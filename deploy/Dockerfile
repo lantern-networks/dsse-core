@@ -4,7 +4,7 @@
 # -control-plane. There is no separate control-plane binary — dsse-cp was a reduced reference that is not what
 # a deployment runs, and it was retired on 2026-08-23 with the decision that the published binary is the
 # product one. Splitting the roles into two binaries is a separate, later change.
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
@@ -46,7 +46,7 @@ RUN LD="-X main.buildVersion=$(sh scripts/build_stamp.sh --version) -X main.buil
  && go build -trimpath -o /out/dsse-deployment-crl ./cmd/dsse-deployment-crl \
  && go build -trimpath -ldflags "$LD" -o /out/dsse-signupdate ./cmd/dsse-signupdate
 
-FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 ARG DSSE_REVISION=unknown
 LABEL org.opencontainers.image.revision=$DSSE_REVISION
 

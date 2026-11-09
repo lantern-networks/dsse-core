@@ -476,6 +476,7 @@ function pinnedView(content, candidates, bypass, input, addButton, filter) {
       if (!current() || stamp !== revision) return;
       if (selected !== pinnedSelection() || (selected && selected !== owner)) throw new Error(pinnedChanged());
       const q = "expected_tenant_id=" + encodeURIComponent(owner);
+      // two-planes-deliberate: candidates exist only on the control plane and the bypass list in force only on an Edge (the control plane answers 409, 'that is an EDGE's answer'); the Edge refreshes its catalog overrides from the authority before it answers (2026-11-06).
       const [cs, bs] = await Promise.all([apiFetch("GET","/admin/policy-candidates?candidate_type=bypass_policy&limit=1000&"+q),apiFetch("GET","/admin/intercept/bypass-hosts?scoped=1&"+q)]);
       if (!current() || stamp !== revision) return;
       if (selected !== pinnedSelection()) throw new Error(pinnedChanged());

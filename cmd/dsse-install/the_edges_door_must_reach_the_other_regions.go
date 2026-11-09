@@ -57,6 +57,39 @@ func databasePeers(dir string) []string { return peersNamedIn(dir, databasePeers
 
 func controlPlanePeers(dir string) []string { return peersNamedIn(dir, controlPlanePeersKey) }
 
+// ★★★ THE OTHER REGIONS' DOORWAYS, A WAY TO THE LEADER WHEN NO DIRECT ONE ANSWERS (2026-11-06). DSSE_CP_PEERS and
+// DSSE_CP_DATA_PEERS name each other region's control plane at its own private listener; these name the same
+// control planes through their regions' doorways on 443, which is how a door reached them before. A deployment
+// re-rendered one machine at a time has peers that publish no direct listener yet, and their doorways are still
+// the way to them.
+//
+// ★★ CHECKED BY THE PEER'S OWN NODE NAME, IN A BACKEND OF THEIR OWN (2026-11-06). They were first
+// `backup` servers of cp_admin_plane, checked by the region's admin name. A doorway answers that name from
+// whichever control plane leads, wherever it is, so two updated regions each saw the other's doorway as healthy
+// while the leader (not yet re-rendered) was elsewhere, and sent requests round between themselves. Now each is
+// checked by <region>-control-plane-a.admin.<deployment>, which that doorway routes to its OWN control plane and
+// nowhere else, so a doorway is up only while its own region leads; and the doorways are a separate backend, used
+// only while every server of the direct one is down (nbsrv … eq 0 in the frontend).
+const (
+	controlPlaneDoorwayPeersKey     = "DSSE_CP_DOORWAY_PEERS"
+	controlPlaneDataDoorwayPeersKey = "DSSE_CP_DATA_DOORWAY_PEERS"
+)
+
+// peerControlPlaneDoorways renders node-name@address:443 doorway entries as servers of a doorway backend.
+// The check asks that node's own control plane whether it leads; forwarded traffic keeps the name the client
+// sent (a passthrough cannot change it), and the doorway answers it from its own, leading, control plane.
+func peerControlPlaneDoorways(dir, key, prefix string) string {
+	out := ""
+	for i, p := range peersNamedIn(dir, key) {
+		name, address, found := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(p, "https://"), "http://"), "@")
+		if !found {
+			continue
+		}
+		out += fmt.Sprintf("    server %s%d %s check check-ssl check-sni %s verify none\n", prefix, i+1, address, name)
+	}
+	return out
+}
+
 func peersNamedIn(dir, controlPlanePeersKey string) []string {
 	body, err := os.ReadFile(filepath.Join(dir, "deployment.env"))
 	if err != nil {
@@ -336,8 +369,14 @@ func peerControlPlaneDataServers(dir string) string {
 				// authority.<region>, which the far doorway serves. The line below stays because the check is
 				// real and because forwarding WITHOUT a client certificate does work; it is simply not the
 				// path anything mTLS should take.
-				out += fmt.Sprintf("    server cp-data-peer-%d %s check check-ssl check-sni %s sni str(%s) verify none\n",
-					i+1, address, check, name)
+				// A control plane's own published data listener asks for a client certificate too, so its
+				// check goes to the admin listener published beside it.
+				checkPort := ""
+				if strings.HasSuffix(address, fmt.Sprintf(":%d", planCPDataPortA)) {
+					checkPort = fmt.Sprintf(" port %d", planCPAdminPortA)
+				}
+				out += fmt.Sprintf("    server cp-data-peer-%d %s check check-ssl check-sni %s sni str(%s) verify none%s\n",
+					i+1, address, check, name, checkPort)
 				continue
 			}
 			host, data, admin := p, "8443", "9443"

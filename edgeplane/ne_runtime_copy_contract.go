@@ -66,34 +66,145 @@ type NetworkExtensionRuntimeCopyNetDialer struct{}
 func (NetworkExtensionRuntimeCopyNetDialer) OpenTCPConnection(ctx context.Context, route NetworkExtensionRuntimeCopyTCPRoute) (io.ReadWriteCloser, error) {
 	dialHost := networkExtensionRuntimeCopyDialHost(route)
 	// ★★★ A STEERED DEVICE MUST NOT BE ABLE TO DIAL WHAT ONLY THIS NODE CAN REACH (2026-08-31, reproduced on
-	// a real Mac against a running deployment).
+	// a real Mac against a running deployment). See a_steered_device_cannot_dial_the_nodes_own_identity_test.go.
 	//
-	// From an armed laptop, through the tunnel:
-	//
-	//	PUT http://169.254.169.254/latest/api/token          -> an IMDSv2 token
-	//	GET .../iam/security-credentials/                    -> dsse-lab-node
-	//	aws sts get-caller-identity                          -> assumed-role/dsse-lab-node/i-0c790ee5...
-	//
-	// The device assumed the CLOUD IDENTITY OF THE NODE CARRYING ITS TRAFFIC. Every steered device could, and
-	// nothing on either side said a word — from the Edge it is an ordinary flow to an ordinary address.
-	//
-	// The guard for this already exists and is correct: swg.CheckEgressDestination refuses loopback,
-	// link-local (which is where every cloud metadata service lives), RFC1918 and CGNAT, and the SWG's HTTP
-	// path has been calling it all along — that is the 502 an administrator sees when a steered browser asks
-	// for an internal address. THIS path, the transparent steer that carries everything a device sends, never
-	// asked. One rule, two paths, applied to one of them.
-	if err := swg.CheckEgressDestination(ctx, dialHost); err != nil {
+	// ★★★ AND THE ADDRESS IT CONNECTS TO IS THE ONE THAT WAS CHECKED (2026-11-07, security review S2). The guard
+	// hands back the addresses it vetted and the socket is opened to those, never to the name again — a
+	// resolver that answers differently to the check and to the dial no longer gets a second answer. The
+	// socket-level Control and the post-connect check are the same two lines the connector dialer already has.
+	// See a_steered_flow_dials_the_address_it_was_checked_against_test.go.
+	addrs, err := swg.VetEgressDestination(ctx, dialHost)
+	if err != nil {
 		return nil, fmt.Errorf("this flow was refused before it was dialled: %w", err)
 	}
-	network, unreachable := DialNetworkForEgress(EdgeHasIPv6Egress(), dialHost)
-	if unreachable {
-		// IPv6-literal destination with no SNI to re-resolve, on an Edge with no IPv6 egress: there is no
-		// reachable path. Fail fast so the client falls back to IPv4, instead of blocking until the OS
-		// connect timeout (the cause of the "abnormally slow bypass" symptom on a single-stack Edge).
+	candidates := addrs[:0:0]
+	hasIPv6 := EdgeHasIPv6Egress()
+	for _, ip := range addrs {
+		if ip.To4() == nil && !hasIPv6 {
+			continue // this node cannot egress IPv6; the name may still have an IPv4 answer
+		}
+		candidates = append(candidates, ip)
+	}
+	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no IPv6 egress for IPv6-literal destination without SNI")
 	}
-	dialer := net.Dialer{}
-	return dialer.DialContext(ctx, network, net.JoinHostPort(dialHost, strconv.Itoa(route.Port)))
+	return dialVettedAddresses(ctx, candidates, route.Port)
+}
+
+// vettedDial opens one guarded TCP connection. A test replaces it to make one attempt hang.
+var vettedDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+	return swg.GuardDialContext((&net.Dialer{Control: swg.EgressControl}).DialContext)(ctx, network, address)
+}
+
+// connectionAttemptDelay is how long one attempt gets to itself before the next address is started as well
+// (RFC 8305 §5, the value Go's own dialer uses). Attempts overlap; the first to connect wins and the rest
+// are cancelled.
+const connectionAttemptDelay = 300 * time.Millisecond
+
+// dialVettedAddresses connects to the first of the vetted addresses that answers, racing them the way
+// net.Dialer races a name's answers: the addresses are interleaved by family so an unanswering IPv6 route does
+// not hold a working IPv4 one back (review R3), each attempt is started connectionAttemptDelay after the one
+// before it, and no address is ever resolved — only what the guard vetted is dialled.
+func dialVettedAddresses(ctx context.Context, candidates []net.IP, port int) (io.ReadWriteCloser, error) {
+	ordered := interleaveByFamily(candidates)
+	address := func(ip net.IP) string { return net.JoinHostPort(ip.String(), strconv.Itoa(port)) }
+	if len(ordered) == 1 {
+		conn, err := vettedDial(ctx, "tcp", address(ordered[0]))
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
+	}
+	type outcome struct {
+		conn net.Conn
+		err  error
+	}
+	raceCtx, cancelRace := context.WithCancel(ctx)
+	defer cancelRace()
+	results := make(chan outcome, len(ordered))
+	started := 0
+	finished := 0
+	// ★ EVERY ATTEMPT HAS AN OWNER (re-review RR4). An attempt that connects after the race has been decided —
+	// a near-simultaneous second answer, or one that lands after the caller gave up — is nobody's socket
+	// unless something waits for it. The reaper takes the attempts still in flight when this returns and
+	// closes whatever they produce.
+	defer func() {
+		outstanding := started - finished
+		if outstanding <= 0 {
+			return
+		}
+		go func() {
+			for i := 0; i < outstanding; i++ {
+				if r := <-results; r.conn != nil {
+					_ = r.conn.Close()
+				}
+			}
+		}()
+	}()
+	start := func() {
+		ip := ordered[started]
+		started++
+		go func() {
+			conn, err := vettedDial(raceCtx, "tcp", address(ip))
+			results <- outcome{conn: conn, err: err}
+		}()
+	}
+	start()
+	timer := time.NewTimer(connectionAttemptDelay)
+	defer timer.Stop()
+	var last error
+	for finished < len(ordered) {
+		select {
+		case r := <-results:
+			finished++
+			if r.err == nil {
+				cancelRace()
+				return r.conn, nil
+			}
+			last = r.err
+			if started < len(ordered) {
+				// A refusal frees the slot at once: start the next address without waiting out the delay.
+				start()
+				timer.Reset(connectionAttemptDelay)
+			}
+		case <-timer.C:
+			if started < len(ordered) {
+				start()
+				timer.Reset(connectionAttemptDelay)
+			}
+		case <-ctx.Done():
+			if last == nil {
+				last = ctx.Err()
+			}
+			return nil, last
+		}
+	}
+	return nil, last
+}
+
+// interleaveByFamily orders the addresses so the two families alternate, IPv6 first when present, which is
+// what makes a dead route in one family cost at most one attempt delay.
+func interleaveByFamily(addrs []net.IP) []net.IP {
+	var v6, v4 []net.IP
+	for _, ip := range addrs {
+		if ip.To4() == nil {
+			v6 = append(v6, ip)
+		} else {
+			v4 = append(v4, ip)
+		}
+	}
+	out := make([]net.IP, 0, len(addrs))
+	for len(v6) > 0 || len(v4) > 0 {
+		if len(v6) > 0 {
+			out = append(out, v6[0])
+			v6 = v6[1:]
+		}
+		if len(v4) > 0 {
+			out = append(out, v4[0])
+			v4 = v4[1:]
+		}
+	}
+	return out
 }
 
 // DialNetworkForEgress picks the dial network for an egress connection given whether the Edge can egress

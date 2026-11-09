@@ -265,7 +265,7 @@ function renderTenantTable(host, body, outerHost, content) {
     return el("tr", {}, [
       nameCell,
       el("td", { text: t.allocated > 0 ? String(t.allocated) : bl({ en: "none", ja: "なし" }) }),
-      el("td", { text: String(t.used) }),
+      el("td", { text: uiSeatsInUse(t.used, t.connectors) }),
       el("td", {}, t.blocked
         ? el("div", {}, [uiBadge(bl({ en: "Cannot enrol", ja: "登録不可" }), "danger"),
                          el("div", { class: "ui-view-desc", text: t.reason || "" })])

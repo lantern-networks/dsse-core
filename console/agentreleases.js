@@ -64,9 +64,16 @@ async function arHash(file) {
 
 // A version out of the file name when it is there. Convenience only, and the field stays editable: a guess
 // that silently becomes the published version is worse than no guess.
+//
+// ★ THE VERSION, NOT WHAT FOLLOWS IT (0.4.1 final acceptance A, 2026-11-09). Release files carry the platform,
+// the architecture, a build stamp and the extension after the version — DsseAgent-0.4.1-windows-x64.msi,
+// LanternDsseAgent-0.4.1-20261109030427.pkg — and reading everything after the core as a pre-release filled
+// the field with "0.4.1-windows-x64.msi". What is kept: build metadata after "+" (0.2.1+3f8f2b02,
+// 0.4.1+source-…), and a conventional pre-release tag (0.5.0-rc.1).
 function arGuessVersion(name) {
-  const m = String(name).match(/(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/);
-  return m ? m[1] : "";
+  const base = String(name).replace(/\.(msi|pkg|zip|dmg|exe)$/i, "");
+  const m = base.match(/(\d+\.\d+\.\d+)(-(?:alpha|beta|rc|pre|dev)(?:\.?[0-9A-Za-z]+)*)?(\+[0-9A-Za-z.-]+)?/i);
+  return m ? m[1] + (m[2] || "") + (m[3] || "") : "";
 }
 
 function arGuessTarget(name) {
@@ -684,7 +691,7 @@ async function renderAgentReleaseList(host) {
       el("td", {}, badge),
       el("td", { class: "ui-muted", text: active && active.not_after ? uiWhen(active.not_after) : "—" }),
       el("td", { class: "ui-muted", text: !signing ? bl({ en: "Unknown", ja: "不明" }) : floorFor
-        ? bl({ en: "no older than " + floorFor, ja: floorFor + " より古いものは不可" })
+        ? bl({ en: "no older than " + floorFor, ja: floorFor + " より古い版は公開できない" })
         : "—" }),
       // ★ THE FIRST INSTALL HAS NO OTHER SOURCE. A device with no agent cannot use the device-facing route —
       // it has no transport identity yet — so without this the operator is told to install something the
@@ -757,7 +764,7 @@ async function renderAgentReleaseList(host) {
       el("th", { text: bl({ en: "Version", ja: "バージョン" }) }),
       el("th", { text: bl({ en: "State", ja: "状態" }) }),
       el("th", { text: bl({ en: "Stops being offered", ja: "配布終了" }) }),
-      el("th", { text: bl({ en: "Minimum version to sign", ja: "署名できる最低バージョン" }) }),
+      el("th", { text: bl({ en: "Lowest version the next release can have", ja: "次に公開できる版の下限" }) }),
       el("th", { text: bl({ en: "The installer", ja: "インストーラ" }) }),
     ])),
     el("tbody", {}, rows),
@@ -1074,8 +1081,29 @@ function openAgentReleaseForm(host) {
       ja: "どのノードも持たない鍵で、この管理サーバーの外で署名したものです。その内容が選んだパッケージと一致するかを、" +
           "公開の前にこの画面で確認します。" }) }),
   ]);
-  envInput.addEventListener("change", () => {
+  // Every change of the signed file — a new one, or none — is a new selection; a read that began under an
+  // earlier selection says nothing about the current one.
+  let envelopeSelection = 0;
+  envInput.addEventListener("change", async () => {
     chosenEnvelope = envInput.files && envInput.files[0];
+    const selection = ++envelopeSelection;
+    // ★ WHAT IS PUBLISHED IS WHAT THE SIGNED FILE SAYS (0.4.1 final acceptance A, 2026-11-09). With a signed
+    // file the version, the devices and the download address come from it, and the fields beside it kept
+    // showing a guess from the package's name — the walk saw "0.4.1-windows-x64.msi" in the version field and
+    // an empty address, and the release that went out was 0.4.1+source-…. The fields now show the file's own
+    // values. Nothing is decided here: the file is checked against the package when Publish is pressed.
+    //
+    // ★ AND ONLY THE FILE STILL CHOSEN WHEN THE READ FINISHES (review FINAL-A-R1, 2026-11-09). The read is
+    // asynchronous: choosing A, then B before A was read, let A's values land on a form that will publish B;
+    // choosing A, then no file, let A's values replace what the operator had typed for a locally signed
+    // release. A read that finishes under a later selection is dropped.
+    if (!chosenEnvelope) return;
+    let m = null;
+    try { m = arManifestOf(JSON.parse(await chosenEnvelope.text())); } catch (e) { m = null; }
+    if (selection !== envelopeSelection || !arReadObject(m)) return;
+    if (typeof m.version === "string" && m.version.trim()) versionF.set(m.version.trim());
+    if (arKnownTarget(arTargetKey(m.platform, m.arch))) targetF.set(arTargetKey(m.platform, m.arch));
+    if (typeof m.artifact_url === "string" && m.artifact_url.trim()) urlF.set(m.artifact_url.trim());
   });
 
   const targetF = uiField({

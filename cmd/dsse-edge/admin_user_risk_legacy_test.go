@@ -38,7 +38,10 @@ func TestUnattributedLegacyRiskStartsAndReachesEdge(t *testing.T) {
 	revoked.Revoke("blocked-device", "operator")
 	handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), AdminAuth: newAdminAuthStore(), AdmissionRevocations: revoked, HighRiskOverlay: cp, Writer: writer, AdminAuditOutbox: outbox})
 	health := httptest.NewRecorder()
-	handler.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	// What a node is goes to the operator only; in a lab with no administrators any credential is the lab's.
+	healthRequest := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	healthRequest.Header.Set("Authorization", "Bearer lab")
+	handler.ServeHTTP(health, healthRequest)
 	var healthBody map[string]any
 	if health.Code != http.StatusOK || json.Unmarshal(health.Body.Bytes(), &healthBody) != nil || healthBody["legacy_unattributed_risk_count"] != float64(1) {
 		t.Fatalf("unattributed risk not visible in healthy CP: status=%d body=%s", health.Code, health.Body.String())

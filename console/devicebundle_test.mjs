@@ -424,3 +424,13 @@ test('a delayed revocation from a replaced fallback cannot overwrite the latest 
   await fallbackButton(f, 'Show the approval').click(); assert.ok(latestFallback.textContent.includes('new-secret'));
   assert.equal(latestFallback.textContent.includes(secret), false);
 });
+
+// Found 2026-11-04 on Windows: a non-ASCII dash in README.txt showed as mojibake in Windows PowerShell 5.1.
+test('device setup README is ASCII so every Windows reader shows it as written', () => {
+  const ctx = {};
+  vm.createContext(ctx);
+  vm.runInContext(bundleSource + '\nthis.__readme = [dbReadme(true, "DsseAgent.msi"), dbReadme(false, "")];', ctx);
+  for (const text of ctx.__readme) {
+    assert.match(text, /^[\x00-\x7f]*$/, 'README.txt must contain only ASCII');
+  }
+});

@@ -14,7 +14,7 @@ import (
 // being invited, not an operator reading an API.
 func TestInvitationCarriesTheLinkAndItsLimits(t *testing.T) {
 	now := time.Date(2026, 8, 15, 9, 0, 0, 0, time.UTC)
-	msg := buildAdminInvitation("alice@corp.example", "https://console.example/?activate=TOKEN123", now)
+	msg := buildAdminInvitation("alice@corp.example", "https://console.example/?activate#activate=TOKEN123", now, time.UTC)
 
 	if msg.To != "alice@corp.example" {
 		t.Fatalf("to = %q", msg.To)
@@ -22,7 +22,7 @@ func TestInvitationCarriesTheLinkAndItsLimits(t *testing.T) {
 	if strings.TrimSpace(msg.Subject) == "" {
 		t.Fatal("an invitation with no subject cannot be pasted into mail")
 	}
-	if !strings.Contains(msg.Body, "https://console.example/?activate=TOKEN123") {
+	if !strings.Contains(msg.Body, "https://console.example/?activate#activate=TOKEN123") {
 		t.Fatalf("the body must contain the link a person will click:\n%s", msg.Body)
 	}
 	if !msg.SingleUse || msg.TTLHours != int(activationTTL.Hours()) {
@@ -33,7 +33,7 @@ func TestInvitationCarriesTheLinkAndItsLimits(t *testing.T) {
 	}
 	// The body says the limits too. A screen can show the fields; the pasted text has to stand alone, because
 	// the person receiving it never sees the screen.
-	if !strings.Contains(msg.Body, "once") || !strings.Contains(msg.Body, msg.ExpiresAt) {
+	if !strings.Contains(msg.Body, "once") || !strings.Contains(msg.Body, "2026-08-16 09:00 UTC") {
 		t.Fatalf("the body must state that the link is single-use and when it expires:\n%s", msg.Body)
 	}
 
@@ -53,7 +53,7 @@ func TestInvitationCarriesTheLinkAndItsLimits(t *testing.T) {
 		t.Fatalf("the subject line is what a person sees first, in both languages: %q", msg.Subject)
 	}
 	// The link appears in each half, so neither half is a fragment that has to be read alongside the other.
-	if strings.Count(msg.Body, "https://console.example/?activate=TOKEN123") != 2 {
+	if strings.Count(msg.Body, "https://console.example/?activate#activate=TOKEN123") != 2 {
 		t.Fatalf("each half must carry the link a person will click:\n%s", msg.Body)
 	}
 }
@@ -68,7 +68,7 @@ func TestActivationLinkIsNotWrittenToTheProcessLog(t *testing.T) {
 	log.SetFlags(0)
 	defer func() { log.SetOutput(prevOut); log.SetFlags(prevFlags) }()
 
-	link := "https://console.example/?activate=SUPERSECRETTOKEN"
+	link := "https://console.example/?activate#activate=SUPERSECRETTOKEN"
 	if err := sendActivationEmail("", "alice@corp.example", link, time.Now()); err != nil {
 		t.Fatalf("sendActivationEmail: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestActivationLinkIsNotWrittenToTheProcessLog(t *testing.T) {
 func TestConfiguredSinkStillReceivesTheLink(t *testing.T) {
 	dir := t.TempDir()
 	sink := dir + "/invites.log"
-	link := "https://console.example/?activate=TOKENINSINK"
+	link := "https://console.example/?activate#activate=TOKENINSINK"
 	if err := sendActivationEmail(sink, "bob@corp.example", link, time.Now()); err != nil {
 		t.Fatalf("sendActivationEmail: %v", err)
 	}
@@ -98,5 +98,36 @@ func TestConfiguredSinkStillReceivesTheLink(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), link) {
 		t.Fatalf("a configured sink must still receive the link, got:\n%s", raw)
+	}
+}
+
+// Acceptance C, third and fourth walks (2026-11-08): the expiry read "2026-11-09T10:28:19Z" to a person joining an
+// organization set to Asia/Tokyo. It is stated in that organization's clock, with the zone named.
+func TestTheInvitationStatesItsExpiryInTheOrganizationsClock(t *testing.T) {
+	tokyo, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		t.Skipf("no zone database: %v", err)
+	}
+	now := time.Date(2026, 11, 8, 10, 28, 19, 0, time.UTC)
+	msg := buildAdminInvitation("alice@corp.example", "https://console.example/?activate#activate=TOKEN123", now, tokyo)
+	if !strings.Contains(msg.Body, "2026-11-09 19:28 JST") {
+		t.Fatalf("the expiry is not in the organization's clock:\n%s", msg.Body)
+	}
+	if strings.Contains(msg.Body, "T10:28:19Z") || strings.Contains(msg.Body, msg.ExpiresAt) {
+		t.Fatalf("the message still states the wire format:\n%s", msg.Body)
+	}
+	if msg.ExpiresAt != now.Add(activationTTL).Format(time.RFC3339) {
+		t.Fatalf("expires_at = %q; programs keep the instant", msg.ExpiresAt)
+	}
+}
+
+// The route passes the inviting organization's zone, not the default.
+func TestTheInviteRouteStatesTheExpiryInTheInvitingOrganizationsClock(t *testing.T) {
+	src, err := os.ReadFile("admin_auth_store.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "buildAdminInvitation(req.Email, link, now, organizationZone(inviteTenantID))") {
+		t.Fatal("the invite route no longer states the expiry in the inviting organization's clock")
 	}
 }

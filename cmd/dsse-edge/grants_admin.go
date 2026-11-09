@@ -43,8 +43,12 @@ func registerGrantsAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Han
 			return
 		}
 		id := r.PathValue("id")
-		if strings.TrimSpace(configSourceURL) != "" {
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("send revocation to the control-plane authority; this Edge cannot confirm an authoritative revocation"))
+		// ★ A REFUSAL THE CALLER CAN ACT ON (2026-11-08, acceptance C). This was its own 503 saying "control-plane
+		// authority", and the Console asks again on the control plane only for a 409 or 501 that names "control
+		// plane". Every revocation from the Console therefore failed, in English, on every node. It is now the
+		// guard every other control-plane-authored write uses, so the Console's table and this set are checked
+		// against each other (ops/checks/cp_authored_routes_in_sync.sh). Nothing has happened yet when it answers.
+		if configWriteRejectedWhenSourced(w, configSourceURL, "access approval revocation") {
 			return
 		}
 		strong := rollout.featureEnabled(authrollout.RevocationReauthenticationFeature)

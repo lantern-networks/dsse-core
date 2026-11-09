@@ -2817,7 +2817,7 @@ final class HandleNewFlowTakeoverTests: XCTestCase {
         )
     }
 
-    // MARK: - Typed AppID matching (docs/steering_exclusion_appid_format.md)
+    // MARK: - Typed AppID matching (docs/administration.md, "Steering exclusions")
 
     // Ignoring a form this OS cannot use is correct and stays silent on the device. It must not stay silent to
     // the OPERATOR: an authored rule this Mac drops looks, from the console, exactly like a rule that failed to

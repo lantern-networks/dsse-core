@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"github.com/lantern-networks/dsse-core/connector"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -193,6 +195,87 @@ func TestPostgresConnectorRegistryStoreE2E(t *testing.T) {
 	}
 	if after := pgStore.ConfigGeneration(); after != beforeLiveness {
 		t.Fatalf("liveness churned connector catalog generation: %d -> %d", beforeLiveness, after)
+	}
+	// What the connector reports about itself and where its tunnel is (third walk of acceptance C): kept in the
+	// column and in the payload every reader uses, without moving the catalog.
+	if changed, err := pgStore.RecordRuntime("tenant_lab_001", "conn_pg_001", map[string]any{"version": "0.4.1", "uptime_seconds": int64(90),
+		"tunnel_region": "jp-001", "tunnel_reported_at": now.Format(time.RFC3339), "runtime_secret_hash": "sha256:00"}); err != nil || !changed {
+		t.Fatalf("record connector runtime: changed=%v err=%v", changed, err)
+	}
+	if after := pgStore.ConfigGeneration(); after != beforeLiveness {
+		t.Fatalf("runtime churned connector catalog generation: %d -> %d", beforeLiveness, after)
+	}
+	if got, ok := pgStore.Get("conn_pg_001"); !ok || adminConnectorVersion(got.Metadata) != "0.4.1" ||
+		adminConnectorMetadataString(got.Metadata, "tunnel_region") != "jp-001" || got.Metadata["runtime_secret_hash"] == "sha256:00" {
+		t.Fatalf("runtime not read back from the payload: %#v", got.Metadata)
+	}
+	// Review C3-R5: an observation older than what is held is refused under the row lock.
+	if _, err := pgStore.RecordRuntime("tenant_lab_001", "conn_pg_001", map[string]any{"version": "0.4.1", "runtime_observed_at": now.Format(time.RFC3339Nano)}); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := pgStore.RecordRuntime("tenant_lab_001", "conn_pg_001", map[string]any{"version": "0.4.0", "tunnel_region": "jp-old",
+		"runtime_observed_at": now.Add(-time.Hour).Format(time.RFC3339Nano)}); err != nil || changed {
+		t.Fatalf("an older observation was written: changed=%v err=%v", changed, err)
+	}
+	if got, _ := pgStore.Get("conn_pg_001"); adminConnectorVersion(got.Metadata) != "0.4.1" || adminConnectorMetadataString(got.Metadata, "tunnel_region") != "jp-001" {
+		t.Fatalf("an older observation rolled the runtime back: %#v", got.Metadata)
+	}
+	// Review C3-RRR2: a registration replacing the row keeps the runtime facts the row holds at that moment,
+	// inside the same transaction — not the ones its sender carried.
+	current, _ := pgStore.Get("conn_pg_001")
+	replay := current
+	replay.Metadata = map[string]any{"version": "0.3.9", "tunnel_region": "jp-stale", "runtime_observed_at": now.Add(-2 * time.Hour).Format(time.RFC3339Nano)}
+	if _, err := pgStore.Register(replay, now); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	if got, _ := pgStore.Get("conn_pg_001"); adminConnectorVersion(got.Metadata) != "0.4.1" || adminConnectorMetadataString(got.Metadata, "tunnel_region") != "jp-001" {
+		t.Fatalf("a registration replaced the held runtime: %#v", got.Metadata)
+	}
+	// Fifth review: this backend's heartbeat did not take the typed version and uptime at all.
+	later := time.Now().UTC()
+	if _, err := pgStore.Heartbeat(model.ConnectorHeartbeat{ID: "conn_pg_001", TenantID: "tenant_lab_001", Version: "0.4.3",
+		UptimeSeconds: 5, Timestamp: later.Format(time.RFC3339Nano)}, later); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	if got, _ := pgStore.Get("conn_pg_001"); adminConnectorVersion(got.Metadata) != "0.4.3" || adminConnectorUptimeSeconds(got.Metadata) == nil {
+		t.Fatalf("the Postgres heartbeat did not take version and uptime: %#v", got.Metadata)
+	}
+	// Review C3-R6-1: a runtime write naming another organization, or none, is refused on the locked row.
+	for _, tenant := range []string{"tenant_other", ""} {
+		if _, err := pgStore.RecordRuntime(tenant, "conn_pg_001", map[string]any{"version": "x", "runtime_observed_at": time.Now().UTC().Format(time.RFC3339Nano)}); !errors.Is(err, connector.ErrNotThisTenantsConnector) {
+			t.Fatalf("RecordRuntime for tenant %q: %v", tenant, err)
+		}
+		if _, err := pgStore.RecordAttachedRegion(tenant, "conn_pg_001", "elsewhere"); !errors.Is(err, connector.ErrNotThisTenantsConnector) {
+			t.Fatalf("RecordAttachedRegion for tenant %q: %v", tenant, err)
+		}
+	}
+	if got, _ := pgStore.Get("conn_pg_001"); adminConnectorVersion(got.Metadata) != "0.4.3" {
+		t.Fatalf("a refused write changed the row: %#v", got.Metadata)
+	}
+	// Seventh review: the attachment update is one locked UPDATE. It records the region without moving the
+	// catalogue generation, and it never re-creates a registration that was removed.
+	beforeAttach := pgStore.ConfigGeneration()
+	if moved, err := pgStore.RecordAttachedRegion("tenant_lab_001", "conn_pg_001", "jp-002"); err != nil || !moved {
+		t.Fatalf("attachment: moved=%v err=%v", moved, err)
+	}
+	if got, _ := pgStore.Get("conn_pg_001"); got.AttachedRegionID != "jp-002" || adminConnectorVersion(got.Metadata) != "0.4.3" {
+		t.Fatalf("attachment not recorded, or it disturbed the rest of the row: %+v", got)
+	}
+	if after := pgStore.ConfigGeneration(); after != beforeAttach {
+		t.Fatalf("recording the attached region moved the catalogue generation %d -> %d", beforeAttach, after)
+	}
+	if _, err := store.Register(model.ConnectorRegistration{ID: "conn_pg_gone", TenantID: "tenant_lab_001", ConnectorGroupID: "cgrp_gone",
+		EdgeRegionID: "jp-001", EdgeClusterID: "edge-001", PrivateBaseURL: "http://gone-connector.local"}, now); err != nil {
+		t.Fatalf("register connector to remove: %v", err)
+	}
+	if removed, err := pgStore.RemoveForTenant("tenant_lab_001", "conn_pg_gone"); err != nil || !removed {
+		t.Fatalf("remove: removed=%v err=%v", removed, err)
+	}
+	if moved, err := pgStore.RecordAttachedRegion("tenant_lab_001", "conn_pg_gone", "jp-late"); err != nil || moved {
+		t.Fatalf("a late attachment for a removed connector: moved=%v err=%v", moved, err)
+	}
+	if _, found := pgStore.Get("conn_pg_gone"); found {
+		t.Fatal("a late attachment re-created a removed connector")
 	}
 	if _, err := store.Register(model.ConnectorRegistration{
 		ID: "conn_pg_purge_001", TenantID: "tenant_purge", ConnectorGroupID: "cgrp_purge",

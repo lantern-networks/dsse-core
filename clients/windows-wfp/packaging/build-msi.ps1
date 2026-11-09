@@ -8,7 +8,7 @@
 
   Prerequisites:
     - Go (windows/amd64 build)
-    - WiX v7 as a dotnet global tool:  dotnet tool install --global wix --version 7.0.0
+    - WiX v7 as a dotnet global tool:  dotnet tool install --global wix --version 7.0.1
       This build explicitly accepts the wix7 OSMF EULA (see README).
     - Windows SDK signtool (only when -Sign)
 
@@ -202,8 +202,8 @@ New-Item -ItemType Directory -Force -Path $stage, $outDir | Out-Null
 $wix = Join-Path $env:USERPROFILE ".dotnet\tools\wix.exe"
 if (-not (Test-Path $wix)) { $wix = "wix" }                 # fall back to PATH
 $wixVersion = (& $wix --version).Trim()
-if ($LASTEXITCODE -or $wixVersion -notmatch '^7\.0\.0(?:\+.*)?$') {
-  throw "WiX 7.0.0 is required (found: $wixVersion)"
+if ($LASTEXITCODE -or $wixVersion -notmatch '^7\.0\.1(?:\+.*)?$') {
+  throw "WiX 7.0.1 is required (found: $wixVersion)"
 }
 $env:DOTNET_ROOT = Join-Path $env:USERPROFILE ".dotnet"
 

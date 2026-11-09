@@ -70,7 +70,7 @@ function renderEgressView(content) {
       }) }),
     ]),
     el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add rule", ja: "+ ルールを追加" }),
-      onClick: () => openRuleEditor("egress", "", () => renderRuleList(section, "egress", "")) }),
+      onClick: () => openRuleEditor("egress", "", (expect) => renderRuleList(section, "egress", "", expect)) }),
   ]));
   content.appendChild(section);
   renderRuleList(section, "egress", "");
@@ -100,7 +100,44 @@ async function catalogIndex() {
   return { endpoints, groups, services, aliasByID };
 }
 
-async function renderRuleList(section, plane, direction) {
+// ★★ THE INTERNET ACCESS LIST IS THE EDGE'S, AND A SAVE GOES TO THE CONTROL PLANE (2026-11-04, found by
+// configuring a new organization from a browser). The list is the Edge's effective view — authored rules plus the
+// defaults and bypasses only an Edge holds — so it cannot simply be read from the control plane. Read straight
+// after a save, it came back without the rule just saved, and a reload a moment later showed it. So a save
+// waits, briefly, until the Edge's list shows what was saved, and says so if it has not arrived.
+//
+// ★ THE WHOLE RULE, NOT A FEW FIELDS (2026-11-05). The first version compared the name, the
+// priority and the subjects, so changing a rule's action — allow to deny, inspect to bypass, its DLP — ended the
+// wait on the Edge's OLD copy and re-showed it with no warning. Both sides are the same rule object
+// (policyrule.Rule: the control plane's answer to the save, and the Edge's authored entry), serialized by the same
+// code, so they are compared whole and only key order is set aside.
+//
+// ★ AND NOTHING EMPTY IS TREATED AS ABSENT (the same day). The first whole comparison also
+// dropped empty objects, so a rule's empty DLP block ({identifiers: null, on_match: ""}) and no DLP block read as
+// the same rule. They are not: without its own block the rule takes the organization's DLP, which can block. The
+// editor removes an empty block on save, so that change ended the wait on the old copy.
+function egressRuleCanonical(v) {
+  if (Array.isArray(v)) return v.map(egressRuleCanonical);
+  if (v && typeof v === "object") {
+    const out = {};
+    Object.keys(v).sort().forEach((k) => { if (v[k] !== undefined) out[k] = egressRuleCanonical(v[k]); });
+    return out;
+  }
+  return v;
+}
+function egressListShows(entries, expect) {
+  if (!expect || !expect.id) return true;
+  const hit = entries.find((e) => e && e.kind === "authored" && e.rule && e.rule.id === expect.id);
+  if (expect.gone) return !hit;
+  if (!hit || !expect.saved) return !!hit;
+  // The save answers the stored rule plus an optional warning (rules_admin.go); the warning is not the rule.
+  const want = Object.assign({}, expect.saved);
+  delete want.warning;
+  return JSON.stringify(egressRuleCanonical(hit.rule)) === JSON.stringify(egressRuleCanonical(want));
+}
+const EGRESS_SAVE_WAIT_TRIES = 10, EGRESS_SAVE_WAIT_MS = 1000;
+
+async function renderRuleList(section, plane, direction, expect) {
   uiState(section, "loading");
   const current = freshRender(section);
 
@@ -113,9 +150,21 @@ async function renderRuleList(section, plane, direction) {
   // place, since an operator expects the Internet Access view to reflect every egress decision, not just authored
   // rules.
   if (plane === "egress") {
-    let resp;
-    try { resp = await apiFetch("GET", "/admin/egress-effective-rules"); }
+    let resp, waited = 0;
+    try {
+      for (;;) {
+        resp = await apiFetch("GET", "/admin/egress-effective-rules");
+        if (!expect || !resp || !resp.ok || !resp.body || !Array.isArray(resp.body.rules) ||
+          egressListShows(resp.body.rules, expect) || waited >= EGRESS_SAVE_WAIT_TRIES) break;
+        waited++;
+        await new Promise((resolve) => setTimeout(resolve, EGRESS_SAVE_WAIT_MS));
+        if (!current()) return;
+      }
+    }
     catch (e) { if (!current()) return; uiState(section, "error", String(e.message || e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderRuleList(section, plane, direction) }); return; }
+    if (expect && resp && resp.ok && resp.body && Array.isArray(resp.body.rules) && !egressListShows(resp.body.rules, expect)) {
+      uiToast(bl({ en: "Saved. This list has not caught up yet; reload in a moment.", ja: "保存しました。この一覧にはまだ反映されていません。少し待ってから読み込み直してください。" }), "info");
+    }
     if (!resp || !resp.ok || !resp.body || !Array.isArray(resp.body.rules)) {
       if (!current()) return;
       uiState(section, "error", bl({ en: "Could not load internet-access rules.", ja: "インターネットアクセスのルールを読み込めません。" }), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderRuleList(section, plane, direction) });
@@ -276,7 +325,7 @@ function authoredRow(r, idx, section, plane, direction) {
   }
 
   const edit = el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Edit", ja: "編集" }),
-    onClick: () => openRuleEditor(plane, direction, () => renderRuleList(section, plane, direction), r) });
+    onClick: () => openRuleEditor(plane, direction, (expect) => renderRuleList(section, plane, direction, expect), r) });
 
   let pending = false;
   const run = async operation => {
@@ -286,16 +335,17 @@ function authoredRow(r, idx, section, plane, direction) {
     try {
       if (await ruleEditorTenant() !== r.tenant_id) throw new Error(ruleUnknownOutcome());
       if (section.isConnected === false) return;
-      if (await operation() === true) await renderRuleList(section,plane,direction);
+      const done = await operation();
+      if (done) await renderRuleList(section,plane,direction,done === true ? undefined : done);
     } catch(e) { uiToast((e.message || String(e))+" "+ruleUnknownOutcome(),"err"); }
     finally { pending = false; controls.forEach(e => e.disabled = false); }
   };
   const toggle = el("button", { class:"ui-btn ui-btn-sm", text:active ? bl({en:"Disable",ja:"無効化"}) : bl({en:"Enable",ja:"有効化"}), onClick:()=>run(async()=>{
     const body = Object.assign({},r,{status:active ? "disabled" : "active"});
     const resp = await apiFetch("POST","/admin/rules",body);
-    validateRuleSave(resp,body,r.tenant_id);
+    const saved = validateRuleSave(resp,body,r.tenant_id);
     uiToast(bl({en:"Rule status saved.",ja:"ルールの状態を保存しました。"}),"ok");
-    return true;
+    return {id:saved.id,saved};
   })});
   const del = el("button", {class:"ui-btn ui-btn-sm ui-btn-danger",text:bl({en:"Delete",ja:"削除"}),onClick:()=>run(async()=>{
     if (!await uiConfirm({title:bl({en:"Delete this rule?",ja:"このルールを削除しますか?"}),body:r.name || r.id,confirmLabel:bl({en:"Delete",ja:"削除"}),danger:true})) return false;
@@ -303,12 +353,12 @@ function authoredRow(r, idx, section, plane, direction) {
     const resp = await apiFetch("DELETE","/admin/rules/"+encodeURIComponent(r.id));
     if (!resp?.ok) throw new Error(httpErr(resp));
     if (resp.status!==200 || resp.body?.status!=="deleted" || resp.body?.id!==r.id) throw new Error(ruleUnknownOutcome());
-    uiToast(bl({en:"Rule deleted.",ja:"ルールを削除しました。"}),"ok");return true;
+    uiToast(bl({en:"Rule deleted.",ja:"ルールを削除しました。"}),"ok");return {id:r.id,gone:true};
   })});
 
   return el("tr", {}, [
     el("td", {}, [
-      el("strong", { text: r.name || bl({ en: "(unnamed rule)", ja: "(名称なしルール)" }) }),
+      el("strong", { text: ruleDisplayName(r.name) || bl({ en: "(unnamed rule)", ja: "(名称なしルール)" }) }),
       el("div", { class: "ui-view-desc" }, el("code", { text: "#" + r.priority + " · " + r.id })),
     ]),
     el("td", {}, ruleAllowsAgentless(r)
@@ -695,7 +745,8 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
   // Source / Destination subject pickers — every group AND every endpoint (operator + built-in catalog) is
   // individually selectable, sorted alphabetically so a just-added endpoint lands where expected. Type-to-filter.
   const subjects = idx.groups.map((g) => ({ id: g.id, label: g.alias, kind: "group", tier0: g.tier0, builtIn: !!g.built_in }))
-    .concat(idx.endpoints.map((e) => ({ id: e.id, label: e.alias, kind: "endpoint", platform: e.platform, builtIn: !!e.built_in })));
+    .concat(idx.endpoints.map((e) => ({ id: e.id, label: e.alias, kind: "endpoint", platform: e.platform, builtIn: !!e.built_in,
+      what: ruleEndpointWhat(e), address: e.kind === "network" ? (e.address || "") : "" })));
   subjects.sort((a, b) => (a.label || "").localeCompare(b.label || ""));
   // Source "who" can be a device/group OR — via the identity-group add — an IdP person/group (idgroup:<name>).
   // An identity source applies to the user from any device, browser included, which is how one rule covers
@@ -750,7 +801,7 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
   // Source/Destination wildcard; a 443-only rule picks the explicit HTTPS service.
   const svcOptions = [{ value: "", label: bl({ en: "Any", ja: "すべて" }) }]
     .concat(idx.services.map((s) => ({ value: s.id, label: s.alias + " (" + (s.ports || []).map((p) => p.protocol + "/" + p.port).join(",") + ")" })));
-  const svcF = uiField({ name: "svc", label: bl({ en: "Service (what)", ja: "Service(何を)" }), type: "select", value: existing ? (existing.service_id || "") : "", options: svcOptions });
+  const svcF = uiField({ name: "svc", label: bl({ en: "Service (what)", ja: "サービス（何を）" }), type: "select", value: existing ? (existing.service_id || "") : "", options: svcOptions });
 
   // Access axis.
   const accessF = uiField({ name: "access", label: bl({ en: "Access", ja: "アクセス" }), type: "select", value: eAction.access || "allow", options: [
@@ -988,13 +1039,13 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
       if (!m.el.isConnected) return;
       writeAttempted = true;
       const resp = await apiFetch("POST", "/admin/rules", body);
-      validateRuleSave(resp, body, editorTenant);
+      const saved = validateRuleSave(resp, body, editorTenant);
       savedOk = true;
       m.close();
       const warning = resp.body && resp.body.warning;
       if (warning) uiToast(bl({ en: "Saved with a warning: ", ja: "警告付きで保存: " }) + warning, "info");
       else uiToast(bl({ en: "Rule saved.", ja: "ルールを保存しました。" }), "ok");
-      onSaved();
+      onSaved({ id: saved.id, saved });
     } catch(e) {
       if (m.el.isConnected) {
         const message = e.message || String(e), guidance = ruleUnknownOutcome();
@@ -1085,10 +1136,13 @@ function subjectPicker(labelText, subjects, opts) {
     } else if (s.kind === "agent") {
       chipEls = [uiBadge(bl({ en: "Agent", ja: "エージェント" }), "warn"), el("span", { class: "subject-chip-label", text: s.label })];
     } else {
+      // ★ WHAT IT IS, AND WHERE (acceptance C, third walk): an application published as "H1 internal app" and a
+      // network of the same name could not be told apart here — both read "Endpoint · H1 internal app".
       chipEls = [
-        uiBadge(s.kind === "group" ? bl({ en: "Group", ja: "グループ" }) : bl({ en: "Endpoint", ja: "エンドポイント" }), s.kind === "group" ? "ok" : "off"),
+        uiBadge(s.kind === "group" ? bl({ en: "Group", ja: "グループ" }) : ruleEndpointWhatLabel(s.what), s.kind === "group" ? "ok" : "off"),
         el("span", { class: "subject-chip-label", text: s.label }),
       ];
+      if (s.address && s.address !== s.label) chipEls.push(el("span", { class: "subject-chip-address ui-view-desc", text: s.address }));
       if (s.builtIn) chipEls.push(uiBadge(bl({ en: "built-in", ja: "組み込み" }), "off"));
       if (s.tier0) chipEls.push(uiBadge("Tier-0", "danger"));
       if (s.platform === "macos") chipEls.push(uiBadge("macOS", "off"));
@@ -1096,7 +1150,7 @@ function subjectPicker(labelText, subjects, opts) {
     }
     const row = el("label", { class: "asset-check subject-row" }, [cb, el("span", { class: "subject-chip" }, chipEls)]);
     list.appendChild(row);
-    rows.push({ row, cb, label: s.label, hay: (s.label + " " + (s.kind || "") + " " + (s.platform || "")).toLowerCase() });
+    rows.push({ row, cb, label: s.label, hay: (s.label + " " + (s.kind || "") + " " + (s.platform || "") + " " + (s.address || "") + " " + ruleEndpointWhatLabel(s.what)).toLowerCase() });
     return cb;
   };
   subjects.forEach(addSubjectRow);
@@ -1260,13 +1314,44 @@ function subjectPicker(labelText, subjects, opts) {
 // ruleFlowText is the one-line "who reaches what" for a row. A set with many destinations is stated as a
 // count rather than as its members: fifteen internal group identifiers in a monospace run is not a sentence
 // anybody reads, and the members are named in the row's own description.
+// ruleEndpointWhat says what a catalogue endpoint stands for, from what made it: a published application, a
+// device, or a network address an administrator named.
+function ruleEndpointWhat(e) {
+  if (!e) return "endpoint";
+  if (e.source === "application") return "application";
+  if (e.kind === "steered_device") return "device";
+  if (e.kind === "network") return "network";
+  return "endpoint";
+}
+
+function ruleEndpointWhatLabel(what) {
+  switch (what) {
+    case "application": return bl({ en: "Application", ja: "アプリ" });
+    case "device": return bl({ en: "Device", ja: "デバイス" });
+    case "network": return bl({ en: "Network", ja: "ネットワーク" });
+    default: return bl({ en: "Endpoint", ja: "エンドポイント" });
+  }
+}
+
 function ruleFlowText(entry) {
   const dest = String(entry.destination_text || "");
   const parts = dest.split(",").map((x) => x.trim()).filter(Boolean);
   const shown = parts.length > 3
     ? bl({ en: parts.length + " destination groups", ja: "宛先 " + parts.length + " グループ" })
-    : dest;
-  return entry.source_text + " → " + shown + " : " + entry.service_text;
+    : ruleAnyText(dest);
+  return ruleAnyText(entry.source_text) + " → " + shown + " : " + ruleAnyText(entry.service_text);
+}
+
+// The server writes "Any" for an unrestricted side of a rule; it is a word on the screen, so it is translated here.
+function ruleAnyText(text) { return text === "Any" ? bl({ en: "Any", ja: "すべて" }) : text; }
+
+// ★ THE RULE EVERY NEW ORGANIZATION STARTS WITH IS NAMED BY THE SERVER, IN ENGLISH (2026-11-04). The name is
+// stored, so an administrator can rename it; until they do, it is shown in the reader's language.
+const STARTING_POSTURE_RULE_NAME = "Everything, allowed and inspected — the rule to narrow first";
+function ruleDisplayName(name) {
+  return name === STARTING_POSTURE_RULE_NAME
+    ? bl({ en: STARTING_POSTURE_RULE_NAME, ja: "すべて許可・検査（最初に絞り込むルール）" })
+    : name;
 }
 
 function ruleUnknownOutcome() {

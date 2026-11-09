@@ -152,7 +152,7 @@ func TestDeviceUpdatesCaseVariantIsOneDeviceWithHeartbeatVersion(t *testing.T) {
 	}
 	mux := http.NewServeMux()
 	registerAgentDeviceUpdateRoutes(mux, func(_ string, h http.HandlerFunc) http.HandlerFunc { return h },
-		store, ledger, agenttelemetry.NewStore(), newPublishedAgentUpdateStore(), nil, nil, nil, nil)
+		store, ledger, agenttelemetry.NewStore(), newPublishedAgentUpdateStore(), nil, nil, nil, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/admin/agent/device-updates", nil)
 	req = req.WithContext(context.WithValue(req.Context(), adminIdentityContextKey{}, adminIdentity{PrincipalID: "admin", TenantID: "tenant_a"}))
 	rec := httptest.NewRecorder()

@@ -51,7 +51,7 @@ func TestARuntimeFactNeitherErasesNorCreates(t *testing.T) {
 	if _, err := registry.Register(seed, time.Now()); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if _, err := registry.RecordAttachedRegion("conn-1", "region-a"); err != nil {
+	if _, err := registry.RecordAttachedRegion("t1", "conn-1", "region-a"); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	targets := configApplyTargets{connectors: registry}

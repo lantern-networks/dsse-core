@@ -45,7 +45,58 @@ function siteSavedFields(row, request, includeRegion) {
   if (includeRegion) keys.push("region");
   if (keys.some(key => (row[key] !== undefined && typeof row[key] !== "string") ||
       (row[key] || "") !== (request[key] || "").trim())) return false;
+  if (request.door_order && (!Array.isArray(row.door_order) || row.door_order.join(",") !== request.door_order.join(","))) return false;
   return (row.expected_connector_count === undefined ? 0 : row.expected_connector_count) === request.expected_connector_count;
+}
+
+// siteDoorOrderEditor lets an administrator choose which of the organization's entrances this site's connectors
+// use first, and in what order after that. A connector goes back to the top one once it answers again, so the
+// top one is where the site is meant to be reached from (acceptance C, third walk: an Osaka site must not be
+// stuck dialling Tokyo first). The list is the organization's entrances; nothing here can add or remove one.
+function siteDoorOrderEditor(site) {
+  const saved = Array.isArray(site.door_order) ? site.door_order.slice() : [];
+  let regions = null, touched = false;
+  const list = el("div", {});
+  const wrap = el("div", { class: "ui-field", style: "display:none" }, [
+    el("div", { class: "ui-field-label", text: bl({ en: "Entrances its connectors use, in order", ja: "コネクタが使う入口の順番" }) }),
+    list,
+    el("div", { class: "ui-field-hint", text: bl({
+      en: "The top one is used first and returned to; the others are used in order if it stops answering.",
+      ja: "いちばん上を先に使い、そこが戻り先になります。止まったときは下へ順に移ります。" }) }),
+  ]);
+  const render = () => {
+    list.innerHTML = "";
+    regions.forEach((region, i) => {
+      const up = el("button", { class: "ui-btn ui-btn-sm", text: "↑", onClick: () => move(i, -1) });
+      const down = el("button", { class: "ui-btn ui-btn-sm", text: "↓", onClick: () => move(i, 1) });
+      up.disabled = i === 0; down.disabled = i === regions.length - 1;
+      list.appendChild(el("div", { class: "ui-checkrow" }, [el("strong", { text: (i + 1) + ". " + region }), el("span", { class: "ui-spacer" }), up, down]));
+    });
+  };
+  const move = (i, delta) => {
+    const j = i + delta;
+    if (j < 0 || j >= regions.length) return;
+    [regions[i], regions[j]] = [regions[j], regions[i]];
+    touched = true; render();
+  };
+  (async () => {
+    try {
+      const r = await apiFetch("GET", "/admin/agent-profile/options", undefined, "control");
+      const offered = r && r.ok && r.body && Array.isArray(r.body.transport_endpoints) ? r.body.transport_endpoints : [];
+      const known = [];
+      offered.forEach(entry => { const i = String(entry).indexOf("="); const region = i > 0 ? String(entry).slice(0, i) : ""; if (region && !known.includes(region)) known.push(region); });
+      if (known.length < 2) return; // one entrance: there is no order to choose
+      const first = saved.length ? saved : (site.region ? [site.region] : []);
+      regions = first.filter(region => known.includes(region)).concat(known.filter(region => !first.includes(region)));
+      wrap.style.display = "";
+      render();
+    } catch (_) { /* unreadable: the editor stays hidden and the saved order is sent back unchanged */ }
+  })();
+  return {
+    el: wrap,
+    // The order to save: what the administrator arranged, or the saved one as it was; null when there is none.
+    get: () => (touched && regions) ? regions.slice() : (saved.length ? saved.slice() : null),
+  };
 }
 
 function siteSaveAcknowledged(response, request) {
@@ -79,20 +130,21 @@ function openSiteForm(host, existing) {
   const idF = uiField({ name: "site_id", label: bl({ en: "Site ID", ja: "サイト ID" }), required: true, value: s.site_id || "", placeholder: "tokyo-dc", hint: editing ? bl({ en: "Fixed — this is the connector group id.", ja: "変更不可 — コネクタグループ ID です。" }) : bl({ en: "Stable id; also the connector group id. Connectors enrolled with this id join this site.", ja: "安定した ID(コネクタグループ ID を兼ねる)。この ID で登録したコネクタがこのサイトに入ります。" }) });
   if (editing) { const inp = idF.el.querySelector("input,select,textarea"); if (inp) inp.disabled = true; }
   const nameF = uiField({ name: "name", label: bl({ en: "Display name", ja: "表示名" }), value: s.name || "", placeholder: bl({ en: "Tokyo DC", ja: "東京 DC" }) });
-  const regionF = uiField({ name: "region", label: bl({ en: "Region / location", ja: "リージョン / 拠点" }), value: s.region || "", placeholder: "ap-northeast-1 / Tokyo office" });
+  const regionF = uiField({ name: "region", label: bl({ en: "Region", ja: "リージョン" }), value: s.region || "", placeholder: "region-a" });
   const expectedF = uiField({ name: "expected", label: bl({ en: "Expected connectors (HA target)", ja: "想定コネクタ数 (HA 目標)" }), type: "number", value: String(s.expected_connector_count ?? (editing ? 0 : "")), placeholder: "2", hint: bl({ en: "The site shows Degraded when fewer than this are online. Blank or 0 means no target.", ja: "オンラインがこれ未満のときサイトは「一部障害」になります。空欄または 0 は目標なしです。" }), validate: value => {
     const input = expectedF.el.querySelector("input");
     return (input && input.validity && input.validity.badInput) || siteExpectedConnectorCount(value) === null
       ? bl({ en: "Enter a non-negative whole number in decimal digits, up to 9007199254740991, or leave blank.", ja: "0 以上 9007199254740991 以下の整数を数字だけで入力するか、空欄にしてください。" }) : "";
   } });
   const deployF = uiField({ name: "deployment_type", label: bl({ en: "Deployment type", ja: "デプロイ種別" }), value: s.deployment_type || "", placeholder: "vm / container / appliance" });
+  const doors = siteDoorOrderEditor(s);
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: editing ? bl({ en: "Save", ja: "保存" }) : bl({ en: "Create", ja: "作成" }) });
   const notice = el("div", { role: "alert", class: "ui-state ui-state-error", style: "display:none" });
   const fields = [idF, nameF, regionF, expectedF, deployF];
   const m = uiModal({
     onClose: () => { closed = true; },
     title: editing ? bl({ en: "Edit site", ja: "サイトを編集" }) : bl({ en: "Create a site", ja: "サイトを作成" }),
-    body: [...fields.map(field => field.el), notice],
+    body: [...fields.map(field => field.el), doors.el, notice],
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
   });
   const controls = fields.map(field => field.el.querySelector("input,select,textarea")).filter(Boolean).concat(submit);
@@ -107,10 +159,21 @@ function openSiteForm(host, existing) {
     const body = { site_id: editing ? s.site_id : idF.get(), name: nameF.get(), region: regionF.get(), deployment_type: deployF.get() };
     if (s.routing_namespace) body.routing_namespace = s.routing_namespace; // preserve (not shown; out of scope)
     if (s.ha_policy) body.ha_policy = s.ha_policy;
+    // The order is sent whenever the site has one or the administrator set one; an untouched site without one
+    // keeps "its own region first", rather than having today's list frozen into it.
+    const order = doors.get();
+    if (order) body.door_order = order;
     body.expected_connector_count = siteExpectedConnectorCount(expectedF.get());
     try {
       const r = await apiFetch("POST", "/admin/sites", body, "control");
       if (!current()) { m.close(); return; }
+      // A refusal is an answer, not an unconfirmed save: nothing was written, and the reason says what to change.
+      if (r && r.status >= 400 && r.status < 500) {
+        const reason = (r.body && typeof r.body.error === "string" && r.body.error) || ("HTTP " + r.status);
+        notice.textContent = bl({ en: "Not saved: " + reason, ja: "保存されませんでした: " + reason });
+        notice.style.display = "";
+        return;
+      }
       if (!siteSaveAcknowledged(r, body)) throw new Error("Unconfirmed site save");
       const read = await apiFetch("GET", "/admin/sites", undefined, "control");
       if (!current()) { m.close(); return; }
@@ -206,7 +269,7 @@ async function renderSiteNetworks(bodyHost, siteID, listHost) {
   }
   // Subnets come from the catalog (select above — defined on the Networks page). A single hostname is bound here.
   const inp = el("input", { class: "ui-input", placeholder: bl({ en: "or a hostname — wiki.corp", ja: "またはホスト名 — wiki.corp" }) }); inp.style.maxWidth = "240px";
-  bodyHost.appendChild(el("div", { class: "ui-toolbar", style: "margin-top:6px" }, [inp, el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Add", ja: "追加" }), onClick: () => { const v = inp.value.trim(); if (!v) return; siteNetworkAction(siteID, { action: "add", fqdn: v }, bodyHost, listHost); } })]));
+  bodyHost.appendChild(el("div", { class: "ui-toolbar", style: "margin-top:6px" }, [inp, el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Add", ja: "追加" }), onClick: () => { const v = inp.value.trim(); if (!v) return; if (siteAddressShapedName(v)) { saveError.textContent = siteAddressNotAName(v); saveError.style.display = ""; return; } siteNetworkAction(siteID, { action: "add", fqdn: v }, bodyHost, listHost); } })]));
   const saveError = el("div", { class: "ui-state ui-state-error", role: "alert", style: "display:none" });
   bodyHost.appendChild(saveError);
   bodyHost.__siteNetworkEditor = { current, busy: false, error: saveError, controls: Array.from(bodyHost.querySelectorAll("button,input,select")) };
@@ -248,6 +311,21 @@ async function renderSiteNetworks(bodyHost, siteID, listHost) {
     panel.appendChild(inner);
     renderConnectorRouteGovernance(inner, c.id);
   }
+}
+
+// ★ A RANGE TYPED INTO THE NAME FIELD WAS STORED AS A NAME (2026-11-08, acceptance C). "10.47.1.30/32" went in
+// as a host name, matched nothing on the connector, and nothing said why. An address or a range is defined on
+// the Networks page and chosen from the list above; the server refuses it too, and this says so in the
+// reader's language before anything is sent.
+function siteAddressShapedName(v) {
+  v = String(v || "").trim();
+  if (!v) return false;
+  if (/[\/:]/.test(v)) return true;
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(v);
+}
+function siteAddressNotAName(v) {
+  return bl({ en: "\"" + v + "\" is an address, not a host name. Define it on the Networks page, then choose it from the list above.",
+    ja: "「" + v + "」はアドレスで、ホスト名ではありません。ネットワークのページで定義してから、上の一覧から選んでください。" });
 }
 
 async function siteNetworkAction(siteID, payload, bodyHost, listHost) {
@@ -342,6 +420,12 @@ async function removeConnector(id, name, host) {
   if (!host || host.isConnected === false) return;
   const pending = host.__connectorManagementOps || (host.__connectorManagementOps = new Set());
   const key = "remove:" + id;
+  // ★ A SECOND PRESS AFTER AN UNCONFIRMED REMOVAL SAYS WHY NOTHING HAPPENS (acceptance C, third walk: the
+  // removal answered 503, and pressing Remove again did not even ask). Retrying is held until the list is
+  // reloaded on purpose — the first request may have removed it — but a button that does nothing and says
+  // nothing reads as a broken screen.
+  const unconfirmed = host.__connectorRemovalUnconfirmed || (host.__connectorRemovalUnconfirmed = new Set());
+  if (unconfirmed.has(key)) { uiToast(connectorManagementError(), "err"); return; }
   if (pending.has(key)) return;
   const context = connectorManagementContext(host);
   if (!context.current()) return;
@@ -359,8 +443,8 @@ async function removeConnector(id, name, host) {
     if (connectorManagementReadback(read, id, context.tenant)) throw new Error("Connector still listed");
     confirmed = true;
     uiToast(bl({ en: "Connector removed.", ja: "コネクタを削除しました。" }), "ok"); renderSiteList(host);
-  } catch (_) { if (context.current()) uiToast(connectorManagementError(), "err"); }
-  finally { if (!attempted || confirmed || !context.current()) pending.delete(key); }
+  } catch (_) { if (context.current()) { if (attempted) unconfirmed.add(key); uiToast(connectorManagementError(), "err"); } }
+  finally { pending.delete(key); } // an unconfirmed attempt is held in `unconfirmed` until the list is reloaded
 }
 
 // siteHealthBadge maps a Site health label to a coloured badge. healthy -> ok, degraded -> warn,
@@ -455,6 +539,7 @@ async function renderSiteList(host) {
 
   // A successful explicit reload is the only safe point to allow another uncertain management attempt.
   host.__connectorManagementOps = new Set();
+  host.__connectorRemovalUnconfirmed = new Set();
 
   const bySite = new Map();
   conns.forEach(conn => { const group = conn.connector_group_id || ""; if (!bySite.has(group)) bySite.set(group, []); bySite.get(group).push(conn); });
@@ -482,7 +567,7 @@ async function renderSiteList(host) {
       return el("tr", {}, [
         el("td", {}, [el("div", { style: "font-weight:600", text: c.name || id }), el("code", { class: "ui-view-desc", text: id })]),
         el("td", {}, availabilityBadge(c)),
-        el("td", { text: c.last_heartbeat_at || bl({ en: "never", ja: "なし" }) }),
+        el("td", { text: (c.last_heartbeat_at ? window.dsseFormatTime(c.last_heartbeat_at) : bl({ en: "never", ja: "なし" })) }),
         el("td", { class: "ui-row-actions" }, [
           el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Details", ja: "詳細" }), onClick: () => showConnectorDetail(id, c) }),
           el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Rename", ja: "名前変更" }), onClick: () => renameConnector(id, c.name, host) }),
@@ -506,7 +591,7 @@ async function renderSiteList(host) {
     const actions = opts.orphan ? [] : [
       el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Networks", ja: "ネットワーク" }), onClick: () => showSiteNetworks(sid, host) }),
       el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Edit", ja: "編集" }), onClick: () => openSiteForm(host, s) }),
-      el("button", { class: "ui-btn ui-btn-sm ui-btn-primary", text: bl({ en: "Add connector", ja: "コネクタを追加" }), onClick: () => showEnrollmentCommand(sid) }),
+      el("button", { class: "ui-btn ui-btn-sm ui-btn-primary", text: bl({ en: "Add connector", ja: "コネクタを追加" }), onClick: () => showEnrollmentCommand(sid, host) }),
       s.managed ? el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Delete", ja: "削除" }), onClick: () => deleteSite(sid, s.name, null, host) }) : null,
     ].filter(Boolean);
     wrap.appendChild(el("div", { style: "display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap" }, [
@@ -580,7 +665,7 @@ async function showSiteDetail(siteID, fallback, host) {
     siteKVRow(bl({ en: "Regions", ja: "リージョン" }), (s.regions || []).join(", ") || "—"),
     siteKVRow(bl({ en: "Routes", ja: "ルート" }), siteRouteCount(rs)),
     siteKVRow(bl({ en: "Namespaces", ja: "ネームスペース" }), namespaces || s.routing_namespace || bl({ en: "None", ja: "なし" })),
-    siteKVRow(bl({ en: "Last heartbeat", ja: "最終ハートビート" }), s.last_heartbeat_at || bl({ en: "never", ja: "なし" })),
+    siteKVRow(bl({ en: "Last heartbeat", ja: "最終ハートビート" }), (s.last_heartbeat_at ? window.dsseFormatTime(s.last_heartbeat_at) : bl({ en: "never", ja: "なし" }))),
   ];
   const overview = el("div", { class: "ui-kv" }, overviewRows.filter(Boolean));
 
@@ -604,7 +689,7 @@ async function showSiteDetail(siteID, fallback, host) {
       // connector when this list is read at a control plane, and unknown is not offline.
       el("td", {}, uiBadge(c.online ? bl({ en: "Connected", ja: "接続中" }) : bl({ en: "Offline", ja: "オフライン" }), c.online ? "ok" : "danger")),
       el("td", { text: [c.edge_region_id, c.edge_cluster_id].filter(Boolean).join(" / ") || "—" }),
-      el("td", { text: c.last_heartbeat_at || bl({ en: "never", ja: "なし" }) }),
+      el("td", { text: (c.last_heartbeat_at ? window.dsseFormatTime(c.last_heartbeat_at) : bl({ en: "never", ja: "なし" })) }),
     ]));
     bodyHost.appendChild(el("table", { class: "ui-table" }, [
       el("thead", {}, el("tr", {}, [
@@ -620,7 +705,7 @@ async function showSiteDetail(siteID, fallback, host) {
   const foot = modal.el.querySelector(".ui-modal-foot");
   foot.innerHTML = "";
   const managed = !!s.managed;
-  foot.appendChild(el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Install connector", ja: "コネクタを導入" }), onClick: () => showEnrollmentCommand(s.site_id || siteID) }));
+  foot.appendChild(el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Install connector", ja: "コネクタを導入" }), onClick: () => showEnrollmentCommand(s.site_id || siteID, host) }));
   if (managed) {
     foot.appendChild(el("button", { class: "ui-btn ui-btn-danger", text: bl({ en: "Delete site", ja: "サイトを削除" }), onClick: () => deleteSite(s.site_id || siteID, s.name, modal, host) }));
   }
@@ -869,11 +954,15 @@ function downloadConnectorProfile(profile, fileName) {
   URL.revokeObjectURL(url);
 }
 
-async function showEnrollmentCommand(siteID) {
+async function showEnrollmentCommand(siteID, listHost) {
   // Open the modal immediately with a loading state so the click always has visible feedback, then fetch.
   const host = el("div", {}, el("span", { class: "ui-view-desc", text: bl({ en: "Generating…", ja: "生成中…" }) }));
   const m = uiModal({
     title: bl({ en: "Add a connector to " + siteID, ja: siteID + " にコネクタを追加" }),
+    // The connector is installed on another machine while this dialog is open, so the list behind it is out of
+    // date by the time it closes (acceptance C, 2026-11-07: an online connector did not appear until a manual
+    // reload). Closing reads the list again.
+    onClose: () => { if (listHost && listHost.isConnected !== false) renderSiteList(listHost); },
     body: [host],
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Done", ja: "完了" }), onClick: () => m.close() })],
   });
@@ -1036,7 +1125,7 @@ async function showEnrollmentCommand(siteID) {
     const name = program && program.file_name ? String(program.file_name) : "";
     if (/\.(tar\.gz|tgz)$/i.test(name)) lines.push("tar xzf " + name);
     else if (/\.zip$/i.test(name)) lines.push("unzip " + name);
-    lines.push((profile ? "./dsse-connector-install --profile " + fileName : command));
+    lines.push((profile ? "sudo ./dsse-connector-install --profile " + fileName : command));
     return lines.join("\n");
   };
   host.appendChild(el("div", { class: "ui-field-label", style: "margin-top:14px", text: bl({ en: "2. Run this on that machine", ja: "2. そのマシンで実行" }) }));

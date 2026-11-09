@@ -552,6 +552,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "dsse-install: %v\n", perr)
 			os.Exit(1)
 		}
+		mintingPlan = plan
 		hosts = strings.Join(plan.CertificateNames(), ",")
 		if err := runWithDeploymentCRL(*dir, hosts, orgFromPlan, *years, *force, plan.DeploymentCRLOrigins, plan.BrowserPortalNames()...); err != nil {
 			fmt.Fprintf(os.Stderr, "dsse-install: %v\n", err)
@@ -602,6 +603,10 @@ type deploymentAuthorities struct {
 // variable rather than a parameter because report() is reached through run() and several callers, and
 // threading a flag through all of them to decide one printed line is worse than saying it once here.
 var installingFromAPlan bool
+
+// mintingPlan is the plan being installed, so report() can name what the plan's clients dial and defer to
+// the -order sequence instead of printing the generic one-host walk.
+var mintingPlan *Plan
 
 func run(dir, hosts, orgName string, years int, force bool, browserPortalNames ...string) error {
 	return runWithDeploymentCRL(dir, hosts, orgName, years, force, nil, browserPortalNames...)
@@ -1576,6 +1581,13 @@ func writeEnvironment(dir string, names []string, ips []net.IP) error {
 	// Where a node writes to the authority. Inside one region the service name is enough and this is unused;
 	// a region that holds no state has no such network and reaches it here.
 	b.WriteString("DSSE_AUTHORITY_ORIGIN=" + shellQuote("https://"+planeNamesFor(host).Authority) + "\n")
+	b.WriteString("\n# The consensus store on this one host speaks TLS and asks Patroni for a client certificate,\n")
+	b.WriteString("# exactly as a member of a spanning store does; the material is minted beside this file.\n")
+	for _, kv := range oneHostStoreTransportEnvironment() {
+		// shellQuoted, not shellQuote: the hosts value carries single quotes of its own, and compose reads
+		// this file as well as the shell does.
+		b.WriteString(kv[0] + "=" + shellQuoted(kv[1]) + "\n")
+	}
 	// ★★★ WHO MAY BUILD SOFTWARE THAT INSTALLS ITSELF ON THIS DEPLOYMENT'S DEVICES (2026-08-27, found by
 	// building the real signed, notarised macOS package and running its own preinstall against the
 	// configuration this deployment publishes). Empty until an operator fills it in, and empty is not a
@@ -1904,6 +1916,18 @@ func report(dir string, a *deploymentAuthorities, names []string, ips []net.IP) 
 	fmt.Printf("  (DSSE_POSTGRES_DSN, DSSE_MIGRATION_DIR) and each Edge needs DSSE_CONTROL_PLANE.\n")
 	fmt.Printf("\n  ★ THE CONTROL PLANE FIRST. An Edge refuses to start without one, so the order is enforced\n")
 	fmt.Printf("  rather than recommended — and an Edge holds no database of its own.\n")
+	if mintingPlan != nil {
+		// ★★★ ONE ORDER, NOT TWO (2026-11-04). This summary used to print "START, CHECK, THEN CLOSE" while -order
+		// prints start, -bootstrap-admin, restart the control plane AND the Edges, then -verify with the named API
+		// token. -verify asserts that the break-glass credential is no longer accepted, so the plan's order is the
+		// one that can pass. A reader following both could not tell which to trust.
+		fmt.Printf("\n  ★★ FOLLOW THE ORDER -order PRINTS:  dsse-install -plan <plan> -dir %s -order\n", dir)
+		fmt.Printf("  start this machine, create the administrator with -bootstrap-admin, restart the control plane\n")
+		fmt.Printf("  AND the Edges, then run the -verify command it prints with the named API token. -verify checks\n")
+		fmt.Printf("  that the break-glass credential is no longer accepted, so it belongs after -bootstrap-admin.\n")
+		reportPlanNameResolution(mintingPlan)
+		return
+	}
 	fmt.Printf("\n  then check it:\n")
 	fmt.Printf("    dsse-install -verify -dir %s \\\n", dir)
 	fmt.Printf("      -control-plane https://admin.<host>:443 \\\n")

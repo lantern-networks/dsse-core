@@ -42,7 +42,7 @@ func TestEveryTrustedBundleEntrypointRejectsEmptyKeyring(t *testing.T) {
 			t.Error("enforcing loader accepted attacker-embedded key with empty keyring")
 		}
 		if err := VerifySignatureWithTrustedKeys(b, keys); err == nil {
-			t.Error("enforcing verifier accepted attacker-embedded key with empty keyring")
+			t.Error("enforcing verifier trusted an attacker-embedded key with an empty keyring")
 		}
 	}
 	keys := map[string]ed25519.PublicKey{b.SigningKeyID: pub}

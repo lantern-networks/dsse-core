@@ -42,7 +42,7 @@ type edgeConfigPull struct {
 // edgeConfigPullState asks one Edge's health surface what its configuration pull is doing.
 func edgeConfigPullState(client *http.Client, adminURL string) edgeConfigPull {
 	state := edgeConfigPull{URL: strings.TrimRight(adminURL, "/")}
-	code, body, err := get(client, state.URL+"/healthz", "")
+	code, body, err := getNodeHealth(client, state.URL+"/healthz")
 	if err != nil || code != 200 {
 		return state
 	}

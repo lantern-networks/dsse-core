@@ -61,7 +61,7 @@ func buildSteerExclusionSourceClient(caFile string) (*http.Client, error) {
 	}
 	return &http.Client{
 		Timeout:   15 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: tlsCfg},
+		Transport: edgeTransport(tlsCfg),
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return fmt.Errorf("the control plane redirected this authenticated pull to %s: refusing to follow it "+
 				"with an admin token attached", req.URL.Redacted())

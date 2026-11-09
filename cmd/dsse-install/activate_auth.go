@@ -263,9 +263,11 @@ func runActivateAuth(ctx context.Context, dir, planPath, cp, token, edgeToken, e
 	if err != nil {
 		return empty, err
 	}
-	if !declaredNodeMapProfile(plan.Profile) {
-		return empty, fmt.Errorf("shared-fleet setup requires a declared shared-fleet profile; use the rolling-upgrade procedure for legacy deployments")
-	}
+	// Every deployment installed from a complete plan has a census of every CP and Edge it planned, and is
+	// activated the same way (0.4.1 final acceptance A, 2026-11-09: this used to refuse every plan but the
+	// declared shared fleets, leaving the single-region and three-region layouts without revocation
+	// reauthentication). A deployment with no plan — an upgraded legacy one — still has no complete inventory
+	// here and is refused by loadInstallPlan above.
 	raw, err := os.ReadFile(filepath.Join(dir, authCensusFile))
 	if err != nil {
 		return empty, err
@@ -320,18 +322,10 @@ func runActivateAuth(ctx context.Context, dir, planPath, cp, token, edgeToken, e
 		return empty, err
 	}
 	defer client.CloseIdleConnections()
+	// The same routes -verify dials, by the same rule (plan.edgeAdminRoutes).
 	var edges []authInstallEdge
-	for _, target := range plan.nodeAdminTargets() {
-		if target.Role != "edge" {
-			continue
-		}
-		region, m, _ := plan.find(target.Machine)
-		owner := m
-		if plan.dedicatedMultiEdge() {
-			owner = region.controlPlane()
-		}
-		endpoint := resolveDoorArguments("https://" + target.Label + ".admin." + plan.Deployment + "@" + owner.reachableAt())
-		edges = append(edges, authInstallEdge{ID: authMemberID(m.Name, "edge"), URL: endpoint})
+	for _, route := range plan.edgeAdminRoutes() {
+		edges = append(edges, authInstallEdge{ID: authMemberID(route.Machine, "edge"), URL: resolveDoorArguments(route.URL)})
 	}
 	return activateFleetAuthentication(ctx, client, strings.TrimSuffix(cp, "/"), token, edgeToken, census, edges, features, 2*time.Second)
 }

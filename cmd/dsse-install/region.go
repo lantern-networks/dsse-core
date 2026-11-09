@@ -354,6 +354,7 @@ func setRegionEnvironment(dir, region string, standbyControlPlane, stateBearingJ
 		// operate. Nothing was reachable through it; it was trust extended to nobody, which is the kind that
 		// is never noticed until somebody is there.
 		set("DSSE_TRUSTED_FRONT_DOORS", fmt.Sprintf("10.%d.0.5", octet))
+		set("DSSE_CONSOLE_TRUSTED_FRONT_DOORS", fmt.Sprintf("10.%d.0.5", octet))
 	}
 	for _, line := range lines {
 		if strings.HasPrefix(strings.TrimSpace(line), "DSSE_REGION_ENDPOINTS=") {

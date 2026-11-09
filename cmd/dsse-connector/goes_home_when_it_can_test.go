@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -121,5 +122,72 @@ func TestLettingGoEndsTheRealTunnelWorker(t *testing.T) {
 	}
 	if held := attachments.nodes(); len(held) != 0 {
 		t.Fatalf("the attachment was not released: %v", held)
+	}
+}
+
+// ★★★ GOING HOME REDIALS AT ONCE (2026-11-07, measured on 0.4.1 acceptance B). Every worker used to pause two
+// seconds after letting go — the pause meant for a door that just failed — so for two seconds a connector that
+// had just watched its home door answer three checks in a row was attached nowhere, and everything behind it was
+// unreachable from every Region. This runs the real tunnel loop against two fake Edges and measures from the
+// decision to the new tunnel arriving at home.
+func TestGoingHomeRedialsTheHomeDoorWithoutPausing(t *testing.T) {
+	fakeEdge := func(node string, arrived chan<- time.Time) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := tunnel.UpgradeWithHeaders(w, r, http.Header{tunnel.EdgeNodeHeader: []string{node}})
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			select {
+			case arrived <- time.Now():
+			default:
+			}
+			var frame tunnel.Frame
+			for conn.ReadJSON(&frame) == nil {
+			}
+		}))
+	}
+	homeArrived := make(chan time.Time, 8)
+	awayArrived := make(chan time.Time, 8)
+	home := fakeEdge("edge-home", homeArrived)
+	defer home.Close()
+	away := fakeEdge("edge-away", awayArrived)
+	defer away.Close()
+
+	doors := parseConnectorEndpoints("region-a=" + home.URL + ";region-b=" + away.URL)
+	doors.advance(errors.New("region-a is down, as it was during the outage"))
+	if doors.atPreferred() {
+		t.Fatal("the connector did not start away from home")
+	}
+	attachments := newConnectorFleetAttachments()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go connectTunnelLoop(ctx, doors, attachments, true, "conn-1", "secret", "http://127.0.0.1:1", nil,
+		connectorTCPNetDialer{}, nil)
+
+	select {
+	case <-awayArrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the connector never attached to the door it failed over to")
+	}
+	for len(attachments.nodes()) == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// What watchForHome does once home has answered enough checks.
+	decided := time.Now()
+	if !doors.resetToPreferred() {
+		t.Fatal("going home did not count as crossing a Region")
+	}
+	attachments.letGoOfEverything()
+
+	select {
+	case at := <-homeArrived:
+		if gap := at.Sub(decided); gap > time.Second {
+			t.Fatalf("the connector reached home %s after deciding to go — attached nowhere for that long, for a "+
+				"door it had just proved", gap.Round(time.Millisecond))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the connector never reached home")
 	}
 }

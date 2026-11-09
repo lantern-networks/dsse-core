@@ -358,11 +358,17 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 	// availability of the decrypt path wins over a visibility log line.
 	var bytesSent int64
 	bytesReceived := new(int64)
+	// Set when a sign-in the user already completed satisfies what dec requires, so the request is forwarded
+	// and must be recorded as allowed (access_log_after_authentication.go), not as a request for authentication.
+	allowedByAuthentication := false
 	defer func() {
+		if allowedByAuthentication {
+			dec = decisionAllowedByAuthentication(dec)
+		}
 		// Policy-driven access logging: only policy ACTIONS and policy-designated categories (AI SaaS) earn a
 		// row; a routine allow of unmarked traffic is NOT logged (that noise is ~99% of intercepted requests and
 		// does not scale). -access-log-all restores full logging.
-		if !shouldLogAccessDecision(dec) {
+		if !shouldLogAccessDecision(dec) && !decisionWasAllowedByAuthentication(dec) {
 			return
 		}
 		if dec.Metadata == nil {
@@ -427,6 +433,7 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 				return
 			}
 			// a live federated grant satisfies the authenticate requirement — fall through and forward.
+			allowedByAuthentication = true
 		} else {
 			setSWGHTTPEgressOutcome(w, edgeplane.EdgeSWGHTTPEgressOutcomePolicyDenied)
 			// ★★★ A NON-BROWSER HTTP CLIENT IS TOLD WHERE TO GO (2026-09-02; the justification CORRECTED
@@ -459,7 +466,7 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 					w.Header().Set(stepUpChallengeHeader, u)
 				}
 			}
-			writeJSON(w, statusForDecision(dec.Decision), dec)
+			writeSWGPolicyRefusal(w, r, targetURL.Hostname(), dec)
 			return
 		}
 	}
@@ -587,7 +594,7 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 					"organization's Sites to Bypass", targetURL.Hostname()))
 			return
 		}
-		writeError(w, http.StatusBadGateway, err)
+		writeSWGUpstreamFailure(w, r, targetURL.Hostname(), err)
 		return
 	}
 	// Content-Encoding reconciliation can replace Body with a decoder. Close

@@ -48,7 +48,7 @@ func verifyControlChannel(client *http.Client, edgeAdmins []string) []verifyResu
 		if admin == "" {
 			continue
 		}
-		code, raw, err := get(client, admin+"/healthz", "")
+		code, raw, err := getNodeHealth(client, admin+"/healthz")
 		if err != nil || code != 200 {
 			continue
 		}

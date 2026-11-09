@@ -124,7 +124,7 @@ func TestPostgresFirstPartyIdentityAndBulkRevocation(t *testing.T) {
 func TestPostgresSiteMetadataRotationAndGenerationRollback(t *testing.T) {
 	db := reviewAuthSitePostgresDB(t)
 	ctx := context.Background()
-	for _, stmt := range postgresAdminSiteSchemaSQL() {
+	for _, stmt := range append(postgresAdminSiteSchemaSQL(), postgresAdminSiteDoorOrderSQL()...) {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			t.Fatal(err)
 		}

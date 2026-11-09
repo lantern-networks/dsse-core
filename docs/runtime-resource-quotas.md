@@ -83,6 +83,30 @@ room for at least one whole request. `DSSE_ENROL_BURST` selects a burst directly
 `0` derives one from the enabled rate. Certificate-authenticated renewal is
 separate and does not inherit this bootstrap limiter.
 
+The first-party administrator sign-in and activation routes (`POST /admin/login/*`
+and `POST /admin/activate*`) carry two bounds on the control plane, answered `429`
+with `Retry-After`. The tight one is keyed on the source address AND what the
+attempt is about — the account in a password attempt, the challenge in a
+second-factor attempt, the invitation token in an activation step: 5 requests per
+second with a burst of 20. It is keyed that way
+because administrators sign in through the Admin Console, which proxies these routes,
+so every browser behind one Console reaches the control plane from one address; a
+bound on that address alone would let one person's mistakes refuse every colleague.
+The looser one is keyed on the source alone, 50 per second with a burst of 200, as a
+backstop against a flood spread across many accounts; an office's Console does not
+meet it. `DSSE_ADMIN_SIGNIN_REQUESTS_PER_SECOND` / `DSSE_ADMIN_SIGNIN_BURST` size the
+first, `DSSE_ADMIN_SIGNIN_SOURCE_REQUESTS_PER_SECOND` / `DSSE_ADMIN_SIGNIN_SOURCE_BURST`
+the second; `0` turns the respective bound off. The per-account lock after repeated
+wrong passwords stays and is the limit that remains for a flood against one account.
+
+The Admin Console bounds the same routes per browser address, 5 per second with a
+burst of 20 (`SIGNIN_REQUESTS_PER_SECOND`, `SIGNIN_BURST`; `0` turns it off). Behind
+the deployment's L4 front door the Console learns the browser's address from the PROXY
+protocol header, which it reads only from the addresses in `TRUSTED_FRONT_DOORS`
+(generated as `DSSE_CONSOLE_TRUSTED_FRONT_DOORS`); the generated HAProxy configuration
+sends that header to the Console. Without that trust the Console sees the door as
+every browser's address and this bound falls back to bounding the door.
+
 Authentication start rates, anonymous/pending/retained request budgets, waiting
 flow reservations, result retention capacity, and native browser request lists
 retain their existing bounds. Their role in abuse resistance, ownership and

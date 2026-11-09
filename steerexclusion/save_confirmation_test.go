@@ -14,10 +14,14 @@ type steerSaveProbe struct {
 	data   []byte
 	err    error
 	retain bool
+	saves  int
 }
+
+func probeSaves(p *steerSaveProbe) int { return p.saves }
 
 func (p *steerSaveProbe) Load() ([]byte, error) { return append([]byte(nil), p.data...), nil }
 func (p *steerSaveProbe) Save(b []byte) error {
+	p.saves++
 	if p.err == nil || p.retain {
 		p.data = append([]byte(nil), b...)
 	}
@@ -208,5 +212,40 @@ func TestSteerExclusionReturnedPoliciesDoNotAlias(t *testing.T) {
 	s.List("t1")[0].ExcludedAppSigningIDs[0] = "list"
 	if got := s.ResolveForDevice("t1", "", ""); !reflect.DeepEqual(got, []string{"original"}) {
 		t.Fatal("aliased policy", got)
+	}
+}
+
+// TestAnUnconfirmedRemovalIsConfirmedBeforeItIsAcknowledged — review C3-RRR1: the save put the new bytes in place
+// and could not confirm them; the retry read the new state back, found nothing to remove, wrote nothing, and
+// reported success.
+func TestAnUnconfirmedRemovalIsConfirmedBeforeItIsAcknowledged(t *testing.T) {
+	probe := &steerSaveProbe{}
+	fp := &FilePersistence{persister: probe, byID: map[string]*Policy{}}
+	s, err := NewStoreWithPersistence(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetReceiver()
+	now := time.Now().UTC()
+	held := Policy{ID: "sx_old", TenantID: "org-1", ScopeType: "tenant", ExcludedAppSigningIDs: []string{"ssh.exe"}, Status: "active", CreatedAt: now, UpdatedAt: now}
+	if err := s.ReplaceTenantsChecked(map[string][]Policy{"org-1": {held}}); err != nil {
+		t.Fatal(err)
+	}
+	saves := func() int { return probeSaves(probe) }
+	before := saves()
+	probe.err, probe.retain = blobstore.ErrDurabilityUnconfirmed, true // the bytes land; the confirmation does not
+	if err := s.ReplaceTenantsChecked(map[string][]Policy{"org-1": {}}); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("first removal: %v, want unconfirmed", err)
+	}
+	// Still unconfirmed on the retry: it must not become success.
+	if err := s.ReplaceTenantsChecked(map[string][]Policy{"org-1": {}}); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("retry while the disk still cannot confirm: %v, want an error", err)
+	}
+	probe.err, probe.retain = nil, false
+	if err := s.ReplaceTenantsChecked(map[string][]Policy{"org-1": {}}); err != nil {
+		t.Fatalf("retry once the disk confirms: %v", err)
+	}
+	if saves() <= before+2 {
+		t.Fatalf("saves %d -> %d: the retry acknowledged without writing and confirming the state", before, saves())
 	}
 }

@@ -15,9 +15,11 @@ import (
 	"github.com/lantern-networks/dsse-core/agentupdate"
 )
 
-// stagedInto points StagedRoot at a scratch tree so no test can write into a real ProgramData.
+// stagedInto points StagedRoot at a scratch tree so no test can write into a real ProgramData. A test that uses
+// it stages, so on Windows it needs an elevated token (stagingNeedsAnAdministrator).
 func stagedInto(t *testing.T) {
 	t.Helper()
+	stagingNeedsAnAdministrator(t)
 	t.Setenv("ProgramData", t.TempDir())
 }
 
@@ -317,6 +319,7 @@ func TestAFailedFetchCarriesTheBodyThatDistinguishesIt(t *testing.T) {
 			want: "does not match the published manifest"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			stagedInto(t)
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, strings.TrimSuffix(tc.body, "\n"), tc.status)
 			}))
@@ -336,6 +339,7 @@ func TestAFailedFetchCarriesTheBodyThatDistinguishesIt(t *testing.T) {
 
 // A hostile or broken origin must not get to write its whole page into the log of a machine running as SYSTEM.
 func TestAFailedFetchTruncatesAndFlattensTheBody(t *testing.T) {
+	stagedInto(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 		_, _ = w.Write([]byte(strings.Repeat("A\n\tB ", 4000)))

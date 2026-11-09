@@ -398,3 +398,54 @@ for (const tenant of ['own','']) test('bearer or tenantless operator uses server
  assert.ok(f.requests.some(r=>r[1]==='/admin/agent-rollout?expected_tenant_id='+tenant));
  assert.equal(f.c.window._arCanSign,true);
 });
+
+// 0.4.1 final acceptance A (2026-11-09): the version field read "0.4.1-windows-x64.msi" for DsseAgent-0.4.1-windows-x64.msi.
+test('the version guessed from a release file name is the version, not the platform and extension after it',()=>{
+ const f=fixture();
+ const cases=[['DsseAgent-0.4.1-windows-x64.msi','0.4.1'],['LanternDsseAgent-0.4.1-20261109030427.pkg','0.4.1'],
+  ['dsse-agent-0.2.1+3f8f2b02.msi','0.2.1+3f8f2b02'],['dsse-steer-0.2.0-amd64.msi','0.2.0'],['agent-0.5.0-rc.1.pkg','0.5.0-rc.1'],
+  ['DsseAgent-0.4.1+source-8e250b8c9a5c.msi','0.4.1+source-8e250b8c9a5c'],['no-version-here.msi','']];
+ for(const [name,want] of cases)assert.equal(f.c.arGuessVersion(name),want,name);
+});
+
+
+// 0.4.1 final acceptance A (2026-11-09): with a signed file chosen, the fields kept a guess from the package name
+// while the release that went out was the file's. They now show the file's own values.
+test('choosing a signed release file shows the version, devices and address it will publish',async()=>{
+ const f=publishFixture();
+ await new Promise(r=>setImmediate(r));
+ assert.equal(f.fields.version.get(),f.m.version);
+ assert.equal(f.fields.target.get(),f.m.platform+'/'+f.m.arch);
+ assert.equal(f.fields.url.get(),f.m.artifact_url);
+});
+
+// Review FINAL-A-R1 (2026-11-09): a signed file's read finishing after the operator chose another file, or no file,
+// must not land on the form.
+function envelopeFor(version){
+ const m={schema:'1',version,platform:'windows',arch:'amd64',channel:'stable',delivery:'dsse',artifact_kind:'msi',artifact_url:'https://example.test/'+version+'.msi',artifact_sha256:'a'.repeat(64),artifact_size:32,released_at:'2026-09-18T00:00:00Z',not_after:'2026-10-18T00:00:00Z'};
+ return {type:'dsse_agent_update_manifest.v1',version:'1',payload_b64:Buffer.from(JSON.stringify(m)).toString('base64'),payload_sha256:'b'.repeat(64)};
+}
+function deferredFile(env){let release;const text=new Promise(r=>{release=()=>r(JSON.stringify(env));});return {file:{text:()=>text},release};}
+test('a signed file chosen earlier does not overwrite the one chosen after it, whichever read finishes first',async()=>{
+ const f=publishFixture();await new Promise(r=>setImmediate(r));
+ const a=deferredFile(envelopeFor('1.1.1')),b=deferredFile(envelopeFor('2.2.2'));
+ f.inputs[1].files=[a.file];f.inputs[1].handlers.change();
+ f.inputs[1].files=[b.file];f.inputs[1].handlers.change();
+ b.release();await new Promise(r=>setImmediate(r));
+ assert.equal(f.fields.version.get(),'2.2.2');
+ a.release();await new Promise(r=>setImmediate(r));
+ assert.equal(f.fields.version.get(),'2.2.2','the earlier file landed after the later one');
+ assert.equal(f.fields.url.get(),'https://example.test/2.2.2.msi');
+});
+test('a signed file deselected before its read finished does not overwrite what the operator typed',async()=>{
+ const f=publishFixture();await new Promise(r=>setImmediate(r));
+ const a=deferredFile(envelopeFor('1.1.1'));
+ f.inputs[1].files=[a.file];f.inputs[1].handlers.change();
+ f.inputs[1].files=[];f.inputs[1].handlers.change();
+ f.fields.version.set('7.7.7');f.fields.target.set('darwin/arm64');f.fields.url.set('https://typed.example.test/pkg');
+ a.release();await new Promise(r=>setImmediate(r));
+ assert.equal(f.fields.version.get(),'7.7.7');
+ assert.equal(f.fields.target.get(),'darwin/arm64');
+ assert.equal(f.fields.url.get(),'https://typed.example.test/pkg');
+});
+

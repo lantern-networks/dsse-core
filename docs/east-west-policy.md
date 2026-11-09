@@ -7,6 +7,14 @@ application is not itself authorization. Configure routing with the
 [Connector guide](connector.md), identity with [IdP integration](idp.md), and then
 the policy described here.
 
+A steered device needs only a Connector Access rule to reach what a site's
+connectors serve. Publishing an application is for devices without the agent, which
+reach it through a browser; it is not a step of Connector Access. A rule's destination
+may be **Any**, or a network destination registered on the **Groups & Services** screen — an
+address, a host name, or a range such as `10.20.9.0/24`, which matches every address
+inside it. Each destination in the list says what it is (application, network,
+device).
+
 This guide describes the current experimental source, including limitations of
 the shared federated step-up path. APIs, behavior, and migration procedures may
 change. It does not claim complete per-hop assurance on every traffic path.
@@ -101,6 +109,17 @@ apply. Leave it off when the rule must require a person's interactive sign-in.
 Out-of-band (OOB) means authentication happens in a separate browser/window, not
 inside the SSH, RDP, or SMB protocol. It does not necessarily mean a second device
 or a second communication network.
+
+On Windows the browser opens only in the sign-in session of the user whose application
+made the connection. A connection from a process started with **Run as administrator**
+belongs to a different logon session, so it is held but no browser opens
+(`steer_stepup_browser_launch_failed` in the agent log); it times out after two minutes.
+Start the application the way the user normally runs it.
+
+A sign-in completed in another logon session does not cover the elevated process: the
+approval is bound to the OS user and the logon session that asked for it, and a
+destination with `max_age=0` takes a fresh sign-in for each request. Signing in once from
+a non-elevated browser therefore does not let an elevated process through.
 
 ```mermaid
 sequenceDiagram

@@ -142,6 +142,10 @@ func TestADestructiveActNeedsAnElevationEvenWhenThePermissionCheckPasses(t *test
 		!strings.Contains(response, `"tenant_id":"tenant_northwind"`) {
 		t.Fatalf("the refusal does not name the elevation a screen would have to offer: %s", response)
 	}
+	// And WHICH act, as the list writes it, so the screen can say it in its reader's language.
+	if !strings.Contains(response, `"act":"DELETE /admin/tenant-cas/*/*"`) {
+		t.Fatalf("the refusal does not name the act it refused: %s", response)
+	}
 	// The registration above is the control: the SAME caller, the SAME organization, ordinary work, allowed.
 	// Without it, "the destructive act was refused" is also what a broken delegation looks like.
 

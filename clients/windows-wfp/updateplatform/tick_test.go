@@ -296,6 +296,7 @@ func (p *recordingPlatform) Execute(m agentupdate.Manifest) error {
 // staging early — the window, and the rehearsal — assume a window that will open, and a freeze is exactly the
 // statement that none will.
 func TestAFrozenFleetDoesNotStage(t *testing.T) {
+	stagedInto(t)
 	dir := t.TempDir()
 	served := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

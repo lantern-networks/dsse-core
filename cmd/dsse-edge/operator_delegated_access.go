@@ -23,6 +23,8 @@ type operatorDelegatedVerdict struct {
 	Elevated bool
 	// Why carries the reason the route is on the elevated list, for the refusal message.
 	Why string
+	// Act names the entry of the elevated list this request matched (operatorElevatedAct.Key), for a screen.
+	Act string
 	// Target is the organization being acted on, or "" when this is not an operate-within request at all.
 	Target string
 	// Resolved is true when this node could look the organization up at all.
@@ -60,7 +62,9 @@ func operatorDelegationForRequest(ctx context.Context, r *http.Request, identity
 	if operatorRouteIsEnvelopeControl(r.URL.Path) {
 		return verdict
 	}
-	verdict.Why, verdict.NeedsElevation = operatorActNeedsElevation(r.Method, r.URL.Path)
+	if act, ok := operatorElevatedActFor(r.Method, r.URL.Path); ok {
+		verdict.Why, verdict.Act, verdict.NeedsElevation = act.Why, act.Key(), true
+	}
 
 	tenant, resolved, err := operatorDelegationRecord(ctx, store, target)
 	if err != nil {

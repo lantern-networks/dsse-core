@@ -29,6 +29,8 @@ window.I18N = {
     breakGlass: "Break-glass admin token (optional)",
     signedOut: "Signed out.",
     invalidCredentials: "Invalid credentials.",
+    signInUnreachable: "Sign-in could not be completed (HTTP {status}): something failed on the server. Try again shortly, and tell the operator if it continues.",
+    signInRefused: "Sign-in was refused (HTTP {status}).",
     enterTotp: "Enter your 2FA code.",
     activateTitle: "Activate your admin account",
     newPassword: "New password",
@@ -70,6 +72,8 @@ window.I18N = {
     breakGlass: "ブレークグラス管理トークン (任意)",
     signedOut: "サインアウトしました。",
     invalidCredentials: "認証情報が正しくありません。",
+    signInUnreachable: "サインインを完了できませんでした（HTTP {status}）。サーバー側で問題が起きています。しばらくしてからもう一度試し、続く場合は運営者に連絡してください。",
+    signInRefused: "サインインが拒否されました（HTTP {status}）。",
     enterTotp: "2FA コードを入力してください。",
     activateTitle: "管理アカウントを有効化",
     newPassword: "新しいパスワード",
@@ -82,4 +86,23 @@ window.I18N = {
     activationDone: "アカウントを有効化しました。email・パスワード・2FA でサインインできます。",
     activationInvalid: "この有効化リンクは無効または期限切れです。",
   },
+};
+
+// The language a reader sees before choosing one. A choice is remembered per browser AND per host name — each
+// region's Console is its own site to the browser — so a reader who chose Japanese on one region's Console met
+// English on the next (0.4.1 acceptance B rerun). Without a choice here, the browser's own language preference
+// decides, in the order the reader set it.
+window.dsseInitialLang = function () {
+  try {
+    const saved = localStorage.getItem("lang");
+    if (saved === "en" || saved === "ja") return saved;
+  } catch (e) { /* storage unavailable: fall through to the browser's preference */ }
+  const nav = typeof navigator !== "undefined" ? navigator : {};
+  const prefs = (nav.languages && nav.languages.length) ? nav.languages : [nav.language || ""];
+  for (const p of prefs) {
+    const l = String(p).toLowerCase();
+    if (l.startsWith("ja")) return "ja";
+    if (l.startsWith("en")) return "en";
+  }
+  return "en";
 };

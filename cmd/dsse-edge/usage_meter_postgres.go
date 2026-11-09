@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/durablefile"
 	usagemeter "github.com/lantern-networks/dsse-core/usagemeter"
 )
 
@@ -321,12 +322,9 @@ func (store *postgresUsageMeterStore) appendSpoolLocked(record usagemeter.UsageM
 	if err := file.Close(); err != nil {
 		return err
 	}
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
+	// The spool may have just been created; its directory entry is made durable the shared way (a directory
+	// handle cannot be flushed on Windows, where SyncDir does nothing).
+	return durablefile.SyncDir(filepath.Dir(path))
 }
 
 func (store *postgresUsageMeterStore) spooledPending() ([]usagemeter.UsageMeterRecord, error) {

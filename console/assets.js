@@ -124,7 +124,7 @@ async function renderEndpointsSection(section) {
     });
     tableHost.innerHTML = "";
     tableHost.appendChild(el("table", { class: "ui-table" }, [
-      el("thead", {}, el("tr", {}, ["Name", bl({ en: "Type", ja: "種別" }), bl({ en: "Platform", ja: "OS" }), bl({ en: "Source", ja: "出所" }), bl({ en: "Address", ja: "アドレス" }), bl({ en: "Interception", ja: "傍受" }), bl({ en: "Actions", ja: "操作" })].map((x) => el("th", { text: x })))),
+      el("thead", {}, el("tr", {}, [bl({ en: "Name", ja: "名前" }), bl({ en: "Type", ja: "種別" }), bl({ en: "Platform", ja: "OS" }), bl({ en: "Source", ja: "出所" }), bl({ en: "Address", ja: "アドレス" }), bl({ en: "Interception", ja: "傍受" }), bl({ en: "Actions", ja: "操作" })].map((x) => el("th", { text: x })))),
       el("tbody", {}, rows),
     ]));
     tableHost.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Showing ", ja: "表示 " }) + filtered.length + " / " + eps.length }));

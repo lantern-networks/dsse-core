@@ -43,7 +43,7 @@ func verifyMesh(client *http.Client, edgeAdmins []string) []verifyResult {
 		if admin == "" {
 			continue
 		}
-		code, raw, err := get(client, admin+"/healthz", "")
+		code, raw, err := getNodeHealth(client, admin+"/healthz")
 		if err != nil || code != 200 {
 			continue
 		}
@@ -211,7 +211,7 @@ func verifyEgressAddressFamily(client *http.Client, edgeAdmins []string) []verif
 		if admin == "" {
 			continue
 		}
-		code, raw, err := get(client, admin+"/healthz", "")
+		code, raw, err := getNodeHealth(client, admin+"/healthz")
 		if err != nil || code != 200 {
 			continue
 		}

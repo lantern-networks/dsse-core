@@ -98,7 +98,7 @@ func newCPQuorumCheck(endpointsJSON, caFile, certFile, keyFile string, bootstrap
 		return nil, fmt.Errorf("read CP quorum identity: %w", err)
 	}
 	client := &http.Client{
-		Transport:     &http.Transport{Proxy: nil, TLSClientConfig: &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}, MaxIdleConnsPerHost: 4},
+		Transport:     &http.Transport{Proxy: nil, DialContext: edgeDial, TLSClientConfig: &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}, MaxIdleConnsPerHost: 4},
 		Timeout:       cpQuorumTimeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}

@@ -84,6 +84,14 @@ function renderOrganizationsView(content) {
 }
 
 function orgStatusKind(s) { return s === "active" ? "ok" : s === "suspended" ? "warn" : "off"; }
+// One table for the list and the editor: the list showed the code ("active") while the editor's choices were in
+// the reader's language (2026-11-07, three-region acceptance rerun). An unknown state is shown as it came.
+const ORG_STATUS_LABELS = {
+  active: { en: "Active", ja: "有効" },
+  suspended: { en: "Suspended", ja: "停止" },
+  archived: { en: "Archived", ja: "アーカイブ" },
+};
+function orgStatusLabel(s) { const k = s || "active"; return ORG_STATUS_LABELS[k] ? bl(ORG_STATUS_LABELS[k]) : k; }
 
 async function renderOrgList(host) {
   uiState(host, "loading");
@@ -103,7 +111,7 @@ async function renderOrgList(host) {
   if (!filtered.length) { if (!current()) return; uiState(host, "empty", bl({ en: "No matches.", ja: "一致なし。" })); return; }
   const rows = filtered.map((t2) => el("tr", {}, [
     el("td", {}, [el("strong", { text: t2.display_name || t2.tenant_id }), el("div", { class: "ui-view-desc" }, el("code", { text: t2.tenant_id }))]),
-    el("td", {}, uiBadge(t2.status || "active", orgStatusKind(t2.status))),
+    el("td", {}, uiBadge(orgStatusLabel(t2.status), orgStatusKind(t2.status))),
     el("td", { text: t2.plan || "—" }),
     el("td", { text: t2.home_region || "—" }),
     el("td", { class: "ui-view-desc" }, [el("span", {text: (t2.allowed_regions || []).join(", ") || "—"}), t2.shared_fleet_warning ? el("div", {role: "status", text: sharedFleetTenantWarning(t2)}) : null].filter(Boolean)),
@@ -135,11 +143,8 @@ function openOrgForm(content, existing) {
   const idF = uiField({ name: "id", label: bl({ en: "Tenant ID", ja: "テナント ID" }), required: true, value: existing ? existing.tenant_id : "", placeholder: "tenant_acme", validate: (v) => (/\s/.test(v) ? bl({ en: "No spaces allowed.", ja: "空白は使えません。" }) : "") });
   if (existing) idF.el.querySelector("input").setAttribute("readonly", "true");
   const nameF = uiField({ name: "name", label: bl({ en: "Display name", ja: "表示名" }), required: true, value: existing ? existing.display_name : "", placeholder: "Acme Corp" });
-  const statusF = uiField({ name: "status", label: bl({ en: "Status", ja: "状態" }), type: "select", value: existing ? existing.status : "active", options: [
-    { value: "active", label: bl({ en: "Active", ja: "有効" }) },
-    { value: "suspended", label: bl({ en: "Suspended", ja: "停止" }) },
-    { value: "archived", label: bl({ en: "Archived", ja: "アーカイブ" }) },
-  ] });
+  const statusF = uiField({ name: "status", label: bl({ en: "Status", ja: "状態" }), type: "select", value: existing ? existing.status : "active",
+    options: Object.keys(ORG_STATUS_LABELS).map((value) => ({ value, label: orgStatusLabel(value) })) });
   const planF = uiField({ name: "plan", label: bl({ en: "Plan (optional)", ja: "プラン(任意)" }), value: existing ? existing.plan : "", placeholder: "enterprise" });
   const homeF = uiField({ name: "home", label: bl({ en: "Home region (optional)", ja: "ホームリージョン(任意)" }), value: existing ? existing.home_region : "", placeholder: "region-a" });
   const regionsF = uiField({ name: "regions", label: bl({ en: "Allowed regions (optional)", ja: "許可リージョン(任意)" }), value: existing ? (existing.allowed_regions || []).join(", ") : "", placeholder: "region-a, region-b", hint: bl({ en: "Comma-separated.", ja: "カンマ区切り。" }) });

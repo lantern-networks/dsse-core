@@ -111,3 +111,72 @@ test('max sign-in age keeps omitted, one-request, and exact positive seconds dis
   assert.throws(()=>context.parseMaxAgeMinutes(bad), undefined, bad);
  }
 });
+// Found 2026-11-04: an Internet Access rule saved to the control plane did not appear in the Edge's list read
+// straight afterwards. The list now waits until the Edge shows what was saved, or says it has not arrived.
+test('the internet access list waits for the Edge to show a saved rule', async () => {
+  const savedRule = {id: 'rule-1', priority: 20, name: 'Deny example.org', status: 'active', stage: 'enforce', source: ['*'], destination: ['g1']};
+  const stale = {ok: true, status: 200, body: {rules: [{kind: 'builtin_default', policy_id: 'p', access: 'allow'}]}};
+  const fresh = {ok: true, status: 200, body: {rules: [{kind: 'authored', rule: savedRule}, ...stale.body.rules]}};
+  assert.equal(context.egressListShows(stale.body.rules, {id: 'rule-1', saved: savedRule}), false);
+  assert.equal(context.egressListShows(fresh.body.rules, {id: 'rule-1', saved: savedRule}), true);
+  assert.equal(context.egressListShows(fresh.body.rules, {id: 'rule-1', saved: {...savedRule, name: 'renamed'}}), false);
+  // A change to what the rule DOES is a change the Edge must show before the wait ends.
+  const base = fresh.body.rules.find((e) => e.rule && e.rule.id === 'rule-1').rule;
+  for (const changed of [
+    {...base, action: {...(base.action || {}), access: 'deny'}},
+    {...base, action: {...(base.action || {}), inspection: 'bypass'}},
+    {...base, action: {...(base.action || {}), dlp: {profile_ids: ['dlpp_1']}}},
+    {...base, risk_at_least: 'high'},
+    {...base, allowed_tool_ids: ['tool_1']},
+  ]) {
+    assert.equal(context.egressListShows(fresh.body.rules, {id: 'rule-1', saved: changed}), false, JSON.stringify(changed));
+  }
+  // Key order is not a difference.
+  const reordered = Object.fromEntries(Object.entries(base).reverse());
+  assert.equal(context.egressListShows(fresh.body.rules, {id: 'rule-1', saved: reordered}), true);
+  // An empty DLP block and no DLP block are different rules (without its own block the rule
+  // takes the organization's DLP). The editor drops an empty block on save; the Edge still holding it is stale.
+  const emptyDlp = {...base, action: {access: 'allow', inspection: 'inspect', dlp: {identifiers: null, on_match: ''}}};
+  const noDlp = {...base, action: {access: 'allow', inspection: 'inspect'}};
+  const withEmpty = {ok: true, status: 200, body: {rules: [{kind: 'authored', rule: emptyDlp}]}};
+  const withNone = {ok: true, status: 200, body: {rules: [{kind: 'authored', rule: noDlp}]}};
+  assert.equal(context.egressListShows(withEmpty.body.rules, {id: 'rule-1', saved: noDlp}), false);
+  assert.equal(context.egressListShows(withNone.body.rules, {id: 'rule-1', saved: emptyDlp}), false);
+  assert.equal(context.egressListShows(withNone.body.rules, {id: 'rule-1', saved: noDlp}), true);
+  // An emptied list and a false flag are also kept as they are.
+  assert.equal(context.egressListShows(fresh.body.rules, {id: 'rule-1', saved: {...base, allowed_tool_ids: []}}), false);
+  // The save's answer can carry a warning beside the rule; the Edge's copy never does.
+  assert.equal(context.egressListShows(fresh.body.rules, {id: 'rule-1', saved: {...base, warning: 'overlaps rule 10'}}), true);
+  assert.match(readFileSync(new URL('../cmd/dsse-edge/rules_admin.go', import.meta.url), 'utf8'), /Warning string `json:"warning,omitempty"`/);
+  assert.equal(context.egressListShows(fresh.body.rules, {id: 'rule-1', gone: true}), false);
+  assert.equal(context.egressListShows(stale.body.rules, {id: 'rule-1', gone: true}), true);
+  assert.equal(context.egressListShows(stale.body.rules, undefined), true);
+});
+test('server-written rule words are shown in the reader language', () => {
+  const ja = vm.createContext({bl: b => b.ja, httpErr: () => ''});
+  vm.runInContext(readFileSync(new URL('./rules.js', import.meta.url), 'utf8'), ja);
+  assert.equal(ja.ruleFlowText({source_text: 'Any', destination_text: 'Any', service_text: 'Any'}), 'すべて → すべて : すべて');
+  assert.equal(ja.ruleDisplayName('Everything, allowed and inspected — the rule to narrow first'), 'すべて許可・検査（最初に絞り込むルール）');
+  assert.equal(ja.ruleDisplayName('My rule'), 'My rule');
+});
+test('a destination says whether it is an application, a network or a device, and where',()=>{
+ const make=(tag,attrs={},children=[])=>{
+  const node={tag,className:attrs.class||'',textContent:attrs.text||'',children:[],events:{},style:{},classList:{add(){},toggle(){}},
+   appendChild(child){this.children.push(child);return child},addEventListener(name,fn){this.events[name]=fn}};
+  for(const child of (Array.isArray(children)?children:[children])) if(child) node.appendChild(child);
+  return node;
+ };
+ const c=vm.createContext({bl:b=>b.en,el:make,uiBadge:(label)=>make('span',{text:label})});
+ vm.runInContext(readFileSync(new URL('./rules.js',import.meta.url),'utf8'),c);
+ const app={id:'app-h1',alias:'H1 internal app',kind:'network',source:'application',address:'h1.c.lab041.test'};
+ const net={id:'ep-1',alias:'H1 internal app net',kind:'network',source:'manual',address:'10.47.1.30/32'};
+ const dev={id:'dev-1',alias:'DESKTOP-ACC3',kind:'steered_device',source:'enrolled'};
+ assert.equal(c.ruleEndpointWhat(app),'application');assert.equal(c.ruleEndpointWhat(net),'network');assert.equal(c.ruleEndpointWhat(dev),'device');
+ const subjects=[app,net,dev].map(e=>({id:e.id,label:e.alias,kind:'endpoint',what:c.ruleEndpointWhat(e),address:e.kind==='network'?e.address:''}));
+ const picker=c.subjectPicker('Destination',subjects);
+ const text=JSON.stringify(picker.el,(k,v)=>k==='events'?undefined:v);
+ assert.match(text,/"Application".{0,200}"H1 internal app".{0,200}"h1\.c\.lab041\.test"/s);
+ assert.match(text,/"Network".{0,200}"H1 internal app net".{0,200}"10\.47\.1\.30\/32"/s);
+ assert.match(text,/"Device".{0,200}"DESKTOP-ACC3"/s);
+ assert.doesNotMatch(text,/"Endpoint"/,'every destination here says what it is');
+});

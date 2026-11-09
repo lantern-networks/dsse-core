@@ -228,7 +228,7 @@ func (a *windowsRegionActions) switchTo(ep regionfailover.RegionEndpoint) error 
 	if cur := a.active.Load(); cur != nil {
 		prev = cur.host
 	}
-	a.active.Store(&activeEndpoint{host: net.JoinHostPort(host, port), serverName: serverName, dialAddrs: addrs})
+	a.active.Store(&activeEndpoint{host: net.JoinHostPort(host, port), serverName: serverName, dialAddrs: addrs, region: ep.Region})
 	if a.onEndpoint != nil {
 		a.onEndpoint(addrs)
 	}

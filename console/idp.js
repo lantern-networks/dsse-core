@@ -126,6 +126,7 @@ async function renderIdPList(host) {
   const content = host.__idpContent;
   host.__idpAdd.disabled = true;
   try {
+    // two-planes-deliberate: /admin/tenant supplies only WHICH organization this is, and every row is checked to belong to it; an organization's identity does not change between the two answers (2026-11-06).
     const [body, tenant] = await Promise.all([idpGet("/admin/idp-connections"), idpGet("/admin/tenant")]);
     if (!idpObject(tenant) || !idpText(tenant.tenant_id) || !idpObject(body) || !Array.isArray(body.connections) || typeof body.default_idp_id !== "string" ||
         !body.connections.every(c => idpConnection(c) && c.tenant_id === tenant.tenant_id) || new Set(body.connections.map(c => c.idp_id)).size !== body.connections.length ||
@@ -203,6 +204,33 @@ async function idpRowChange(c, host, remove) {
 async function setIdpDefault(c, host) { return idpRowChange(c, host, false); }
 async function removeIdp(c, host) { return idpRowChange(c, host, true); }
 
+// What each check and its outcome are called on the screen. The Edge sends a code beside its English sentence; the
+// sentence stays as the tooltip, because its specifics (an error, a URL) are what an operator fixing it needs.
+// A code this table does not know shows the sentence (2026-11-07, three-region acceptance rerun: the results
+// read "reachable, 2 RSA key(s)" and "issuer matches, endpoints agree" on a Japanese screen).
+const IDP_CHECK_NAMES = {
+  jwks: { en: "Signing keys (JWKS)", ja: "署名鍵（JWKS）" },
+  discovery: { en: "Discovery document", ja: "OpenID の設定情報" },
+  "certificate authority": { en: "Certificate authority", ja: "認証局" },
+};
+function idpCheckName(k) { return IDP_CHECK_NAMES[k.name] ? bl(IDP_CHECK_NAMES[k.name]) : k.name; }
+function idpCheckDetail(k) {
+  const differ = Array.isArray(k.differ) ? k.differ.join(", ") : "";
+  switch (k.code) {
+    case "jwks_ok": return bl({ en: "Reachable, " + k.rsa_keys + " RSA key(s)", ja: "届きました。RSA の鍵 " + k.rsa_keys + " 本" });
+    case "jwks_no_rsa_keys": return bl({ en: "No RSA signing key is published", ja: "RSA の署名鍵が公開されていません" });
+    case "jwks_not_configured": return bl({ en: "No JWKS URL is set", ja: "JWKS の URL が設定されていません" });
+    case "jwks_unreachable": return bl({ en: "Not reachable", ja: "届きません" });
+    case "discovery_unreachable": return bl({ en: "Not reachable (not required)", ja: "届きません（必須ではありません）" });
+    case "issuer_mismatch": return bl({ en: "The issuer does not match", ja: "発行者が一致しません" });
+    case "issuer_matches": return differ
+      ? bl({ en: "The issuer matches; these differ from the provider's: " + differ, ja: "発行者は一致。ただし次の設定がプロバイダと違います: " + differ })
+      : bl({ en: "The issuer and the endpoints match", ja: "発行者もエンドポイントも一致しました" });
+    case "ca_unusable": return bl({ en: "The certificate authority set for this provider cannot be used", ja: "このプロバイダに設定した認証局を使えません" });
+    default: return k.detail;
+  }
+}
+
 // Non-interactive connectivity probe (discovery + JWKS reachable/parseable, issuer match) — no end-user login.
 async function testIdp(c) {
   uiToast(bl({ en: "Testing…", ja: "テスト中…" }), "info");
@@ -219,7 +247,8 @@ async function testIdp(c) {
     ? [el("table", { class: "ui-table" }, [
         el("thead", {}, el("tr", {}, [bl({ en: "Check", ja: "チェック" }), bl({ en: "Result", ja: "結果" })].map((x) => el("th", { text: x })))),
         el("tbody", {}, checks.map((k) => el("tr", {}, [
-          el("td", {}, [el("div", { text: k.name }), k.detail ? el("div", { class: "ui-view-desc", text: k.detail }) : null]),
+          el("td", {}, [el("div", { text: idpCheckName(k), title: k.name }),
+            k.detail ? el("div", { class: "ui-view-desc", text: idpCheckDetail(k), title: k.detail }) : null]),
           el("td", {}, uiBadge(k.ok ? bl({ en: "OK", ja: "OK" }) : bl({ en: "Failed", ja: "NG" }), k.ok ? "ok" : "danger")),
         ]))),
       ])]

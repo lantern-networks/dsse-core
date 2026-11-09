@@ -72,10 +72,38 @@ if ($AfterUninstall) {
   # deployment whose step-up portal runs on its own transport certificate writes the same root as both
   # step_up_portal_ca.pem and transport_ca.pem. Listing per file printed it twice and printed the removal
   # command twice, which reads as two problems and invites running a destructive command a second time.
-  $left = @{}
-  foreach ($pem in 'interception-root.pem','step_up_portal_ca.pem','transport_ca.pem','trust_anchors_adopted.pem') {
+  # ONLY WHAT PROVISIONING ADDED (2026-11-04). Provisioning records, beside each PEM it trusts, the SHA-256 of
+  # every certificate it actually added (<pem>.added-by-provisioning). A certificate that was trusted BEFORE -
+  # typically the deployment anchor an administrator imported to reach the Console - is not the agent's to take
+  # back, and is reported as kept rather than as a failure.
+  # DECIDED THE WAY THE UNINSTALL DECIDES, PER FILE (2026-11-08, review C2R1 of acceptance C). The uninstall
+  # takes trust back from three files only - interception-root.pem, interception_root.pem and
+  # step_up_portal_ca.pem - and for each it owns what that file's record names (<pem>.added-by-provisioning);
+  # with no record, what the note an upgrade left says the older package trusted (<pem>.trusted-by-older-package);
+  # with neither, every certificate in the file, as an older package's removal would (onlyWhatProvisioningAdded
+  # in packaging/cmd/profileapply/trust_added_record.go). A root one of those files owns and the store still holds
+  # is a failed removal. transport_ca.pem and trust_anchors_adopted.pem are written for the agent's own
+  # verification, never put in a trust store by provisioning and never taken back, so a root only they carry - the
+  # deployment anchor an administrator imported to reach the Console - is kept, not failed.
+  # Two earlier answers were each wrong once: judging transport_ca.pem by the old expectation FAILED a correct
+  # uninstall on the administrator's anchor (acceptance C, 2026-11-08); then reading "any record on the machine" as
+  # "this package recorded everything" let an interception root survive when an upgrade stopped between files.
+  $takenBack = @('interception-root.pem','interception_root.pem','step_up_portal_ca.pem')
+  $seen = @{}
+  foreach ($pem in $takenBack + @('transport_ca.pem','trust_anchors_adopted.pem')) {
     $p = Join-Path $progData $pem
     if (-not (Test-Path $p)) { continue }
+    $ownsAll = $false
+    $owned = @()
+    if ($takenBack -contains $pem) {
+      if (Test-Path "$p.added-by-provisioning") {
+        $owned = @(Get-Content "$p.added-by-provisioning" | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+      } elseif (Test-Path "$p.trusted-by-older-package") {
+        $owned = @(Get-Content "$p.trusted-by-older-package" | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+      } else {
+        $ownsAll = $true
+      }
+    }
     $raw = Get-Content $p -Raw
     foreach ($blk in ([regex]::Matches($raw, '(?s)-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----'))) {
       try {
@@ -83,12 +111,22 @@ if ($AfterUninstall) {
         $c = New-Object Security.Cryptography.X509Certificates.X509Certificate2(,$der)
         $inStore = Get-ChildItem Cert:\LocalMachine\Root,Cert:\CurrentUser\Root -ErrorAction SilentlyContinue |
                    Where-Object { $_.Thumbprint -eq $c.Thumbprint }
-        if ($inStore) {
-          if ($left.ContainsKey($c.Thumbprint)) { $left[$c.Thumbprint].Files += $pem }
-          else { $left[$c.Thumbprint] = [pscustomobject]@{ Cert = $c; Files = @($pem) } }
+        if (-not $inStore) { continue }
+        $sha = ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($der)) -replace '-','').ToLowerInvariant()
+        if (-not $seen.ContainsKey($c.Thumbprint)) {
+          $seen[$c.Thumbprint] = [pscustomobject]@{ Cert = $c; Files = @(); Owned = $false }
         }
+        $e = $seen[$c.Thumbprint]
+        $e.Files += $pem
+        if (($takenBack -contains $pem) -and ($ownsAll -or ($owned -contains $sha))) { $e.Owned = $true }
       } catch { }
     }
+  }
+  $left = @{}
+  $kept = @{}
+  foreach ($k in $seen.Keys) {
+    $e = $seen[$k]
+    if ($e.Owned) { $left[$k] = $e } else { $kept[$k] = $e.Cert }
   }
   foreach ($k in $left.Keys) {
     $e = $left[$k]
@@ -96,14 +134,26 @@ if ($AfterUninstall) {
     note "  fingerprint $k, carried by $($e.Files -join ' and '), valid until $($e.Cert.NotAfter.ToString('yyyy-MM-dd'))"
   }
   if ($left.Count -eq 0) { ok "no certificate this install carried is still in a trust store" }
-
-  if (Test-Path (Join-Path $progData "enroll\device.key.dpapi")) {
-    bad "the device identity is still on disk: $progData\enroll"
-    note "  device.key.dpapi is sealed to this machine's SYSTEM account, so it is not portable - but the"
-    note "  identity it proves is still enrolled at the deployment until an administrator removes the device"
+  foreach ($k in $kept.Keys) {
+    if (-not $left.ContainsKey($k)) { note "kept: $($kept[$k].Subject) - not a certificate this install put in the trust store, so the uninstall left it" }
   }
+
+  # KEPT ON PURPOSE, SO NOT A FAILURE (2026-11-07). The uninstall keeps the device identity under enroll\ with
+  # the signed install profile and its key, so that reinstalling for the same organization restores the device
+  # (windows-agent.md, "Removing it"). This check used to count the identity as a failure, and nothing could
+  # clear it: removing the device at the Console does not touch this disk. Every uninstall on the 0.4.1
+  # acceptance runs ended "1 thing(s) remain", and a check that cannot pass teaches its reader to skip its last
+  # line. What it still has to say: what was kept, where, and that the identity stays enrolled at the
+  # deployment until an administrator removes the device.
+  $kept = @()
+  if (Test-Path (Join-Path $progData "enroll\device.key.dpapi")) { $kept += "the device identity ($progData\enroll)" }
   foreach ($f in 'install-profile.json','profile_signing_key.txt') {
-    if (Test-Path (Join-Path $progData $f)) { note "$f is still in $progData" }
+    if (Test-Path (Join-Path $progData $f)) { $kept += "$f" }
+  }
+  if ($kept.Count -gt 0) {
+    note "kept on purpose, so a reinstall for the same organization restores this device: $($kept -join ', ')"
+    note "  the device identity stays enrolled at the deployment until an administrator removes the device;"
+    note "  device.key.dpapi is sealed to this machine's SYSTEM account, so it is not portable"
   }
 
   Write-Host ""
@@ -115,14 +165,26 @@ if ($AfterUninstall) {
       Write-Host ("       Get-ChildItem Cert:\LocalMachine\Root | Where-Object { `$_.Thumbprint -eq '" + $k + "' } | Remove-Item")
     }
   }
-  note "then: Remove-Item -Recurse `"`$env:ProgramData\DSSE`""
+  if ($kept.Count -gt 0) {
+    note "when this PC leaves DSSE, or before installing it for another deployment or organization, and only"
+    note "after confirming the kept files are this deployment's: Remove-Item -Recurse `"`$env:ProgramData\DSSE`""
+  } else {
+    note "then: Remove-Item -Recurse `"`$env:ProgramData\DSSE`""
+  }
   note "DO NOT remove a CA bundle other programs were pointed at while this agent was running: shells and"
   note "daemons started before the uninstall still hold that path, and taking it removes TLS from them"
   note "entirely. After a reboot nothing holds it and it can go."
 
   Write-Host ""
   if ($script:unanswered -gt 0) { foreach ($u in $script:unansweredList) { Write-Host ("  not answered: " + $u) } }
-  if ($script:fail -eq 0) { Write-Host "verify-windows-install: PASS - the uninstall left nothing behind."; exit 0 }
+  if ($script:fail -eq 0) {
+    if ($kept.Count -gt 0) {
+      Write-Host "verify-windows-install: PASS - the uninstall removed what it runs and trusts; it kept the registration listed above on purpose."
+    } else {
+      Write-Host "verify-windows-install: PASS - the uninstall left nothing behind."
+    }
+    exit 0
+  }
   Write-Host "verify-windows-install: $($script:fail) thing(s) remain after an uninstall that returned 0."
   exit 1
 }
@@ -207,8 +269,26 @@ if ($payload) {
   $keys = @($payload.deployment.update_signing_keys) | Where-Object { $_ }
   if ($keys.Count -gt 0) { ok "$($keys.Count) update-signing key(s) - a signed update can be accepted" }
   else { bad "no update-signing keys in the profile - this device can never be updated" }
-  if ($payload.deployment.update_publisher_team_id) { ok "update publisher team '$($payload.deployment.update_publisher_team_id)'" }
-  else { note "no update publisher team - packages install on the manifest signature alone" }
+  # The profile's update_publisher_team_id is the macOS package identity (an Apple Team ID) and says nothing about
+  # Windows (found 2026-11-04: this line printed it as the Windows publisher). The Windows updater checks the
+  # Authenticode publisher and the signing-key pins it is GIVEN on its command line, so those are what is read.
+  $updSvc = Get-CimInstance Win32_Service -Filter "Name='DsseUpdater'" -ErrorAction SilentlyContinue
+  if (-not $updSvc) { na "DsseUpdater is not installed, so the publisher and keys it checks were not read" }
+  else {
+    $updArgs = [string]$updSvc.PathName
+    # Read the way Windows splits a command line: a value is quoted only when it has a space in it, so
+    # "subject:LANTERN NETWORKS, INC." arrives quoted and subject:Lantern or thumbprint:<hex> do not - and the
+    # updater's arguments are rewritten without quotes when pins are restored. Both forms, and --flag=value.
+    $pubs = @([regex]::Matches($updArgs, '--update-publisher(?:=|\s+)(?:"([^"]*)"|([^\s"]+))') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } })
+    $pins = @([regex]::Matches($updArgs, '--update-pin(?:=|\s+)"?([0-9a-fA-F]{64})"?') | ForEach-Object { $_.Groups[1].Value })
+    # An empty value (--update-publisher "") is read by the updater as no publisher at all.
+    if ($pubs.Count -eq 1 -and "$($pubs[0])".Trim()) { ok "DsseUpdater accepts update packages signed by '$($pubs[0])'" }
+    elseif ($pubs.Count -eq 1) { bad "DsseUpdater's --update-publisher is empty - the updater reads that as no publisher, so the publisher of an update package is not checked, only its signed manifest" }
+    elseif ($pubs.Count -eq 0) { bad "DsseUpdater has no --update-publisher - the publisher of an update package is not checked, only its signed manifest (0.4.1 installs set one)" }
+    else { bad "DsseUpdater has $($pubs.Count) --update-publisher arguments - it is ambiguous which publisher is checked" }
+    if ($pins.Count -gt 0) { ok "DsseUpdater holds $($pins.Count) update-signing key pin(s)" }
+    else { bad "DsseUpdater holds no --update-pin - it cannot verify an update manifest" }
+  }
 }
 else { na "the update path was not judged - there is no decodable profile to read it from" }
 
@@ -292,8 +372,10 @@ public sealed class DsseStrictTlsObservation {
   public bool Validate(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors errors) {
     Errors = errors;
     if (chain != null) {
+      // Copied from the certificate object, not from its bytes: the byte[] constructor is obsolete in .NET 9
+      // (SYSLIB0057), and Add-Type in PowerShell 7 refuses to compile it. This one works in 5.1 and 7.
       foreach (X509Certificate2 cert in chain.ChainPolicy.ExtraStore)
-        Served.Add(new X509Certificate2(cert.RawData));
+        Served.Add(new X509Certificate2(cert));
       var statuses = new List<string>();
       foreach (X509ChainStatus status in chain.ChainStatus) statuses.Add(status.Status.ToString());
       ChainStatus = statuses.ToArray();
@@ -313,12 +395,14 @@ try {
   $tcp = New-Object Net.Sockets.TcpClient
   $connect = $tcp.ConnectAsync($u.Host, $u.Port)
   if (-not $connect.Wait(5000)) { throw 'TCP connection timed out' }
-  $connect.GetAwaiter().GetResult()
+  # An async method's Task is a Task<VoidTaskResult> underneath, so GetResult() returns that object and
+  # PowerShell printed "System.Threading.Tasks.VoidTaskResult" into the report (0.4.1 acceptance B rerun).
+  $null = $connect.GetAwaiter().GetResult()
   $cb = $observation.Callback
   $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, $cb)
   $auth = $ssl.AuthenticateAsClientAsync($u.Host, (New-Object Security.Cryptography.X509Certificates.X509CertificateCollection), [Security.Authentication.SslProtocols]::None, $true)
   if (-not $auth.Wait(20000)) { throw 'strict TLS authentication timed out' }
-  $auth.GetAwaiter().GetResult()
+  $null = $auth.GetAwaiter().GetResult()
   $leaf = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate)
   $leafIssuer = $leaf.Issuer
   $ch = New-Object Security.Cryptography.X509Certificates.X509Chain

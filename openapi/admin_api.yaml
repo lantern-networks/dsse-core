@@ -4266,22 +4266,31 @@ paths:
         "503":
           description: First-party admin accounts are not enabled.
   /admin/activate:
-    get:
+    post:
       summary: Validate an activation token and return the account email.
+      description: >-
+        The token is a credential (it sets the administrator's password), so it travels in the request body
+        and never in the URL, where access and proxy logs would keep it.
       tags:
         - AdminAuth
       security: []
-      parameters:
-        - name: token
-          in: query
-          required: true
-          schema:
-            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
       responses:
         "200":
           description: The activation token is valid.
         "404":
           description: The activation link is invalid or expired.
+        "429":
+          description: Too many sign-in or activation attempts from this source address.
   /admin/activate/password:
     post:
       summary: Set the password during account activation.

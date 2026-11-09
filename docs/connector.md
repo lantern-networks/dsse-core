@@ -3,6 +3,12 @@
 A connector publishes the things inside a network — a subnet, a server, an internal name — to the deployment,
 over a tunnel it opens **outbound**. Nothing is exposed inbound, and no firewall hole is made for it. The connector host must be able to reach the configured regional endpoints and the private applications.
 
+**The connector host must resolve the doors by name before the install.** Its settings name each
+region's door (`agents.<region>.<deployment>`), and the install dials them by name with TLS verification.
+Where your DNS does not answer those names, add them to the host's `/etc/hosts` first, pointing at an
+address of the door that this host can reach — on a cloud network that may be the door's private address
+rather than its public one.
+
 Configure authorization separately with [East-West policy and OOB step-up](east-west-policy.md)
 and [IdP integration](idp.md). A connected connector does not prove the intended
 allow, deny, or authentication rule is enforced.
@@ -66,6 +72,14 @@ as secret throughout this process; it also holds the long-lived private identity
 **The doors are why the shape matters.** On a three-region deployment the file names all three, tried in
 order, so a connector whose region goes keeps the estate behind it reachable. On a one-machine deployment it
 names one, and the screen says so rather than implying otherwise.
+
+**The order is the site's.** In the Console, **Sites → Edit** shows the entrances the organization may use,
+under *Entrances its connectors use, in order*, when there is more than one; move them with ↑↓. The top one
+is used first and returned to. A site that has not been given an order uses its own **Region** first, then
+the deployment's order. The settings file of a connector added afterwards carries the order, and a connector
+already running picks it up on its next configuration poll (every 5 minutes) and moves to the new first
+entrance once it has answered three checks a minute apart, as it does after a failover. The order chooses
+among the organization's entrances; it cannot add one the organization is not allowed to use.
 
 ## Then check it, on the machine
 
@@ -133,7 +147,7 @@ a digest to check on arrival.
 **A deployment seeds one program from its own image — its own architecture, and no other.** Build the Edge
 images on arm64 machines and the deployment offers an arm64 connector; a branch office running x86 has
 nothing it can run, and **Add connector** says so and names who fixes it. A deployment running the published
-0.4.0 images (linux/amd64) offers an amd64 connector, so an arm64 site needs `GOARCH=arm64` below. Build the
+images (linux/amd64) offers an amd64 connector, so an arm64 site needs `GOARCH=arm64` below. Build the
 other and add it:
 
 ```sh
@@ -154,6 +168,28 @@ runs the same build and names any that disagree, and a connector installed from 
 outside that question. What the deployment seeds carries its own build; what an operator publishes carries
 what the operator declares, and the screen says "build not stated" when that is nothing.
 
+## Removing it from a machine
+
+There is no uninstall command. The install leaves a system service
+(`/etc/systemd/system/dsse-connector.service`), the state directory (`/var/lib/dsse-connector`, which holds
+the connector's private key) and two programs in `/usr/local/bin`. Stop the service first, then take the rest
+away:
+
+```sh
+sudo systemctl disable --now dsse-connector
+sudo mv /etc/systemd/system/dsse-connector.service /root/dsse-connector.service.removed
+sudo systemctl daemon-reload
+sudo mv /var/lib/dsse-connector /root/dsse-connector.state.removed   # holds a private key: protect or destroy it
+sudo rm /usr/local/bin/dsse-connector /usr/local/bin/dsse-connector-install
+```
+
+If you added the door names to `/etc/hosts` for the install, remove them too. On a host that uses
+systemd-resolved, run `sudo resolvectl flush-caches` afterwards: a hosts file restored with its old
+modification time (for example by `cp -p`) is not re-read, and the removed names keep resolving.
+
+Then delete the connector in the Console, so the site stops counting it. Deleting it in the Console alone
+does not stop the process on the machine.
+
 ## What a connector reaches, and who decides
 
 Routes are the **control plane's**, not the connector's. Nothing on the machine says what it fronts — its
@@ -167,9 +203,13 @@ raw CIDR bindings are not accepted: define "10.20.9.0/24" as a Named Network on 
 then bind it by network_id
 ```
 
+The host-name field beside it takes names only. An address or a range typed there
+(`10.20.9.10`, `10.20.9.0/24`, `fd00::10`) is refused the same way, rather than stored as a name
+that the connector would try to resolve and that would match nothing.
+
 A range typed into a connector's routes is a fact about that connector; the same range defined once, on the
 Networks page, is a fact about the estate that policy, boundaries and every other connector can refer to.
-So `Networks → add`, then `Sites → (a site) → (a connector) → Routes → add`, choosing the network by name.
+So `Networks → add`, then **Networks** on the site's row under `Sites`, choosing the network by name.
 What comes back names both, and says whether it actually carries traffic:
 
 ```json
@@ -221,6 +261,22 @@ nodes, another of that Region's three entrances. A deployment with a single entr
 CP with dedicated Edges) has no alternative endpoint. Recovery time depends on detection,
 network conditions, and the other entrances' health; no fixed failover latency is promised,
 and established connections are not carried over.
+
+When the first entrance (the site's first, see above) has answered three consecutive checks a minute apart, the connector moves its
+tunnels back to it and dials it at once. A running device does not follow, so devices that failed over stay
+where they are. The Edge the connector left holds new flows for what the connector fronts for up to
+10 seconds, the time a tunnel open is already given, until it hears where the connector went. It does not
+refuse them in that window. An Edge in another Region learns at its next configuration poll (10 seconds by
+default, `-config-source-poll`), and a flow it sends to the Region the connector left before then can fail.
+
+Just after it enrols, a connector can reach an Edge that has not yet heard of it. That Edge answers the
+tunnel with 404 (`websocket upgrade returned status 404` in the connector's log), and the connector moves on
+to its next entrance and comes back to the first one by the rule above. On the measured three-node install it
+was on its first entrance again, and on all three Edges, about three minutes after enrolling.
+
+The Console shows a connector as online until two minutes after an Edge last reported it, and Edges report a
+running connector to the control plane every 30 seconds. A connector that stops is therefore shown offline
+within about two and a half minutes, not at once.
 
 Test from an enrolled device that the private application remains reachable after the
 selected entrance or region becomes unavailable. A new tunnel log alone does not prove the application's

@@ -702,12 +702,15 @@ function renderSteerExclResolved(host) {
 // cannot use — but silence the operator cannot see is how an authoring mistake looks exactly like correct
 // inapplicability.
 //
-// steerExclAppIDApplies is a DISPLAY HINT and must track docs/steering_exclusion_appid_format.md. It decides
-// nothing; the agents do. A drift here shows a wrong explanation, never wrong behaviour.
+// steerExclAppIDApplies is a DISPLAY HINT and must track the identifier forms in docs/administration.md
+// ("Steering exclusions"). It decides nothing; the agents do. A drift here shows a wrong explanation, never
+// wrong behaviour.
 function steerExclAppIDApplies(appID, platform) {
   const id = String(appID || "").trim();
   const os = String(platform || "").toLowerCase();
-  const typed = id.match(/^([a-z-]+):/i);
+  // Two letters or more: every typed form is a word. "C:" is a drive, and reading it as a type said
+  // "form Windows cannot use" about C:\Program Files\Git\usr\bin\ssh.exe (2026-11-08, acceptance C).
+  const typed = id.match(/^([a-z][a-z-]+):/i);
   if (typed) {
     const kind = typed[1].toLowerCase();
     if (kind === "subject" || kind === "thumbprint") return true;          // shared forms

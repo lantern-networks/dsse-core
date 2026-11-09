@@ -346,7 +346,7 @@ struct DsseRuntimeCopyDownstreamPassthroughDecision: Equatable, Sendable {
 // workspace keeps connectivity when the transparent proxy is enabled. This is
 // the hostname/IP-independent backstop to the anthropic.com domain passthrough.
 // Each merged entry (hardcoded floor + scaffold + agent_config local + signed server set) is a typed AppID per
-// the cross-platform contract (docs/steering_exclusion_appid_format.md). The TYPE keyword is case-insensitive;
+// the cross-platform contract (docs/administration.md, "Steering exclusions"). The TYPE keyword is case-insensitive;
 // the VALUE is preserved as-is (trim only). macOS applies the SHARED cross-platform forms and its own
 // macOS-only forms, and IGNORES the Windows-only forms (and any unknown prefix) as a silent no-op — never an
 // error, never an accidental match. One authored identity can now mean the same thing on macOS and Windows

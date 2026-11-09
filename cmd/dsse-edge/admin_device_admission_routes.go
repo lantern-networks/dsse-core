@@ -525,6 +525,9 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		allocations: config.SeatAllocations,
 		licensing:   config.EnrolmentLicensing,
 		ledger:      config.EnrolledLedger,
+		connectorsAdmitted: func(tenantID string) int {
+			return admittedConnectorCount(config.EnrolledLedger, tenantID, connectorIdentitiesFor(registry, tenantID))
+		},
 		displayName: func(tenantID string) string {
 			if tenantModelStore == nil {
 				return ""

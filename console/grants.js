@@ -53,6 +53,34 @@ function grantRemaining(g, nowMs) {
 
 // acrMeaning translates the raw assurance code (acr) the IdP asserted into what it MEANS for the
 // operator. Unknown codes fall through to the raw value — an operator-configured acr is meaningful as-is.
+// enrolmentNoteText says what the enrolment record says, in the reader's language. The Edge writes these four
+// sentences into the device ledger (enroll_endpoint.go, enroll_eligibility_idp.go,
+// connector_enrolment_identity.go), and the ledger keeps them — so a record written by any version reads the
+// same here. Anything else is a note an administrator typed, and is shown as typed.
+//
+// ★ 2026-11-04, acceptance A, third run: "enrolled with a token issued by …" in English on the Japanese screen.
+function enrolmentNoteText(note) {
+  const n = String(note || "").trim();
+  let m;
+  if ((m = /^enrolled with a token issued by (.+)$/.exec(n))) {
+    // "label (principal id)" since 2026-11-06; the reader is told who, and the id is for the record.
+    const who = (/^(.+) \(([^()\s]+)\)$/.exec(m[1]) || [null, m[1]])[1];
+    return bl({ en: "Enrolled with a token issued by " + who, ja: who + " が発行したトークンで登録" });
+  }
+  if ((m = /^enrolled via IdP login by (.+) \(issuer (.*)\)$/.exec(n))) {
+    const issuer = m[2].trim();
+    return bl({ en: "Enrolled by " + m[1] + " signing in" + (issuer ? " at " + issuer : ""),
+      ja: m[1] + " のサインインで登録" + (issuer ? "（" + issuer + "）" : "") });
+  }
+  if ((m = /^enrolled as a connector for site (.+)$/.exec(n))) {
+    return bl({ en: "Enrolled as the connector of site " + m[1], ja: "サイト " + m[1] + " のコネクタとして登録" });
+  }
+  if (n === "enrolled via POST /enroll") {
+    return bl({ en: "Enrolled; who approved it was not recorded", ja: "登録（承認した人の記録なし）" });
+  }
+  return n;
+}
+
 function acrMeaning(acr) {
   const a = (acr || "").trim();
   if (a === "phishing_resistant") return { label: { en: "Phishing-resistant passkey", ja: "フィッシング耐性パスキー" }, kind: "ok" };
@@ -92,8 +120,8 @@ function renderGrantsView(content) {
     el("div", {}, [
       el("h2", { class: "ui-view-title", text: bl({ en: "Access Approvals", ja: "アクセス承認" }) }),
       el("p", { class: "ui-view-desc", text: bl({
-        en: "Access granted after identity-provider sign-in. Revoking an approval requires a new identity verification before access can be granted again. Other servers must receive the update.",
-        ja: "ID プロバイダでの本人確認後に付与されるアクセスです。失効後の再許可には、新しい本人確認が必要です。他のサーバーには更新の配布が必要です。",
+        en: "Access granted after identity-provider sign-in. Revoking an approval requires a new identity verification before access can be granted again. Every gateway applies it on its own, usually within half a minute.",
+        ja: "ID プロバイダでの本人確認後に付与されるアクセスです。失効後の再許可には、新しい本人確認が必要です。すべてのゲートウェイに自動で反映されます（ふつうは30秒以内）。",
       }) }),
     ]),
     el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reload", ja: "再読込" }), onClick: () => renderGrantsList(host) }),
@@ -108,6 +136,7 @@ async function renderGrantsList(host) {
   const current = freshRender(host);
   let grants;
   try {
+    // two-planes-deliberate: /admin/tenant supplies only WHICH organization this is, and every row is checked to belong to it; an organization's identity does not change between the two answers (2026-11-06).
     const [r, tenant] = await Promise.all([apiFetch("GET", "/admin/grants"), apiFetch("GET", "/admin/tenant")]);
     if (!r?.ok || !tenant?.ok) throw new Error("HTTP " + (!r?.ok ? r?.status : tenant?.status));
     grants = validatedAccessGrants(r.body, tenant.body);
@@ -182,7 +211,7 @@ async function renderGrantsList(host) {
     const deviceKids = g.device_id
       ? [el("span", { text: g.device_id })]
       : [el("span", { class: "ui-view-desc", text: bl({ en: "Not device-bound", ja: "デバイス束縛なし" }) })];
-    if (humanNote) deviceKids.push(el("div", { class: "ui-view-desc", text: humanNote }));
+    if (humanNote) deviceKids.push(el("div", { class: "ui-view-desc", text: enrolmentNoteText(humanNote) }));
 
     // WHAT the ceremony was run for (recorded at approval; older approvals predate the field).
     const destCell = g.scope ? el("code", { text: g.scope }) : el("span", { class: "ui-view-desc", text: "—" });
@@ -305,7 +334,7 @@ async function revokeGrant(g, host, label, retry = false) {
   try {
     if (!retry && !await uiConfirm({
       title:bl({en:"Revoke this access?",ja:"このアクセスを失効?"}),
-      body:bl({en:"Revoke this approval. When fresh identity verification is activated fleet-wide, a new identity verification is required before access can be granted again. During an upgrade, only this approval is revoked; the result will show whether fresh verification is enforced. If revocation protection requires consolidation, other approvals in this organization may also require fresh verification. Other servers must receive the update. This cannot be undone.",ja:"この承認を失効します。全認証ノードで新しい本人確認の要求が有効な場合、再許可には新しい本人確認が必要です。更新途中はこの承認だけを失効します。新しい本人確認が要求されるかは結果に表示します。失効の保護を維持するため境界を集約した場合、この組織の他の承認にも新しい本人確認を求める場合があります。他のサーバーには更新の配布が必要です。この操作は取り消せません。"}),
+      body:bl({en:"Revoke this approval. When fresh identity verification is activated fleet-wide, a new identity verification is required before access can be granted again. During an upgrade, only this approval is revoked; the result will show whether fresh verification is enforced. If revocation protection requires consolidation, other approvals in this organization may also require fresh verification. Every gateway applies the revocation on its own, usually within half a minute. This cannot be undone.",ja:"この承認を失効します。全認証ノードで新しい本人確認の要求が有効な場合、再許可には新しい本人確認が必要です。更新途中はこの承認だけを失効します。新しい本人確認が要求されるかは結果に表示します。失効の保護を維持するため境界を集約した場合、この組織の他の承認にも新しい本人確認を求める場合があります。失効は、すべてのゲートウェイに自動で反映されます（ふつうは30秒以内）。この操作は取り消せません。"}),
       confirmLabel:bl({en:"Revoke",ja:"失効"}),danger:true,
     })) return;
     let r;

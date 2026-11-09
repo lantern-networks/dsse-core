@@ -290,7 +290,9 @@ func TestPullingEdgeCannotAcknowledgeLocalOnlyAdministrativeRevocation(t *testin
 	}
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("POST", "/admin/grants/old/revoke", nil))
-	if w.Code != 503 || !strings.Contains(w.Body.String(), "this Edge cannot confirm") {
+	// 409 naming the control plane: the refusal the Console turns into the same request to the control plane
+	// (acceptance C, 2026-11-08 — a 503 here made every revocation from the Console fail).
+	if w.Code != 409 || !strings.Contains(w.Body.String(), "control plane") {
 		t.Fatalf("Edge did not refuse authoritative write: %d %s", w.Code, w.Body)
 	}
 	if g, ok := store.Get("old"); !ok || g.Revoked {

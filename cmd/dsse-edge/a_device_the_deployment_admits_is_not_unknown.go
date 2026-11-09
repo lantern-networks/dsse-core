@@ -112,8 +112,19 @@ func adminEnrolledDeviceCount(ledger *enrolledinventory.Ledger, tenantID string,
 func adminEnrolledEndpointCount(ledger *enrolledinventory.Ledger, tenantID string, present int,
 	connectors map[string]bool) int {
 	admitted := adminEnrolledDeviceCount(ledger, tenantID, present)
-	if ledger == nil || len(connectors) == 0 {
+	n := admittedConnectorCount(ledger, tenantID, connectors)
+	if n > admitted {
 		return admitted
+	}
+	return admitted - n
+}
+
+// admittedConnectorCount is how many of a tenant's admitted (enrolled AND enabled) identities are connectors —
+// the part of the seat count the Devices screen leaves out. One function for both screens, so the licence page's
+// breakdown and the Devices count cannot disagree about what a connector is.
+func admittedConnectorCount(ledger *enrolledinventory.Ledger, tenantID string, connectors map[string]bool) int {
+	if ledger == nil || len(connectors) == 0 {
+		return 0
 	}
 	n := 0
 	for _, e := range ledger.List() {
@@ -127,8 +138,5 @@ func adminEnrolledEndpointCount(ledger *enrolledinventory.Ledger, tenantID strin
 			n++
 		}
 	}
-	if n > admitted {
-		return admitted
-	}
-	return admitted - n
+	return n
 }

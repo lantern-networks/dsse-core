@@ -50,3 +50,18 @@ for (const [button, expected] of [
     assert.match(fixture.messages[0][0], /copy.*message/i);
   });
 }
+
+test('the invitation says when it expires in the reader\'s time, not as a raw timestamp', () => {
+  let modal;
+  const context = vm.createContext({
+    navigator: {clipboard: {writeText: async () => {}}}, bl: value => value.ja,
+    el: (tag, attrs = {}, children) => ({tag, ...attrs, children}),
+    uiToast: () => {}, uiModal: options => { modal = options; return {close() {}}; },
+    window: {dsseFormatTime: v => '2026/11/09 12:12:51 JST <' + v + '>'},
+  });
+  vm.runInContext(source, context);
+  vm.runInContext(`openInvitationHandover({subject:'S', body:'B', link:'https://example.invalid/i', expires_at:'2026-11-09T03:12:51Z'})`, context);
+  const hint = modal.body.at(-1).text;
+  assert.match(hint, /2026\/11\/09 12:12:51 JST/);
+  assert.doesNotMatch(hint.replace(/<[^>]*>/, ''), /T03:12:51Z/);
+});

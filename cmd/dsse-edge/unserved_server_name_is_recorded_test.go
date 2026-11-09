@@ -22,6 +22,12 @@ func TestAnUnservedServerNameIsRecordedOncePerNamePerHour(t *testing.T) {
 	restore := unservedServerNames.seen
 	t.Cleanup(func() { unservedServerNames.seen = restore })
 	unservedServerNames.seen = map[string]time.Time{}
+	// The incident was on a node that serves organizations' own transport names; see
+	// unservedServerNameSaysSomething for why a node serving none stays quiet.
+	restoreCerts := transportTenantCertificates
+	t.Cleanup(func() { transportTenantCertificates = restoreCerts })
+	transportTenantCertificates = newTransportTenantCerts()
+	transportTenantCertificates.tenantOf["agents.acme.example.test"] = "tenant_acme"
 
 	noteUnservedServerName("Stale.Provisioned.Name")
 	if _, ok := unservedServerNames.seen["stale.provisioned.name"]; !ok {

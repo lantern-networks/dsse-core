@@ -129,9 +129,8 @@ func (r *Registry) Register(conn model.ConnectorRegistration, now time.Time) (mo
 	if conn.LastHeartbeatAt == "" {
 		conn.LastHeartbeatAt = conn.RegisteredAt
 	}
-	if conn.Metadata == nil {
-		conn.Metadata = map[string]any{}
-	}
+	// A copy: the caller's map is not this registry's, and is written below.
+	conn.Metadata = copyMetadata(conn.Metadata, len(RuntimeKeys)+3)
 	if err := validateRuntimeSecretHashMetadata(conn.Metadata); err != nil {
 		return conn, err
 	}
@@ -146,6 +145,9 @@ func (r *Registry) Register(conn model.ConnectorRegistration, now time.Time) (mo
 		}
 		preserveServerManagedRuntimeSecretMetadata(prev.Metadata, conn.Metadata)
 		preserveServerManagedRegistrationState(prev, &conn)
+		// Under the same lock as the write (review C3-RRR2): the runtime facts held now, not as they were when
+		// the caller looked.
+		PreserveHeldRuntime(prev.Metadata, conn.Metadata)
 	}
 	r.connectors[conn.ID] = conn
 	if !had || connectorCatalogChanged(prev, conn) {
@@ -216,22 +218,21 @@ func (r *Registry) Heartbeat(heartbeat model.ConnectorHeartbeat, now time.Time) 
 	} else {
 		conn.LastHeartbeatAt = now.UTC().Format(time.RFC3339)
 	}
-	if conn.Metadata == nil {
-		conn.Metadata = map[string]any{}
-	}
+	// A copy, never the map Get and List have already handed out (review C3-R6): writing into it here races
+	// with every reader that is still holding the registration, outside this lock.
+	conn.Metadata = copyMetadata(conn.Metadata, len(heartbeat.Metadata)+4)
 	for key, value := range heartbeat.Metadata {
-		if isServerManagedRuntimeSecretMetadata(key) {
+		if isServerManagedRuntimeSecretMetadata(key) || RuntimeKeys[key] {
 			continue
 		}
 		conn.Metadata[key] = value
 	}
 	conn.Metadata["policy_bundle_id"] = heartbeat.PolicyBundleID
 	conn.Metadata["policy_bundle_version"] = heartbeat.PolicyBundleVersion
-	if strings.TrimSpace(heartbeat.Version) != "" {
-		conn.Metadata["version"] = strings.TrimSpace(heartbeat.Version)
-	}
-	if heartbeat.UptimeSeconds > 0 {
-		conn.Metadata["uptime_seconds"] = heartbeat.UptimeSeconds
+	// Version and uptime, with the time they were observed, through the same check as every other writer
+	// (review C3-R5-1): an older catalogue copy can no longer overwrite what this heartbeat just said.
+	for k, v := range NewerRuntimeFields(conn.Metadata, HeartbeatRuntime(heartbeat, now)) {
+		conn.Metadata[k] = v
 	}
 	// A connector may re-report its reachable routes on the heartbeat so the Edge's discovery list stays current
 	// without a reconnect. Update the registered set when present (additive — an older connector omits it).
@@ -563,7 +564,174 @@ func (r *Registry) RecordLiveness(id, status, heartbeatAt string) (bool, error) 
 	return true, nil
 }
 
-func (r *Registry) RecordAttachedRegion(id, region string) (bool, error) {
+// RuntimeKeys are the connector-reported and node-observed facts RecordRuntime may write: what the connector
+// says it runs and for how long, and when an Edge last said it holds the connector's tunnel and where, and when
+// all of that was observed. They are runtime, not route: writing them never moves the catalog's version.
+var RuntimeKeys = map[string]bool{"version": true, "uptime_seconds": true, "tunnel_reported_at": true, "tunnel_region": true, RuntimeObservedAtKey: true}
+
+// RuntimeObservedAtKey is when the facts in a runtime write were observed by the Edge that reported them — not
+// when they arrived. A report replayed from an outbox an hour later carries the hour-old time.
+const RuntimeObservedAtKey = "runtime_observed_at"
+
+// The runtime facts come in two groups, each judged by its own observation time (review C3-R5-1):
+//   - what the connector process reports about itself — version, uptime — observed when a heartbeat carried it
+//     (RuntimeObservedAtKey);
+//   - where its tunnel is — tunnel_region — observed when the Edge holding it said so (tunnel_reported_at).
+//
+// ★ ONE TIME FOR BOTH WAS WRONG TWICE. A tunnel report made now by an Edge that has not seen a heartbeat for a
+// while carries a fresh tunnel and an old version; judged by one time, either the old version was taken as new or
+// the fresh tunnel was refused as old. And a heartbeat that did not move the time let an older catalogue copy,
+// newer than the time held, overwrite what the heartbeat had just said.
+var runtimeGroups = []struct {
+	stamp string
+	keys  []string
+}{
+	{RuntimeObservedAtKey, []string{"version", "uptime_seconds"}},
+	{"tunnel_reported_at", []string{"tunnel_region"}},
+}
+
+func runtimeStamp(m map[string]any, key string) (time.Time, bool) {
+	raw, _ := m[key].(string)
+	at, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(raw))
+	return at, err == nil
+}
+
+// NewerRuntimeFields is the part of fields that may be written over held: each group is taken whole when its
+// observation is not older than the one held, and left out when it is. A group without an observation time is
+// taken only when the held group has none either — an unstamped fact cannot outrank a stamped one.
+func NewerRuntimeFields(held, fields map[string]any) map[string]any {
+	out := map[string]any{}
+	for _, g := range runtimeGroups {
+		present := false
+		for _, k := range append([]string{g.stamp}, g.keys...) {
+			if _, ok := fields[k]; ok {
+				present = true
+			}
+		}
+		if !present {
+			continue
+		}
+		incoming, hasIn := runtimeStamp(fields, g.stamp)
+		stored, hasStored := runtimeStamp(held, g.stamp)
+		if hasStored && (!hasIn || incoming.Before(stored)) {
+			continue
+		}
+		for _, k := range append([]string{g.stamp}, g.keys...) {
+			if v, ok := fields[k]; ok && v != nil {
+				out[k] = v
+			}
+		}
+	}
+	return out
+}
+
+// HeartbeatRuntime is what a heartbeat says about the process, stamped with when it was observed (the
+// heartbeat's own time, else now), as NewerRuntimeFields takes it.
+func HeartbeatRuntime(heartbeat model.ConnectorHeartbeat, now time.Time) map[string]any {
+	fields := map[string]any{}
+	if v := strings.TrimSpace(heartbeat.Version); v != "" {
+		fields["version"] = v
+	}
+	if heartbeat.UptimeSeconds > 0 {
+		fields["uptime_seconds"] = heartbeat.UptimeSeconds
+	}
+	if len(fields) == 0 {
+		return fields
+	}
+	at := now.UTC()
+	if t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(heartbeat.Timestamp)); err == nil && !t.After(now) {
+		at = t.UTC()
+	}
+	fields[RuntimeObservedAtKey] = at.Format(time.RFC3339Nano)
+	return fields
+}
+
+// ErrNotThisTenantsConnector is returned by a runtime write whose caller names an organization that does not
+// own the connector.
+var ErrNotThisTenantsConnector = errors.New("this connector belongs to another organization")
+
+// ownedBy is the owner check every runtime write makes inside the lock or transaction that writes (review
+// C3-R6-1). A runtime write keyed by the connector ID alone wrote another organization's version, uptime and
+// tunnel into a registration this node holds for a different one: the ID is chosen by the connector, two Edges
+// can hold the same ID for two organizations until their registrations converge, and the full catalogue apply
+// refused the foreign registration while the same-generation poll then wrote its runtime facts anyway. The
+// caller names the organization it is writing for, and a mismatch is refused; an empty caller tenant is refused
+// too, because "any owner" is what let this through.
+func ownedBy(conn model.ConnectorRegistration, tenantID string) error {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" || strings.TrimSpace(conn.TenantID) != tenantID {
+		return fmt.Errorf("%w: connector %s", ErrNotThisTenantsConnector, conn.ID)
+	}
+	return nil
+}
+
+// PreserveHeldRuntime makes a registration that REPLACES a stored one carry the stored runtime facts
+// (RuntimeKeys) and none of its own. A registration is catalogue; the runtime facts change only through
+// RecordRuntime, which takes them when they were observed later than what is held (review C3-RR2, C3-RRR2).
+//
+// Every backend calls it inside the lock or transaction that reads the stored registration and writes the new
+// one. Called before that, from what the caller read earlier, it kept a snapshot: a newer fact recorded between
+// the read and the write was overwritten, along with the observation time that would have protected it.
+func PreserveHeldRuntime(held, incoming map[string]any) {
+	if incoming == nil {
+		return
+	}
+	for k := range RuntimeKeys {
+		delete(incoming, k)
+		if v, ok := held[k]; ok {
+			incoming[k] = v
+		}
+	}
+}
+
+func copyMetadata(m map[string]any, extra int) map[string]any {
+	out := make(map[string]any, len(m)+extra)
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// RecordRuntime merges RuntimeKeys from fields into the connector's metadata. Other keys are ignored.
+func (r *Registry) RecordRuntime(tenantID, id string, fields map[string]any) (bool, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	conn, ok := r.connectors[id]
+	if !ok {
+		return false, fmt.Errorf("connector %s is not registered", id)
+	}
+	if err := ownedBy(conn, tenantID); err != nil {
+		return false, err
+	}
+	// Written into a copy (review C3-R6): the map in r.connectors is the one Get and List returned to readers.
+	conn.Metadata = copyMetadata(conn.Metadata, len(fields))
+	fields = NewerRuntimeFields(conn.Metadata, fields)
+	if len(fields) == 0 {
+		return false, nil
+	}
+	changed := false
+	for key, value := range fields {
+		if !RuntimeKeys[key] || value == nil {
+			continue
+		}
+		if fmt.Sprint(conn.Metadata[key]) != fmt.Sprint(value) {
+			conn.Metadata[key] = value
+			changed = true
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+	r.connectors[id] = conn
+	r.persistLocked()
+	return true, nil
+}
+
+func (r *Registry) RecordAttachedRegion(tenantID, id, region string) (bool, error) {
 	id, region = strings.TrimSpace(id), strings.TrimSpace(region)
 	if id == "" || region == "" {
 		return false, nil
@@ -573,6 +741,9 @@ func (r *Registry) RecordAttachedRegion(id, region string) (bool, error) {
 	conn, ok := r.connectors[id]
 	if !ok {
 		return false, fmt.Errorf("connector %s is not registered", id)
+	}
+	if err := ownedBy(conn, tenantID); err != nil {
+		return false, err
 	}
 	if strings.EqualFold(conn.AttachedRegionID, region) {
 		return false, nil

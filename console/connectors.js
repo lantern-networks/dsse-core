@@ -34,7 +34,7 @@ async function renderConnList(host) {
     return el("tr", { class: "ui-row-clickable", onClick: () => showConnectorDetail(id, c) }, [
       el("td", {}, el("code", { text: id })),
       el("td", { text: c.name || "—" }),
-      el("td", {}, uiBadge(status, /connect|online|active|healthy/i.test(status) ? "ok" : "off")),
+      el("td", {}, uiBadge(uiConnectorStatusLabel(status), /connect|online|active|healthy/i.test(status) ? "ok" : "off")),
       el("td", {}, connTunnelBadge(c.tunnel_connected)),
       el("td", { class: "ui-row-actions" }, [
         el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Details", ja: "詳細" }), onClick: (e) => { e.stopPropagation(); showConnectorDetail(id, c); } }),
@@ -62,6 +62,15 @@ function connTunnelBadge(tunnelConnected) {
   if (tunnelConnected === true) return uiBadge(bl({ en: "Connected", ja: "接続中" }), "ok");
   if (tunnelConnected === false) return uiBadge(bl({ en: "Disconnected", ja: "切断" }), "off");
   return uiBadge(bl({ en: "Unknown", ja: "不明" }), "warn");
+}
+
+// connEntranceText names the Region whose entrance holds the connector's tunnel, and when that was last said.
+// The deployment's internal cluster label is not shown: it names nothing an administrator can act on.
+function connEntranceText(c) {
+  const region = c.tunnel_region || c.attached_region_id || "";
+  if (!region) return "—";
+  if (!c.tunnel_reported_at) return region;
+  return region + " (" + bl({ en: "reported ", ja: "報告 " }) + window.dsseFormatTime(c.tunnel_reported_at) + ")";
 }
 
 // connDetailRow builds a label/value line for the detail modal. value may be a string or a node.
@@ -104,13 +113,16 @@ async function showConnectorDetail(id, fallback) {
   const sections = [
     connDetailRow(bl({ en: "Connector ID", ja: "コネクタ ID" }), el("code", { text: c.id || id })),
     connDetailRow(bl({ en: "Name", ja: "名前" }), c.name || ""),
-    connDetailRow(bl({ en: "Status", ja: "状態" }), uiBadge(c.status || bl({ en: "unknown", ja: "不明" }), /connect|online|active|healthy/i.test(c.status || "") ? "ok" : "off")),
+    connDetailRow(bl({ en: "Status", ja: "状態" }), uiBadge(uiConnectorStatusLabel(c.status), /connect|online|active|healthy/i.test(c.status || "") ? "ok" : "off")),
     connDetailRow(bl({ en: "Tunnel", ja: "トンネル" }), connTunnelBadge(c.tunnel_connected)),
+    // Where the tunnel is now, as the Edge holding it last reported (third walk of acceptance C: following a
+    // connector through a failover meant logging in to the machine at the site).
+    connDetailRow(bl({ en: "Connected through", ja: "つながっている入口" }), connEntranceText(c)),
     connDetailRow(bl({ en: "Version", ja: "バージョン" }), c.version || bl({ en: "unknown", ja: "不明" })),
     connDetailRow(bl({ en: "Uptime", ja: "稼働時間" }), uptime || bl({ en: "unknown", ja: "不明" })),
-    connDetailRow(bl({ en: "Last heartbeat", ja: "最終ハートビート" }), c.last_heartbeat_at || bl({ en: "never", ja: "なし" })),
-    connDetailRow(bl({ en: "Registered", ja: "登録日時" }), c.registered_at || ""),
-    connDetailRow(bl({ en: "Region / Cluster", ja: "リージョン / クラスター" }), [c.edge_region_id, c.edge_cluster_id].filter(Boolean).join(" / ") || "—"),
+    connDetailRow(bl({ en: "Last heartbeat", ja: "最終ハートビート" }), (c.last_heartbeat_at ? window.dsseFormatTime(c.last_heartbeat_at) : bl({ en: "never", ja: "なし" }))),
+    connDetailRow(bl({ en: "Registered", ja: "登録日時" }), c.registered_at ? window.dsseFormatTime(c.registered_at) : ""),
+    connDetailRow(bl({ en: "Registered in", ja: "登録したリージョン" }), c.edge_region_id || "—"),
     connDetailRow(bl({ en: "Connector group", ja: "コネクタグループ" }), c.connector_group_id || "—"),
     connDetailRow(bl({ en: "Runtime secret", ja: "ランタイムシークレット" }), secretLine),
     connDetailRow(bl({ en: "Reachable routes", ja: "到達可能ルート" }), connRoutesNode(c.reachable_routes)),

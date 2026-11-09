@@ -144,6 +144,8 @@ func repairUnterminatedShipSpool(path string, replay []auditShipItem) error {
 	if err != nil {
 		return err
 	}
+	// durable-write: staged — the spool is rewritten line by line from the file being repaired; the result is
+	// flushed and handed to durablefile.Replace.
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".repair-*")
 	if err != nil {
 		return err

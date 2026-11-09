@@ -21,20 +21,20 @@ func TestCompleteCeremonyRequiresProvenIdentity(t *testing.T) {
 
 	// Claimed subject "alice" but the ceremony proved NO identity (empty) -> must be rejected (was: issued to alice).
 	ch, id := mk()
-	if _, err := CompleteCeremony(store, ch, id, "acme", "", now); err == nil {
+	if _, err := CompleteCeremony(store, ch, id, CeremonyProof{TenantID: "acme", SubjectUserID: ""}, now); err == nil {
 		t.Fatal("empty authenticated identity must NOT satisfy a claimed subject (fail-open #16)")
 	}
 
 	// Claimed "alice", proven "bob" -> mismatch, rejected (control, unchanged).
 	ch2, id2 := mk()
-	if _, err := CompleteCeremony(store, ch2, id2, "acme", "bob", now); err == nil {
+	if _, err := CompleteCeremony(store, ch2, id2, CeremonyProof{TenantID: "acme", SubjectUserID: "bob"}, now); err == nil {
 		t.Fatal("mismatched proven identity must be rejected")
 	}
 
 	// The same user ID may exist in multiple tenants. A valid login in another
 	// tenant must not complete this tenant's held flow or consume its challenge.
 	chForeign, foreignID := mk()
-	if _, err := CompleteCeremony(store, chForeign, foreignID, "other-tenant", "alice", now); err == nil {
+	if _, err := CompleteCeremony(store, chForeign, foreignID, CeremonyProof{TenantID: "other-tenant", SubjectUserID: "alice"}, now); err == nil {
 		t.Fatal("matching user ID from another tenant completed the challenge")
 	}
 	if len(chForeign.ListPending("acme", now)) != 1 {
@@ -43,7 +43,7 @@ func TestCompleteCeremonyRequiresProvenIdentity(t *testing.T) {
 
 	// Claimed "alice", proven "alice" -> issued (control, unchanged).
 	ch3, id3 := mk()
-	if _, err := CompleteCeremony(store, ch3, id3, "acme", "alice", now); err != nil {
+	if _, err := CompleteCeremony(store, ch3, id3, CeremonyProof{TenantID: "acme", SubjectUserID: "alice"}, now); err != nil {
 		t.Fatalf("proven identity matching the claim must issue the grant: %v", err)
 	}
 }

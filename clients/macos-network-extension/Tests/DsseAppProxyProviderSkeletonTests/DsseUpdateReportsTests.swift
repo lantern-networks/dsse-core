@@ -239,6 +239,34 @@ final class DsseUpdateReportsTests: XCTestCase {
         }
     }
 
+    // The Go updater writes a cleared refusal as installed with refusal_cleared=true, and the
+    // body dropped the mark, so the Edge counted it as an install in the success rate.
+    func testAClearedRefusalTravelsWithItsMark() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("dsse-refusal-cleared-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // The keys agentupdate.Report writes (report.go).
+        let cleared: [String: Any] = ["id": "r1", "status": "installed", "at": "2026-11-05T00:00:00Z",
+                                      "running_version": "0.4.1", "target_version": "0.4.1",
+                                      "platform": "macos", "refusal_cleared": true]
+        let ordinary: [String: Any] = ["id": "r2", "status": "installed", "at": "2026-11-05T00:01:00Z",
+                                       "running_version": "0.4.1", "target_version": "0.4.1", "platform": "macos"]
+        for (name, json) in [("cleared.json", cleared), ("ordinary.json", ordinary)] {
+            try JSONSerialization.data(withJSONObject: json).write(to: dir.appendingPathComponent(name))
+        }
+        let c = try XCTUnwrap(DsseUpdateReportStore.read(dir.appendingPathComponent("cleared.json")))
+        let o = try XCTUnwrap(DsseUpdateReportStore.read(dir.appendingPathComponent("ordinary.json")))
+        XCTAssertTrue(c.refusalCleared)
+        XCTAssertFalse(o.refusalCleared)
+        let cb = DsseUpdateReportStore.body(for: c, deviceID: "d", tenantID: "t")
+        let ob = DsseUpdateReportStore.body(for: o, deviceID: "d", tenantID: "t")
+        XCTAssertEqual(cb["update_status"] as? String, "installed")
+        XCTAssertEqual((cb["metadata"] as? [String: Any])?["refusal_cleared"] as? Bool, true,
+                       "the Edge would count a cleared refusal as an install")
+        XCTAssertNil((ob["metadata"] as? [String: Any])?["refusal_cleared"])
+    }
+
     // A device with no identity cannot address the route, and must not build a URL that would report as
     // somebody else.
     func testNoDeviceIdentityMeansNoURL() {

@@ -18,6 +18,10 @@
 //	TLS_CERT, TLS_KEY             server certificate + key (REQUIRED — no plaintext fallback)
 //	CLIENT_CA                     PEM bundle of admin CA(s); client certs are verified against it (mTLS)
 //	CONSOLE_ALLOW_NO_CLIENT_CERT  "1" -> serve TLS without requiring a client cert (explicit opt-out)
+//	TRUSTED_FRONT_DOORS           addresses/CIDRs of the L4 front door(s) whose PROXY protocol header names
+//	                              the browser's address. Empty => the header is never read.
+//	SIGNIN_REQUESTS_PER_SECOND    bound on sign-in/activation attempts per browser address (default 5; 0 off)
+//	SIGNIN_BURST                  its burst (default 20)
 //	ADMIN_SESSION_VALIDATE_URL    Edge session endpoint, e.g. https://edge:9443/admin/session. Set => the
 //	                              server-side auth gate is ENABLED. Empty => derived from ADMIN_API_UPSTREAM,
 //	                              else gate off (back-compat; logged).
@@ -42,6 +46,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"github.com/lantern-networks/dsse-core/frontdoor"
 	"github.com/lantern-networks/dsse-core/runtimequota"
 	"io"
 	"log"
@@ -334,7 +339,13 @@ func main() {
 	// Upstream TLS trust (Edge / control-plane admin APIs) — one CA pool reused by the validation client and
 	// the reverse proxies.
 	upstreamTLS := upstreamTLSConfig(os.Getenv("ADMIN_SESSION_VALIDATE_CA"))
-	validateClient := &http.Client{Timeout: 8 * time.Second, Transport: &http.Transport{TLSClientConfig: upstreamTLS}}
+	// Where the Console connects when this machine's door does not answer (see doorDialer). Nil: only here.
+	doors := consoleDoorDialer(os.Getenv(consoleDoorFallbacksEnv))
+	validateTransport := &http.Transport{TLSClientConfig: upstreamTLS}
+	if doors != nil {
+		validateTransport.DialContext = doors.DialContext
+	}
+	validateClient := &http.Client{Timeout: 8 * time.Second, Transport: validateTransport}
 	navigation, err := newConsoleLeaderRouting(os.Getenv(consoleLeaderRoutingEnv), upstreamTLS)
 	if err != nil {
 		log.Fatal(err)
@@ -380,7 +391,7 @@ func main() {
 	mux.Handle("/ready", consoleReadyHandler(leaderURL, leaderClient))
 	var edgeProxy http.Handler
 	if adminUpstream != "" {
-		edgeProxy = newReverseProxy(adminUpstream, upstreamTLS)
+		edgeProxy = newReverseProxy(adminUpstream, upstreamTLS, doors)
 		mux.Handle("/admin/", edgeProxy) // enforcement config/state (auth subpaths overridden below)
 		log.Printf("front door: /admin/* -> %s (enforcement Edge)", adminUpstream)
 	}
@@ -389,16 +400,21 @@ func main() {
 	// win over /admin/ in the ServeMux.
 	authProxy := edgeProxy
 	if authUpstream != "" {
-		authProxy = newReverseProxy(authUpstream, upstreamTLS)
+		authProxy = newReverseProxy(authUpstream, upstreamTLS, doors)
 		log.Printf("front door: auth surface (login/activate/admins/session/logout/oidc + /auth/) -> %s (auth authority)", authUpstream)
 	}
 	if authProxy != nil {
+		throttled := signInThrottled(newSignInThrottle(), authProxy)
 		for _, p := range []string{"/admin/login/", "/admin/activate", "/admin/activate/", "/admin/admins", "/admin/admins/", "/admin/session", "/admin/logout", "/admin/oidc/", "/auth/"} {
+			if isSignInPath(p) {
+				mux.Handle(p, throttled)
+				continue
+			}
 			mux.Handle(p, authProxy)
 		}
 	}
 	if controlUpstream != "" {
-		cpProxy := newReverseProxy(controlUpstream, upstreamTLS)
+		cpProxy := newReverseProxy(controlUpstream, upstreamTLS, doors)
 		mux.Handle("/control/", http.StripPrefix("/control", cpProxy))
 		log.Printf("front door: /control/* -> %s (durable data)", controlUpstream)
 	}
@@ -424,6 +440,13 @@ func main() {
 	if maxConns := runtimequota.CountDefault("CONSOLE_MAX_CONNECTIONS", 4096); maxConns > 0 {
 		ln = newLimitListener(ln, maxConns)
 		log.Printf("admin console: concurrent connection cap = %d (CONSOLE_MAX_CONNECTIONS)", maxConns)
+	}
+	// The front door is L4 and passes TLS through, so every connection would arrive from it. It states the
+	// browser's address in a PROXY protocol header, read only from the addresses in TRUSTED_FRONT_DOORS
+	// (empty = the header is never read, which is what a Console without a door wants).
+	if doors := frontdoor.ParseTrustedNets(env("TRUSTED_FRONT_DOORS", "")); len(doors) > 0 {
+		ln = frontdoor.NewProxyProtocolListener(ln, doors)
+		log.Printf("admin console: PROXY protocol accepted from %d trusted front door(s) (TRUSTED_FRONT_DOORS)", len(doors))
 	}
 	log.Printf("admin console (TLS) on %s serving %s", addr, dir)
 	log.Fatal(srv.ServeTLS(ln, certFile, keyFile))
@@ -494,7 +517,7 @@ func upstreamTLSConfig(caFile string) *tls.Config {
 // newReverseProxy proxies to a single upstream admin API over TLS, forwarding cookies both ways (the default
 // ReverseProxy behavior) so the browser's same-origin session cookie reaches the Edge and Set-Cookie comes
 // back scoped to the front-door origin. The upstream Host is set for correct SNI/vhost.
-func newReverseProxy(target string, tlsCfg *tls.Config) http.Handler {
+func newReverseProxy(target string, tlsCfg *tls.Config, doors *doorDialer) http.Handler {
 	u, err := url.Parse(target)
 	if err != nil {
 		log.Fatalf("invalid upstream URL %q: %v", target, err)
@@ -505,7 +528,11 @@ func newReverseProxy(target string, tlsCfg *tls.Config) http.Handler {
 	// GETs on a stale connection but never a POST, so GETs worked while "Add connector" (a POST) intermittently
 	// stalled/"Failed to fetch", worst on the first POST after page load. An admin console's request volume makes
 	// per-request connections a non-issue, and it matches curl (fresh connection), which never reproduced the bug.
-	p.Transport = &http.Transport{TLSClientConfig: tlsCfg, DisableKeepAlives: true}
+	transport := &http.Transport{TLSClientConfig: tlsCfg, DisableKeepAlives: true}
+	if doors != nil {
+		transport.DialContext = doors.DialContext
+	}
+	p.Transport = transport
 	orig := p.Director
 	p.Director = func(r *http.Request) { orig(r); r.Host = u.Host }
 	return p

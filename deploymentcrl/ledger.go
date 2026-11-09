@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/lantern-networks/dsse-core/inspectioncrl"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 const (
@@ -230,35 +232,7 @@ func Refresh(authorityDir, publicDir string, root *x509.Certificate, issuers []I
 }
 
 func atomicWrite(path string, contents []byte, mode os.FileMode) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".deployment-crl-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if err := f.Chmod(mode); err != nil {
-		f.Close()
-		return err
-	}
-	if _, err := f.Write(contents); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(f.Name(), path); err != nil {
-		return err
-	}
-	d, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
+	return durablefile.Write(path, contents, mode)
 }
 
 // Ready is the issuer-side gate. A missing or lagging published CRL, including

@@ -91,7 +91,7 @@ func TestConsoleSurvivingEntranceKeepsSameOriginAuthenticationAndWrites(t *testi
 	validateClient := &http.Client{Transport: &http.Transport{TLSClientConfig: f.trust.Clone()}}
 	defer validateClient.CloseIdleConnections()
 	mux := http.NewServeMux()
-	proxy := newReverseProxy(authority.URL, f.trust.Clone())
+	proxy := newReverseProxy(authority.URL, f.trust.Clone(), nil)
 	mux.Handle("/admin/", proxy)
 	mux.Handle("/control/", http.StripPrefix("/control", proxy))
 	mux.Handle("/", authGate(authority.URL+"/admin/session", validateClient, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

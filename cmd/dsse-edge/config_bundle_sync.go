@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/lantern-networks/dsse-core/authrollout"
 	"github.com/lantern-networks/dsse-core/inspectionposture"
+	steerexclusion "github.com/lantern-networks/dsse-core/steerexclusion"
 	"io"
 	"log"
 	"net/http"
@@ -67,6 +68,11 @@ type configBundleSource struct {
 	// reporter tells the control plane which generation this Edge holds. Best-effort and deliberately outside
 	// every decision path: a visibility feature must never be able to interfere with the sync it reports on.
 	reporter *fleetConfigReporter
+	// hurry, when set, asks for a pull now instead of at the next tick; pulled, when set, is told after every
+	// pull, applied or not. Both exist for a connector that has just left this node: see
+	// a_connector_that_just_left_is_waited_for.go.
+	hurry  <-chan struct{}
+	pulled func()
 }
 
 // acceptedVerifyKeys is the set of signing keys the CP's config bundle may be signed with: the explicit set
@@ -273,6 +279,10 @@ type configBundlePayload struct {
 	// state (a locally-connected connector keeps its tunnel/secret); a present-but-EMPTY catalog does NOT wipe a
 	// non-empty local registry (lockout-safe). Pointer so a CP that omits it leaves the Edge's registry untouched.
 	Connectors *connectorCatalogBundle `json:"connectors,omitempty"`
+	// SteerExclusions is every administrator-authored steering exclusion of the organizations it names, which
+	// it REPLACES on the Edge (see an_exclusion_rides_the_config_bundle.go). Pointer so a control plane that
+	// predates it leaves the Edge's set alone.
+	SteerExclusions *steerExclusionBundle `json:"steer_exclusions,omitempty"`
 	// RouteGovernance carries the connector route-governance DECISIONS (configured bindings + hold/adopt state).
 	// The CP-configured model distributes the bindings as config, so a pull-model Edge converges WITHOUT a shared
 	// governance store (retiring the shared-file HA workaround). apply REPLACES the local decisions when present
@@ -532,15 +542,18 @@ type delegatedGrantBundle struct {
 // signatures stable as more separate-store resources fold into the bundle. Any field may be nil (that resource
 // is absent on this Edge).
 type configApplyTargets struct {
-	legalHold       *legalHoldStore
-	applications    appcatalog.RuntimeStore
-	dlp             *dlpConfigStores
-	policyStore     *policy.Store
-	resolver        *dnsresolver.Resolver
-	enrolled        *enrolledinventory.Ledger
-	tenantModels    adminTenantModelAdminStore
-	vlan            *vlan.Store
-	connectors      *connector.Registry
+	legalHold    *legalHoldStore
+	applications appcatalog.RuntimeStore
+	dlp          *dlpConfigStores
+	policyStore  *policy.Store
+	resolver     *dnsresolver.Resolver
+	enrolled     *enrolledinventory.Ledger
+	tenantModels adminTenantModelAdminStore
+	vlan         *vlan.Store
+	connectors   *connector.Registry
+	// steerExclusions is the set this Edge signs for its devices. Carried since 2026-11-08; before that an
+	// installer-built Edge never held one.
+	steerExclusions *steerexclusion.Store
 	nhi             nhi.RuntimeStore
 	humanIdentities humanidentity.HumanIdentityDirectoryRuntimeStore
 	delegatedGrants *delegatedgrant.Store
@@ -928,6 +941,16 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 			}
 		}
 	}
+	if payload.SteerExclusions != nil && t.steerExclusions != nil {
+		// A refusal is critical: nothing re-offers this generation, so the Edge would keep signing the old set
+		// for its devices while reporting itself current.
+		if err := applySteerExclusionBundle(t.steerExclusions, payload.SteerExclusions); err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("steering exclusions: %w", err))
+		} else {
+			log.Printf("config-bundle sync: steering exclusions applied for %d organization(s), %d polic(ies)",
+				len(payload.SteerExclusions.Tenants), len(payload.SteerExclusions.Policies))
+		}
+	}
 	if payload.Connectors != nil && t.connectors != nil {
 		if len(payload.Connectors.Connectors) == 0 && len(t.connectors.List()) > 0 {
 			log.Printf("config-bundle sync: control plane sent an EMPTY connector catalog while this Edge has connectors — keeping local (lockout-safe).")
@@ -976,6 +999,14 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 				if _, err := t.connectors.Register(conn, now); err != nil {
 					log.Printf("config-bundle sync: skipping invalid connector %q from the control plane: %v", conn.ID, err)
 					continue
+				}
+				// Register keeps the runtime facts this node already holds (connector.PreserveHeldRuntime), so
+				// the authority's are offered separately, through the same observation-time check every other
+				// writer goes through: newer ones are taken, older ones are not (fourth review of the C3 fixes).
+				if runtime := connectorRuntimeFieldsOf(conn.Metadata); len(runtime) > 0 {
+					if _, err := t.connectors.RecordRuntime(conn.TenantID, conn.ID, runtime); err != nil {
+						log.Printf("config-bundle sync: connector %q runtime facts from the control plane not taken: %v", conn.ID, err)
+					}
 				}
 				// Route governance: record the advertised routes. First sight grandfathers the current set
 				// (existing deployments keep working); a route advertised LATER is pending until approved.
@@ -1423,7 +1454,13 @@ func (s configBundleSource) run(ctx context.Context, targets configApplyTargets)
 			log.Printf("config-bundle sync: could not report this Edge's config status to the control plane (the fleet view will show it as silent): %v", err)
 		}
 	}
+	afterPull := func() {
+		if s.pulled != nil {
+			s.pulled()
+		}
+	}
 	pull(true)
+	afterPull()
 	tell()
 	t := time.NewTicker(s.interval)
 	defer t.Stop()
@@ -1433,7 +1470,13 @@ func (s configBundleSource) run(ctx context.Context, targets configApplyTargets)
 			return
 		case <-t.C:
 			pull(false)
+			afterPull()
 			tell()
+		case <-s.hurry:
+			// An early pull carries no report: the tick still reports on its own schedule, and a burst of these
+			// must not become a burst of writes to the control plane.
+			pull(false)
+			afterPull()
 		}
 	}
 }

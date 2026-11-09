@@ -70,3 +70,17 @@ for (const [name, failure] of [
   assert.equal(f.host.querySelectorAll('button').filter(b=>b.text==='Remove').length,1);
  });
 }
+test('the detail says which entrance holds the tunnel, not the registration-time cluster label',async()=>{
+ const f=fixture({ok:true,status:200,body:{id:'conn-h1',name:'h1',status:'healthy',tunnel_connected:true,version:'0.4.1',uptime_seconds:2520,
+  last_heartbeat_at:'2026-11-08T03:40:00Z',registered_at:'2026-11-08T03:20:51Z',edge_region_id:'region-a',edge_cluster_id:'local-edge-001',
+  tunnel_region:'region-a',tunnel_reported_at:'2026-11-08T03:40:01Z'}});
+ f.context.window={dsseFormatTime:v=>'JST('+v+')'};
+ const host={children:[],innerHTML:'',appendChild(x){this.children.push(x)}};
+ f.context.uiModal=spec=>{f.modals.push(spec);return{close(){},el:{querySelector:sel=>sel==='.ui-modal-body'?host:{style:{},innerHTML:'',appendChild(){}}}}};
+ f.context.uiBadge=(text,kind)=>({text,kind});f.context.uiConnectorStatusLabel=v=>v;f.context.renderConnectorRouteGovernance=()=>{};
+ await f.context.showConnectorDetail('conn-h1');
+ const text=JSON.stringify(host.children);
+ assert.match(text,/Connected through/);assert.match(text,/region-a \(reported JST\(2026-11-08T03:40:01Z\)\)/);
+ assert.match(text,/JST\(2026-11-08T03:20:51Z\)/,'the registration time is in the reader\'s time');
+ assert.doesNotMatch(text,/local-edge-001/,'an internal cluster label is not something an administrator can act on');
+});

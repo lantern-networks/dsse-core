@@ -120,7 +120,7 @@ export PATH="$PWD/bin:$PATH"
 
 Use the revision associated with the release you are evaluating. Each node needs the
 server images its generated Compose file names: either the images published with the
-release (see [Using the published images](releases/0.4.0/install-multi-edge.md#using-the-published-images)),
+release (see [Server container images](releases/0.4.1/README.md#server-container-images)),
 or both service images and the data-layer images built from this revision and loaded on
 every node, following [Building](building.md#build-the-service-images).
 Keep `dsse-install` on `PATH` when changing directories. If a separate build host is used,
@@ -142,7 +142,7 @@ Replace them before minting:
 | Field | Value to supply |
 |---|---|
 | `deployment` | DNS suffix under your control; `example.test` is only a private test example |
-| `agent_publisher` | Identity expected by the endpoint package verifier, matching your signed packages; not a display name or the example placeholder. For the published 0.4.0 packages use `M4U8GSBL6C` |
+| `agent_publisher` | Identity expected by the endpoint package verifier, matching your signed packages; not a display name or the example placeholder. For the published 0.4.0 and 0.4.1 packages use `M4U8GSBL6C` |
 | `regions[].id` | Stable region identifier |
 | `founding` | `true` on exactly one region, where authorities are first minted |
 | `holds_state` | `true` on each of the three voting regions |
@@ -161,8 +161,8 @@ Replace them before minting:
 
 The examples do not name the images to run, and the installer cannot generate a
 startable deployment without them. Add `image_revision`, `service_image`,
-`console_image` and `data_layer` before minting. For the published 0.4.0 images, copy
-the values from [Using the published images](releases/0.4.0/install-multi-edge.md#using-the-published-images);
+`console_image` and `data_layer` before minting. For the published 0.4.1 images, copy
+the values from [Using the published images](releases/0.4.1/README.md#using-the-published-images);
 for images you built, see [Building](building.md). Without `data_layer`, Compose refuses
 to start with `required variable DSSE_ETCD_IMAGE is missing a value`.
 
@@ -250,27 +250,32 @@ Monitor free space and backlog;
 if the local store fills, ingestion can fail. Restore S3 connectivity or capacity
 without deleting the pending journal, hot rows or audit chain state.
 
-Minting outputs the names the deployment needs. Configure all of them, including:
+Minting a plan prints the names its clients dial, who dials each and the address that
+answers for it. They include:
 
-- `node-a.<deployment>` and each other machine's `reachable` name;
-- `agents.<region>.<deployment>`, `admin.<region>.<deployment>`,
-  `authority.<region>.<deployment>`, and `console.<region>.<deployment>`;
-- the generated per-node admin names and deployment-wide agent/recovery names.
+- `admin.<region>.<deployment>`, used by this machine for `-bootstrap-admin` and `-verify`;
+- `authority.<region>.<deployment>`, used by the deployment's own machines;
+- `console.<region>.<deployment>`, used by the administrator's browser;
+- the agent doors in device and connector profiles: `agents.<region>.<deployment>`, or for the
+  one-region three-node plan `agents.<node>.<deployment>` for each node;
+- the step-up Portal names the user's browser opens during sign-in, for the plans that have them
+  (the one-region three-node and multi-edge plans);
+- `recovery.<deployment>`, used by a device whose certificate has expired;
+- `agents.<deployment>`, which `-verify` resolves to check where the recovery name points;
+- `console.<deployment>`, the origin of the links the Console sends (an administrator's
+  invitation, the return after sign-in), opened by the administrator's browser;
+- `node-a.<deployment>` and each other machine's `reachable` name.
 
-Use the generated list rather than constructing an incomplete DNS zone from these examples.
-Each regional name must reach that region's front door. Test resolution **inside the
-containers as well as on the hosts**. For a one-machine lab without container DNS, the
-generated `deployment.env` has four `DSSE_HOST_ALIAS_1` through `DSSE_HOST_ALIAS_4` slots:
+Use the printed list rather than constructing an incomplete DNS zone from these examples.
+Each regional name must reach that region's front door. Make the names resolve on the
+host itself (the next steps call `admin.<region>.<deployment>`), on the administrator's
+computer and on every device. For an isolated lab, hosts entries work. A Windows hosts
+file reads at most nine names on one line, so put a longer list on several lines.
 
-```sh
-DSSE_HOST_ALIAS_1=node-a.example.test:host-gateway
-DSSE_HOST_ALIAS_2=agents.region-a.example.test:host-gateway
-DSSE_HOST_ALIAS_3=admin.region-a.example.test:host-gateway
-DSSE_HOST_ALIAS_4=authority.region-a.example.test:host-gateway
-```
-
-Use these only when that gateway can reach the host's bound ports. They do not configure
-the administrator's or endpoint's resolver, and cannot replace cross-node DNS in a three-region lab.
+On a single-machine plan the containers do not need anything more: minting writes
+`DSSE_HOST_ALIAS_1` through `DSSE_HOST_ALIAS_4` in `deployment.env`, pointing the names the
+containers use at the plan's address. Plans with more than one machine leave these
+empty and use DNS, because a hosts entry inside a container silently overrides DNS.
 
 Check `DSSE_IMAGE` and `DSSE_CONSOLE_IMAGE` in `deployment.env` and resolve any
 [container subnet conflicts](building.md#container-network-conflicts) before starting.
@@ -303,20 +308,24 @@ Retry while services initialize. If it continues to fail, check DNS, clock, cert
 and service logs. The installer's printed readiness hint may use `curl -k`; use the
 `--cacert` form above so a successful probe also validates the expected deployment.
 
-Then run the generated `-bootstrap-admin` command with your email address. On Bash or zsh:
+Then run the generated `-bootstrap-admin` command with your email address:
 
 ```sh
-umask 077
-set -o pipefail
-dsse-install -bootstrap-admin -dir "$DSSE_DIR" \
+(umask 077; set -C; dsse-install -bootstrap-admin -dir "$DSSE_DIR" \
   -control-plane https://admin.region-a.example.test \
-  -admin-email admin@example.test 2>&1 | tee "$DSSE_DIR/admin-credentials.txt"
+  -admin-email admin@example.test \
+  -admin-token-file "$DSSE_DIR/authority/operator-api-token" \
+  > "$DSSE_DIR/admin-credentials.txt" 2>&1)
 ```
 
 Replace the example URL and email. Check the command's exit status before proceeding.
-The output contains the generated password, **TOTP second-factor secret**, recovery codes,
-and named API token. Store them securely; initialize an authenticator with the second-factor
-secret. Never paste this file into an issue or attach it to diagnostics.
+Nothing is printed: the output goes only to `admin-credentials.txt`, created readable by its
+owner alone and never overwritten (`set -C`), and the named operator API token goes to its own
+owner-only file, which `-verify` and `-activate-auth` read with `-admin-token-file` so the token
+never appears on a command line. The credentials file contains the generated password, **TOTP
+second-factor secret** and recovery codes. Read it on this host, store the values securely and
+initialize an authenticator with the second-factor secret. Never paste this file into an issue or
+attach it to diagnostics.
 
 Run the printed recreation step for **both** the control plane and the Edge:
 
@@ -354,9 +363,12 @@ Two voting members cannot tolerate the loss of either member; finish the third r
 
 ## 7. Verify the whole fleet
 
-Run the final `dsse-install -verify` command printed by `-order`, using the **named API
-token** from bootstrap. Keep all entries in `-edge`, `-edge-admin`, and
+Run the final `dsse-install -verify` command printed by `-order`. It reads the **named API
+token** from bootstrap with `-admin-token-file`, so the token is never on a command line. Keep all entries in `-edge`, `-edge-admin`, and
 `-control-plane-peers`; a check through one load-balanced name cannot observe every node.
+Keep `-console` too: it sends a deliberately wrong sign-in through the Console and fails
+unless the control plane refuses it, which is how a Console that cannot reach the
+control plane is found before an administrator tries to sign in.
 
 `NAME@ADDRESS` in these arguments preserves the TLS name while selecting the dial address.
 It does not configure DNS for device-style checks. Run verification where all generated
@@ -430,14 +442,40 @@ through to the Edge. Use the generated hostnames, not bare IP URLs.
 
 | Connection | Access required |
 |---|---|
-| Endpoint/connector to regional front door | TCP 443 |
-| Administrator to Console and admin names | TCP 443, restricted to administrator networks |
+| Endpoint/connector to regional front door | TCP 443 from any address — endpoints and connectors use dynamic addresses, so do not restrict this by source address |
+| Administrator to Console and admin names | TCP 443 on the same front door, from any address. Do not restrict it by source address: administrators, endpoints and connectors all arrive from changing addresses and share this port. The Console is protected by sign-in (password and a second factor, with sign-in rate limits); the admin names require the operator's credentials |
 | Nodes to other regional doors | TCP 443 for authority and mesh paths |
+| Multi-region plans: each region's front door to the other regions' control planes | Direct admin/data ports 19543 / 19545 on each control-plane machine's address (`reachable_address`), restricted to the other control-plane machines. The other regions' doors on 443 are a fallback used only while no direct listener answers |
 | Peer nodes to published Edge ports | Generated agent/admin ports (defaults 8443 / 19443), restricted to deployment peers and verification hosts |
 | `one-region-three-nodes` peer doorways to each Node's CP | Direct admin/data ports 19543 / 19545 on the Node address, restricted to the three Node addresses |
 | `one-region-three-nodes` peer doorways to each Node's Console | Direct TLS port 19544 on the Node address, restricted to the three Node addresses; `/ready` accepts only the Console colocated with the CP leader |
 | State-bearing nodes to one another | Generated etcd client/peer and database ports, restricted to deployment peers |
 | Control planes to operator-managed S3, if configured | TLS to the archive endpoint declared in the plan; no S3 egress requirement for local-only storage |
+
+Because 443 is open to every address, a node answers anybody only whether it takes traffic.
+`GET /healthz` returns the status code and `{"status":"..."}` to every caller, which is what the
+front door's health checks and the device agents read. The rest of that document (build, machine,
+region, control channel, database replicas, counters) and `GET /metrics` are returned only to a
+caller presenting an administrator credential of the operator organization. That credential can be
+a session or a named API token. `-verify` presents the installation's read-only token, or the
+fleet token in `deployment.env`. Give a metrics scraper its own named API token with
+`admin.state.read` and send it as a bearer token. Without one, `/metrics` answers 401.
+
+In a plan with more than one region, each region's front door reaches the other regions'
+control planes at those control planes' own listeners on 19543 (admin) and 19545 (data), so
+a stopped front door does not hide a control plane that is still leading. A control plane is
+used for writes only while its admin listener says it leads and its data listener answers.
+
+The other regions' doors on 443 are a separate fallback, taken only while no direct listener
+answers, for example while machines are being re-rendered one at a time. Each door in the
+fallback is asked about its own region's control plane only (by that node's name), so it is
+used only while its own region leads, and re-rendered doors do not pass requests between
+themselves. Doors not yet re-rendered behave as before and may hand a request to another
+region's door before it reaches the leader; re-render every machine to finish.
+
+`-verify` reports "the other control planes answer at their own listeners" and "the other
+control planes' data listeners answer", and fails when a direct listener does not answer.
+Open both ports between the control-plane machines rather than relying on the fallback.
 
 Typical state ports between peers include 12379/12390 (etcd), 15433 (PostgreSQL member)
 and 18008 (Patroni). The local database port 15432 binds to loopback and is not a peer port.
@@ -452,6 +490,41 @@ owning Edge, so the names can share the Region's one public IP.
 The profile also publishes each Node's CP admin/data listeners on its plan address only.
 Both peer leader probes and forwarded admin/authority traffic use those listeners directly;
 opening a peer doorway on 443 as the CP backend can produce false leader health and routing loops.
+
+The Console is served only beside the control-plane leader, and it reaches sign-in, the control
+plane and the Edge through the names it was generated with (`admin.<host>`,
+`<node>.admin.<host>`), which resolve to the door on its own machine. When that door is stopped
+while the browser still arrives through another one, the Console opens new connections through the
+other doors instead: `DSSE_CONSOLE_DOOR_FALLBACKS` in `deployment.env` lists them. Only where it
+connects changes; the TLS name, the Host and the certificate it checks stay those of the name.
+
+What this keeps working depends on the profile:
+
+- `one-region-three-nodes` lists the other Nodes on 443. Every door in the region routes every name
+  the Console uses, so sign-in, the control plane and the Edge's own screens all continue.
+- `three-regions-multi-edge` lists the other regions' control-plane machines on 443. Their doors
+  route `admin.<deployment>` to the leader, so sign-in and everything the control plane answers
+  continue. They do not route this region's per-node Edge names: those requests reach another
+  region's data plane, which refuses `/admin/*` (404), so screens that ask one of this region's
+  Edges directly are unavailable until this region's door is back.
+
+The Edge and the control plane on the same machine reach the control plane's names
+(`admin.<region>.<host>`, `authority.<region>.<host>`) through the same door, and do the same
+thing: `DSSE_EDGE_LOCAL_DOORS` names the door those names resolve to on this machine, and
+`DSSE_EDGE_DOOR_FALLBACKS` the others. Only a connection to that door can go elsewhere; an identity
+provider, a connector or an Internet destination that does not answer fails as itself. Without it, an
+Edge beside a stopped door cannot check an administrator's session, pull configuration or
+revocations, or ship audit until the door is back, and a screen that asks it directly waits and is
+refused (401). In `three-regions-multi-edge` every region's door routes every region's
+control-plane names (`admin.<region>.<deployment>`, `authority.<region>.<deployment>`) to the
+control plane, so an Edge whose region's door is stopped keeps reaching it through another region's
+door. (The per-node Edge names described above are different: those stay with their own region's door.)
+
+The door on the machine is tried first, with a one-second limit; after it refuses, new
+connections try the other doors first for 15 seconds, then this machine's door again. A connection
+already open (the Console's session checks reuse theirs) is not moved. Re-render the machine
+(`dsse-install -plan … -dir … -machine …`) to add the settings to a deployment generated before they
+existed.
 
 ## Secrets and the process command line
 

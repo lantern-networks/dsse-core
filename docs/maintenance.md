@@ -798,6 +798,26 @@ Steering exclusions now keep saved state on failed writes, attribute audit and v
 
 Before updating an Edge that downloads steering exclusions, ensure its retrieval token belongs to the same tenant as its configuration bundle. An operator token or a token from another tenant now receives a tenant-mismatch response; the Edge retains its cached exclusions but cannot receive subsequent updates. Update the CP first, then update Edges after checking this token-to-tenant mapping.
 
+### Connector liveness from a node without the connector's tunnel
+
+From 0.4.1, an Edge that receives a connector's heartbeat without holding that
+connector's tunnel reports the heartbeat to the control plane marked
+`liveness_only`. On the multi-node layouts the agent entrance balances by least
+connections, so a heartbeat lands on any node of the region. The control plane
+records the heartbeat time and status from such a report and nothing else: not
+the reporting node's region as the connector's location, and not the node's copy
+of the registration.
+
+Upgrade requirement: a control plane older than 0.4.1 does not know the
+`liveness_only` mark. Given such a report it records the node's copy of the whole
+registration, which restores a previous address, routes and location over what an
+administrator saved or the fleet observed. **Upgrade every control plane that a 0.4.1
+Edge can report to before any Edge**, and do not let an older control plane take
+leadership, or serve reports during a rollback, while a 0.4.1 Edge is running.
+Upgrading one control plane, then the Edges beside it, then the next control plane
+does not satisfy this on a multi-region deployment, because an Edge reports to
+whichever control plane leads.
+
 ### Connector management and organization-domain reconciliation
 
 Connector secret replacement confirms persistence at both administrative URLs; errors do not return a usable new secret. Registration and heartbeat keep their audit/report follow-up when route discovery alone fails. Organization domain updates preserve concurrent changes, refresh shared state and retain the request leadership term. Connector lists reject malformed responses and avoid applying responses after the selected organization changes. These changes retain existing browser acceptance evidence for unchanged controls; real connector reconnection remains a deployment check.

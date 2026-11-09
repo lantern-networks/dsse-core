@@ -618,6 +618,14 @@ func tick(u *updater, evt *eventWriter, thr *reportThrottle) Result {
 	return r
 }
 
+// trustedKeyCount is how many update-signing keys this service verifies manifests against.
+func (u *updater) trustedKeyCount() int {
+	if src, ok := u.deps.Source.(updateplatform.FileManifestSource); ok {
+		return len(src.TrustedKeys)
+	}
+	return 1 // a source that does not carry keys this way is not the keyless start this guards
+}
+
 // printStatus answers "what would this device do, and why" without doing any of it. The question an operator
 // asks about a device that has not updated is never "what is the code" — it is "what is this box waiting for".
 func printStatus(u *updater) {
@@ -700,9 +708,41 @@ func (s *updaterService) Execute(_ []string, r <-chan svc.ChangeRequest, st chan
 
 	t := time.NewTicker(s.interval)
 	defer t.Stop()
+	if wait := firstPassDelay(s.u.trustedKeyCount()); wait > 0 {
+		evt.info(evtProgress, fmt.Sprintf("no update-signing key is configured yet; the first pass waits %s, "+
+			"because the installer hands the keys over moments after it starts this service", wait))
+		first := time.After(wait)
+	waiting:
+		for {
+			select {
+			case <-first:
+				break waiting
+			case c := <-r:
+				switch c.Cmd {
+				case svc.Interrogate:
+					st <- c.CurrentStatus
+				case svc.Stop, svc.Shutdown:
+					st <- svc.Status{State: svc.StopPending}
+					return false, 0
+				}
+			}
+		}
+	}
 	tick(s.u, evt, thr)
+	// ★★ A REFUSAL STILL STANDING AT START IS LOOKED AT AGAIN SOON (2026-11-04, measured on an upgrade from
+	// 0.4.0). The installer starts this service a moment before it hands over the update-signing keys, so the
+	// first pass refuses; the restarted service then finds nothing wrong, but the agent has not yet recorded the
+	// version it runs, so the pass cannot say what the device should now show and leaves the refusal standing.
+	// The next look was the ordinary interval, thirty minutes, and for those thirty minutes the Devices screen
+	// said "refusing the update" about a device with nothing wrong with it. A few early passes, only while a
+	// refusal stands and only just after start, close that without polling a device that is genuinely refused.
+	early := startupRecheck{reportsDir: agentupdate.ReportsDir(s.u.deps.JournalPath)}
+	recheck := early.next()
 	for {
 		select {
+		case <-recheck:
+			tick(s.u, evt, thr)
+			recheck = early.next()
 		case <-t.C:
 			tick(s.u, evt, thr)
 		case c := <-r:

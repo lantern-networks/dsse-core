@@ -467,6 +467,10 @@ func sendHeartbeat(client *http.Client, edgeURL, connectorID, connectorSecret, t
 		Metadata: map[string]any{
 			"identity_sync": identitySyncMonitor.Snapshot(identitySyncConfigured),
 		},
+		// What this process runs and for how long (C3-R4-1): the Console's connector detail has nothing else to
+		// show.
+		Version:       connectorVersion(),
+		UptimeSeconds: connectorUptimeSeconds(time.Now()),
 	}
 	return postJSON(client, fmt.Sprintf("%s/connectors/%s/heartbeat", edgeURL, connectorID), heartbeat, connectorSecret)
 }
@@ -586,7 +590,10 @@ func connectTunnelLoop(ctx context.Context, doors *connectorEndpoints, attachmen
 		if node != "" {
 			log.Printf("connector no longer holds a tunnel on Edge node %s; now on %s", node, attachments.coverage())
 		}
-		if primary && doors.selection() != selected {
+		// Whether the door was moved while this tunnel was up — by going home, or by a heartbeat that gave up on
+		// the region. Read before this worker judges the door itself, so its own advance below does not count.
+		doorMoved := doors.selection() != selected
+		if primary && doorMoved {
 			// ★★★ THE DOOR ALREADY MOVED, AND THIS TUNNEL BELONGS TO THE OLD ONE (2026-09-02, measured within
 			// a minute of adding the heartbeat-driven decision). The heartbeat concluded the region was gone
 			// and advanced to the next door; the long-held tunnel to the DEAD door then ended and was judged
@@ -626,6 +633,16 @@ func connectTunnelLoop(ctx context.Context, doors *connectorEndpoints, attachmen
 			} else {
 				doors.advanceIfSelected(selected, err)
 			}
+		}
+		// ★★★ A DOOR THIS CONNECTOR CHOSE IS DIALLED AT ONCE (2026-11-07, measured on 0.4.1 acceptance B). Going
+		// home ends every tunnel so the workers redial at the preferred door — and then each worker paused two
+		// seconds first, the pause meant for a door that has just failed. For those two seconds the connector
+		// was attached nowhere and everything behind it was unreachable from every Region, for a door it had
+		// just watched answer three checks in a row. The pause stays where it belongs: after a tunnel that ended
+		// on its own, at a door nobody moved. A move happens at most once per decision, so skipping the pause
+		// cannot turn into a loop: the next tunnel that ends without a move waits as before.
+		if doorMoved {
+			continue
 		}
 		select {
 		case <-ctx.Done():

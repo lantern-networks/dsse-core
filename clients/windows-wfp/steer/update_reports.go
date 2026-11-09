@@ -93,6 +93,10 @@ func agentUpdateEventBody(cfg heartbeatConfig, r agentupdate.Report) map[string]
 	if r.Status == agentupdate.ReportRefused {
 		meta["refused"] = true
 	}
+	if r.RefusalCleared {
+		// Says why an "installed" arrived with nothing installed: a refusal reported earlier no longer applies.
+		meta["refusal_cleared"] = true
+	}
 	if r.RejectedDigest != "" {
 		// ★ IT IS THE ONLY THING THAT IDENTIFIES THIS REFUSAL (2026-08-12, ninth review). A manifest that does
 		// not verify supplies no version this box may believe, so the refusal has none — and without the digest

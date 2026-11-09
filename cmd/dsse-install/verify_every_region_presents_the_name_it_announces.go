@@ -22,6 +22,7 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -66,14 +67,45 @@ func verifyEveryRegionPresentsTheNameItAnnounces(dir string) []verifyResult {
 			// deployment hands out and verified against the anchor the deployment distributes, so there is no
 			// gap between what this says and what a device would experience.
 			results = append(results, verifyResult{name: name, ok: false, note: fmt.Sprintf("a device dialling %s — the address this deployment hands out for %s — cannot "+
-				"verify it: %v. Teach that region the name with: dsse-install -dir <that region's directory> "+
-				"-add-host %s, then restart its nodes", region.url, region.id, derr, host)})
+				"verify it: %v. %s", region.url, region.id, derr, whatToDoWhenARegionDoesNotVerify(derr, host))})
 			continue
 		}
 		_ = conn.Close()
 		results = append(results, verifyResult{name: name, ok: true, note: fmt.Sprintf("%s answers as %s and verifies against this deployment's anchor", region.url, host)})
 	}
 	return results
+}
+
+// whatToDoWhenARegionDoesNotVerify names the fix for the failure that actually happened.
+//
+// ★ THE ONE HINT WAS RIGHT FOR ONE FAILURE (2026-11-07, three-region acceptance rerun). Every failure here told
+// the operator to teach the region the name with -add-host. Run a minute after the last region was started, the
+// check failed with EOF — the region's entrance was not yet completing handshakes — and the same sentence sent
+// the operator to re-issue certificates that were fine; a minute later the check passed untouched. A name the
+// certificate does not carry is -add-host; a certificate from another authority is a different deployment's;
+// a handshake that never completes is a door that is not answering yet.
+func whatToDoWhenARegionDoesNotVerify(derr error, host string) string {
+	var hostname x509.HostnameError
+	var authority x509.UnknownAuthorityError
+	var invalid x509.CertificateInvalidError
+	switch {
+	case errors.As(derr, &hostname):
+		return fmt.Sprintf("Its certificate does not carry that name. Teach that region the name with: dsse-install -dir "+
+			"<that region's directory> -add-host %s, then restart its nodes", host)
+	case errors.As(derr, &invalid) && invalid.Reason == x509.Expired:
+		// ★ EXPIRED IS NOT ANOTHER AUTHORITY (review of 2026-11-07, R5). A certificate from this deployment's own
+		// CA, carrying the right name, past its dates was sent to check the anchor — the one thing that was fine.
+		return "Its certificate is expired or not yet valid. Check the clock on that region's nodes and on this " +
+			"machine, and whether that region's certificates were renewed"
+	case errors.As(derr, &authority):
+		return "Its certificate does not chain to the anchor this deployment gives its devices. Check that region " +
+			"was set up from this deployment's plan, and that the anchor beside this directory is this deployment's"
+	case errors.As(derr, &invalid):
+		return fmt.Sprintf("Its certificate was refused: %v. Check how that region's certificates were issued", invalid)
+	default:
+		return "Nothing there completed a TLS handshake. If that region was started moments ago, run -verify again " +
+			"once it is up; otherwise check that its entrance is running and reachable from here"
+	}
 }
 
 type announcedRegion struct{ id, url string }

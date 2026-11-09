@@ -56,13 +56,19 @@ type connectorRegistryRenamer interface {
 // by the act, not by a store: both the in-memory registry and the deployment's database implement it, and a
 // third would need this one method rather than another type assertion.
 type connectorAttachmentRecorder interface {
-	RecordAttachedRegion(id, region string) (bool, error)
+	RecordAttachedRegion(tenantID, id, region string) (bool, error)
 }
 
 // connectorLivenessRecorder writes what a reporting Edge OBSERVED about a connector it holds — that it was
 // heard from, and what it said — without touching the fields an operator authored. See Registry.RecordLiveness.
 type connectorLivenessRecorder interface {
 	RecordLiveness(id, status, heartbeatAt string) (bool, error)
+}
+
+// connectorRuntimeRecorder keeps what the connector reports about itself (version, uptime) and when an Edge
+// last said it holds the tunnel, on the authority. See recordConnectorRuntime.
+type connectorRuntimeRecorder interface {
+	RecordRuntime(tenantID, id string, fields map[string]any) (bool, error)
 }
 
 type connectorRegistryTenantReader interface {

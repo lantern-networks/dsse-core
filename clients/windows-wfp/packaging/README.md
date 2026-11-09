@@ -6,7 +6,7 @@ use the [Windows agent guide](../../../docs/windows-agent.md). This page is for 
 ## Prerequisites
 
 - Windows, Go 1.27.3 (the release toolchain; `go.mod` requires at least 1.26.9 and selects 1.27.3 when the `go` command may download toolchains), PowerShell, and a .NET SDK.
-- WiX 7.0.0 (`dotnet tool install --global wix --version 7.0.0`) and the Windows SDK signing tools. The build scripts pass `-acceptEula wix7` to the WiX CLI. Review the [OSMF terms](https://docs.firegiant.com/wix/osmf/) before building; confirm the applicable revenue condition as part of release operations.
+- WiX 7.0.1 (`dotnet tool install --global wix --version 7.0.1`) and the Windows SDK signing tools. The build scripts pass `-acceptEula wix7` to the WiX CLI. Review the [OSMF terms](https://docs.firegiant.com/wix/osmf/) before building; confirm the applicable revenue condition as part of release operations.
 - A driver matching the target architecture and accepted by the target's Windows security policy.
 - Your own signing identity for a distributed MSI. The `test` backend is for development only.
 
@@ -113,7 +113,7 @@ After the MSI build:
 
 This produces `DsseAgentSetup.exe` using WiX Burn. Authentication uses the user's default
 browser; the retired embedded WebView2 helper is not installed. Build prerequisites include
-`WixToolset.BootstrapperApplications.wixext/7.0.0`. Run the bundle from an ordinary build/output directory, not
+`WixToolset.BootstrapperApplications.wixext/7.0.1`. Run the bundle from an ordinary build/output directory, not
 under the Windows system directories.
 
 ## Verify what will be distributed

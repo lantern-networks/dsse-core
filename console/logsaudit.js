@@ -14,7 +14,9 @@ const _LA_PLANE = "control";
 // This set MIRRORS the backend's `defaultAuditShipStreams` (cmd/edge/audit_ship.go). Keep them in
 // sync: a stream added there must be added here, or its tab reads the wrong plane. Anything not listed is
 // read from the edge — the safe default, since an edge always has its own records.
-const _LA_SHIPPED_STREAMS = new Set(["audit", "access", "device_state", "inspection_events", "config_generations"]);
+// connector joined the shipped streams on 2026-11-09 (acceptance D): an Edge on its own machine writes a connector's
+// connections to its own disk, and until the shipper carried them this tab read an Edge that held none.
+const _LA_SHIPPED_STREAMS = new Set(["audit", "access", "device_state", "inspection_events", "config_generations", "connector"]);
 function laPlaneFor(stream) { return _LA_SHIPPED_STREAMS.has(stream) ? _LA_PLANE : "edge"; }
 let _laTab = "logs";
 let _laStream = "access";
@@ -77,6 +79,16 @@ function laResultBadge(res) {
 const _LA_REASON = {
   policy_matched: { en: "Policy matched", ja: "ポリシー合致" },
   application_allowed: { en: "Allowed by policy", ja: "ポリシーで許可" },
+  application_denied: { en: "Denied by policy", ja: "ポリシーで拒否" },
+  reauthentication_required: { en: "Re-authentication required", ja: "再認証が必要" },
+  workload_attestation_required: { en: "Workload attestation required", ja: "ワークロードの証明が必要" },
+  authenticate_required: { en: "Sign-in required", ja: "本人確認が必要" },
+  authentication_satisfied: { en: "Sign-in completed", ja: "本人確認済み" },
+  delegated_grant_valid: { en: "Delegated grant valid", ja: "委任が有効" },
+  scope_allowed: { en: "Scope allowed", ja: "範囲内" },
+  approval_valid: { en: "Approval valid", ja: "承認が有効" },
+  tool_allowed: { en: "Tool allowed", ja: "ツールを許可" },
+  connector_route_denied: { en: "Connector route denied", ja: "コネクタ経路で拒否" },
   no_policy_match: { en: "No policy matched (default deny)", ja: "合致ポリシーなし(既定拒否)" },
   risk_signal_manual_high_risk: { en: "Marked high-risk", ja: "高リスク指定" },
   risk_signal_idp_high_risk: { en: "IdP high risk", ja: "IdP高リスク" },
@@ -86,7 +98,22 @@ const _LA_REASON = {
   ransomware_protection_mode_active: { en: "Risk overlay active", ja: "リスクオーバーレイ作動" },
   high_sensitivity_application: { en: "High-sensitivity app", ja: "機密アプリ" },
   authentication_max_age_exceeded: { en: "Stale authentication", ja: "認証鮮度切れ" },
-  east_west_authenticate_required: { en: "East-West step-up required", ja: "コネクタ経由アクセスの認証が必要" },
+  // ★ EVERY CODE THE CONNECTOR-ACCESS AND SERVER-INITIATED DECISIONS WRITE (2026-11-07, three-region acceptance
+  // rerun). The table held "east_west_authenticate_required", which nothing writes, and not the
+  // "east_west_authentication_required" the decision does write — so a sign-in row read in English, tag and all.
+  // A test now derives the codes from the decision package instead of from one function in it.
+  east_west_authentication_required: { en: "This rule requires sign-in", ja: "このルールは本人確認を求める" },
+  east_west_policy_allow: { en: "Allowed by a connector-access rule", ja: "コネクタ経由アクセスのルールで許可" },
+  east_west_policy_deny: { en: "Denied by a connector-access rule", ja: "コネクタ経由アクセスのルールで拒否" },
+  east_west_grant_satisfied: { en: "Allowed by an access approval", ja: "アクセス承認で許可" },
+  east_west_device_attested: { en: "Allowed for a verified device", ja: "確認済みの端末として許可" },
+  east_west_unmatched_allow: { en: "No rule matched (partial enforcement allows it)", ja: "合致ルールなし(部分強制のため許可)" },
+  server_initiated_default_deny: { en: "Server-initiated: denied, no exception applies", ja: "受信接続(サーバ発): 例外なしで拒否" },
+  server_initiated_invalid_exception: { en: "Server-initiated: denied, the exception is invalid", ja: "受信接続(サーバ発): 例外が無効のため拒否" },
+  server_initiated_legacy_exception_allow: { en: "Server-initiated: allowed by an exception", ja: "受信接続(サーバ発): 例外で許可" },
+  server_initiated_legacy_exception_deny: { en: "Server-initiated: denied by an exception", ja: "受信接続(サーバ発): 例外で拒否" },
+  server_initiated_legacy_exception_observe: { en: "Server-initiated: allowed by an exception (observe)", ja: "受信接続(サーバ発): 例外で許可(観測)" },
+  server_initiated_legacy_exception_warn: { en: "Server-initiated: allowed by an exception (warn)", ja: "受信接続(サーバ発): 例外で許可(警告)" },
   east_west_default_deny: { en: "East-West default deny", ja: "コネクタ経由アクセス 既定拒否" },
   east_west_warn: { en: "East-West warn (dry-run)", ja: "コネクタ経由アクセス 警告(ドライラン)" },
   device_attested_auto: { en: "Device-attested (silent)", ja: "デバイス認証(無言許可)" },
@@ -112,6 +139,11 @@ const _LA_EVENT = {
   admin_policy_upserted: { en: "Policy saved", ja: "ポリシー保存" },
   admin_application_upserted: { en: "Application saved", ja: "アプリ保存" },
   admin_application_deleted: { en: "Application deleted", ja: "アプリ削除" },
+  admin_application_published: { en: "Application published", ja: "アプリを公開" },
+  admin_application_unpublished: { en: "Application unpublished", ja: "アプリの公開を停止" },
+  admin_route_collision_override_approved: { en: "Overlapping route approved", ja: "重なる経路を承認" },
+  break_glass_session_used: { en: "Emergency session used", ja: "緊急用のセッションが使われました" },
+  nhi_delegated_access_decision_evaluated: { en: "NHI delegated access decided", ja: "NHI の委任アクセスを判定" },
   admin_endpoint_inventory_upserted: { en: "Endpoint saved", ja: "エンドポイント保存" },
   enrolled_inventory_updated: { en: "Enrolled inventory updated", ja: "登録インベントリ更新" },
   admin_tenant_model_updated: { en: "Tenant settings changed", ja: "テナント設定変更" },
@@ -176,6 +208,11 @@ const _LA_EVENT = {
   device_heartbeat: { en: "Heartbeat", ja: "ハートビート" },
   device_state_changed: { en: "Posture changed", ja: "ポスチャ変化" },
   connector_registered: { en: "Connector registered", ja: "コネクタ登録" },
+  // ★ THE ONE ROW EVERY CONNECTOR WRITES FIRST WAS MISSING (2026-11-04, acceptance A, third run). A connector
+  // installed by the book showed "Connector connected" on a Japanese page: laPretty spelled the code out.
+  connector_connected: { en: "Connected", ja: "接続" },
+  connector_reconnect: { en: "Reconnected", ja: "再接続" },
+  reachability_test_executed: { en: "Reachability checked", ja: "到達の確認" },
   connector_heartbeat: { en: "Heartbeat", ja: "ハートビート" },
   connector_disconnected: { en: "Disconnected", ja: "切断" },
   connector_status_changed: { en: "Status changed", ja: "状態変化" },
@@ -189,6 +226,33 @@ const _LA_EVENT = {
   saas_tenant_restriction_rewrite: { en: "Tenant-restriction rewrite", ja: "テナント制限リライト" },
   dlp_device_risk: { en: "Automatic DLP risk outcome", ja: "DLP自動リスクの適用結果" },
   dlp_match: { en: "DLP match", ja: "DLP一致" },
+  // Admin events found unlabelled by ops/checks/console_audit_events_are_named.sh (2026-11-06).
+  admin_access_grant_revoked: { en: "Access approval revoked", ja: "アクセス承認を取り消し" },
+  admin_asset_catalog_changed: { en: "Asset catalogue changed", ja: "資産の一覧を変更" },
+  admin_authored_rule_changed: { en: "Rule changed", ja: "ルールを変更" },
+  admin_authorization_unavailable: { en: "Permission could not be checked", ja: "権限を確認できず" },
+  admin_connector_program_published: { en: "Connector program published", ja: "コネクタのプログラムを公開" },
+  admin_incoming_changed: { en: "Incoming risk signal settings changed", ja: "リスク信号の受信設定を変更" },
+  admin_inspection_posture_changed: { en: "Inspection settings changed", ja: "検査の設定を変更" },
+  admin_internal_ca_changed: { en: "Internal site certificate changed", ja: "社内サイトの証明書を変更" },
+  admin_policy_deleted: { en: "Policy deleted", ja: "ポリシーを削除" },
+  admin_policy_status_changed: { en: "Policy status changed", ja: "ポリシーの状態を変更" },
+  admin_seat_allocation_changed: { en: "Device seats reassigned", ja: "端末枠の割り当てを変更" },
+  admin_swg_tenant_restriction_unconfirmed: { en: "SaaS tenant restriction not confirmed", ja: "SaaSテナント制限が未確認" },
+  admin_upstream_tls_updated: { en: "Upstream TLS settings changed", ja: "接続先TLSの設定を変更" },
+  agent_profile_issued: { en: "Device configuration issued", ja: "端末の設定一式を発行" },
+  agent_update_activate_failed: { en: "Agent release could not be activated", ja: "エージェントのリリースの有効化に失敗" },
+  agent_update_publish_failed: { en: "Agent release could not be published", ja: "エージェントのリリースの公開に失敗" },
+  device_risk_change_failed: { en: "Device risk could not be changed", ja: "端末のリスクの変更に失敗" },
+  device_risk_changed: { en: "Device risk changed", ja: "端末のリスクを変更" },
+  east_west_observations_adopted: { en: "Observed connections adopted as rules", ja: "観測した接続をルールに採用" },
+  legacy_unattributed_risk_discarded: { en: "Unattributed older risk signals discarded", ja: "帰属先の無い古いリスク信号を破棄" },
+  steer_exclusion_updated: { en: "Bypass list changed", ja: "振り向けの除外を変更" },
+  transport_admission_changed: { en: "Device admission changed", ja: "端末の受け入れ設定を変更" },
+  user_risk_changed: { en: "User risk changed", ja: "ユーザーのリスクを変更" },
+  idp_connection_upserted: { en: "IdP connection saved", ja: "IdP 連携を保存" },
+  idp_connection_deleted: { en: "IdP connection deleted", ja: "IdP 連携を削除" },
+  idp_connection_default_set: { en: "Default IdP set", ja: "既定の IdP を設定" },
 };
 function laPretty(code) {
   const c = String(code || "").trim();
@@ -293,7 +357,7 @@ function laDeviceUserCell(row) {
 function laConnectorStatusCell(row) {
   const status = laVal(row, "status", "result");
   const hb = laVal(row, "last_heartbeat_at", "timestamp");
-  const kids = [uiBadge(laDash(status) || "—", /healthy|ok|connected|active/i.test(status) ? "ok" : "off")];
+  const kids = [uiBadge(status ? uiConnectorStatusLabel(status) : "—", /healthy|ok|connected|active/i.test(status) ? "ok" : "off")];
   if (hb) { const ageMs = Date.now() - Date.parse(hb); if (!isNaN(ageMs) && ageMs > 150000) kids.push(el("span", { class: "ui-view-desc", style: "font-size:10px", text: bl({ en: "stale", ja: "古い" }) })); }
   return el("span", { style: "display:inline-flex;gap:5px;align-items:center" }, kids);
 }
@@ -346,9 +410,25 @@ function laReasonCell(row) {
   const codes = (Array.isArray(row.reason_codes) ? row.reason_codes : []).filter((c) => !_LA_GENERIC_CODE[c] && !_LA_ROW_HIDE_CODE[c]);
   // Top line: a meaningful reason (deny/exception) if any, plus WHICH policy decided (the "why allowed").
   const line = [];
-  if (reason && !laReasonIsGenericSentence(reason)) line.push(el("span", { text: reason }));
+  // ★ THE LIST PRINTED THE DECISION'S ENGLISH SENTENCE (2026-11-08, acceptance C). The drawer translated the reason
+  // from its codes and the row beside it did not, so a Japanese screen read "Allowed: the interactive
+  // authentication this rule requires was completed." The row says it the way the drawer does.
+  const saidWhy = Boolean(reason && !laReasonIsGenericSentence(reason));
+  if (saidWhy) line.push(el("span", { text: laReasonSentence(row, reason), title: reason }));
   const pid = laVal(row, "policy_id");
   if (pid) line.push(el("span", { class: "ui-view-desc", title: bl({ en: "Matched policy", ja: "合致ポリシー" }), text: "▸ " + pid }));
+  // ★ AN ALLOWED ROW SAID NOTHING AND A DENIED ROW BESIDE IT SAID WHY (acceptance C, fourth walk, 2026-11-08). The
+  // generic "allowed by policy" was hidden as filler, while "denied by policy" — just as generic — was shown, and
+  // the drawer of the same allowed row said "allowed by policy". When nothing more specific remains, the row says
+  // the generic reason, as the drawer does.
+  // ★ AND IT STILL SAID NOTHING ON THE LAB (acceptance D, 2026-11-09). The fix above asked "is the line empty",
+  // and the line already held the rule's id — so every real row, which names its rule, skipped it, and only the
+  // test's rows without a rule id took it. The question is whether a REASON was said, not whether anything was.
+  if (!saidWhy && !codes.length) {
+    const all = Array.isArray(row.reason_codes) ? row.reason_codes : [];
+    const generic = ["application_allowed", "policy_matched"].find((c) => all.includes(c));
+    if (generic) codes.push(generic);
+  }
   const kids = [];
   if (line.length) kids.push(el("span", { style: "display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap" }, line));
   if (codes.length) kids.push(el("span", { class: "ui-chip-row", style: "margin-top:3px;display:flex;gap:4px;flex-wrap:wrap" }, codes.slice(0, 4).map(laReasonChip)));
@@ -364,7 +444,7 @@ function laIdentityCell(row) {
   const who = laVal(row, "user_id", "subject_user_id", "actor_user_id", "actor_nhi_id");
   const at = laVal(row, "actor_type");
   const kids = [el("span", { text: laDash(who) })];
-  if (at && at !== "human") kids.push(uiBadge(at, "off"));
+  if (at && at !== "human") kids.push(uiBadge(_LA_ACTOR_TYPE[at] ? bl(_LA_ACTOR_TYPE[at]) : at, "off"));
   // Authorization signal at a glance: this access was gated by a delegated grant / human approval (not just allow).
   if (laVal(row, "delegated_access_grant_id")) kids.push(el("span", { class: "ui-badge ui-badge-off", style: "font-size:10px", title: bl({ en: "Authorized by a delegated grant", ja: "委譲grantで認可" }), text: "🔑 grant" }));
   if (laVal(row, "human_approval_event_id")) kids.push(el("span", { class: "ui-badge ui-badge-off", style: "font-size:10px", title: bl({ en: "Gated by a human approval", ja: "人手承認あり" }), text: "✋ approval" }));
@@ -1018,14 +1098,110 @@ const _LA_GROUPS = [
   { title: { en: "Inspection", ja: "検査" }, keys: ["inspection_profile_id", "inspection_mode", "inspection_route_category", "data_classification"] },
   { title: { en: "Agent / tool", ja: "エージェント・ツール" }, keys: ["tool_id", "tool_action_type", "context_boundary_id", "mcp_server_id", "runtime_environment_id"] },
 ];
-function laFieldRow(k, v) {
+// What each field of a decision is called on the screen. The keys are the record's own; a key with no label
+// here falls back to the key itself, so a field added later is still shown (2026-11-07, three-region acceptance
+// rerun: every field name in the drawer read as the record's key, "user id", "actor type", "policy id").
+const _LA_FIELD = {
+  // The record's own bookkeeping, which the drawer lists under "Other" (acceptance C, 2026-11-07: these were the
+  // keys themselves).
+  id: { en: "Record", ja: "記録" },
+  tenant_id: { en: "Organization", ja: "組織" },
+  config_generation_id: { en: "Configuration version", ja: "設定の版" },
+  access_decision_id: { en: "Access decision", ja: "アクセスの判断" },
+  edge_region_id: { en: "Region", ja: "リージョン" },
+  edge_cluster_id: { en: "Edge", ja: "Edge" },
+  connector_id: { en: "Connector", ja: "コネクタ" },
+  timestamp: { en: "Time", ja: "時刻" },
+  user_id: { en: "User", ja: "ユーザー" },
+  subject_user_id: { en: "Subject user", ja: "対象のユーザー" },
+  actor_user_id: { en: "Acted by", ja: "操作した人" },
+  actor_type: { en: "Actor type", ja: "操作した者の種類" },
+  actor_nhi_id: { en: "Acting non-human identity", ja: "操作した非人間ID" },
+  session_id: { en: "Session", ja: "セッション" },
+  auth_time: { en: "Signed in at", ja: "本人確認の時刻" },
+  authentication_event_id: { en: "Sign-in record", ja: "本人確認の記録" },
+  delegated_access_grant_id: { en: "Delegated access", ja: "委任アクセス" },
+  human_approval_event_id: { en: "Approval record", ja: "承認の記録" },
+  agent_task_session_id: { en: "Agent task", ja: "エージェントのタスク" },
+  reauthentication_reason: { en: "Why sign-in was asked again", ja: "本人確認をやり直した理由" },
+  authentication_max_age_seconds: { en: "Sign-in valid for (seconds)", ja: "本人確認の有効時間(秒)" },
+  device_id: { en: "Device", ja: "端末" },
+  source_ip: { en: "Source IP", ja: "送信元IP" },
+  source_port: { en: "Source port", ja: "送信元ポート" },
+  posture: { en: "Posture", ja: "端末の状態" },
+  trust_state: { en: "Trust", ja: "信頼の状態" },
+  application_id: { en: "Application", ja: "アプリ" },
+  destination: { en: "Destination", ja: "宛先" },
+  request_method: { en: "Method", ja: "メソッド" },
+  request_path: { en: "Path", ja: "パス" },
+  destination_ip: { en: "Destination IP", ja: "宛先IP" },
+  destination_port: { en: "Destination port", ja: "宛先ポート" },
+  fqdn: { en: "Host name", ja: "宛先の名前" },
+  sni: { en: "Name in the TLS handshake (SNI)", ja: "TLSで名乗った名前(SNI)" },
+  protocol: { en: "Protocol", ja: "プロトコル" },
+  service_family: { en: "Kind of service", ja: "サービスの種類" },
+  decision: { en: "Decision", ja: "判断" },
+  reason: { en: "Reason", ja: "理由" },
+  reason_codes: { en: "Reasons", ja: "理由の内訳" },
+  policy_id: { en: "Policy", ja: "ポリシー" },
+  policy_bundle_id: { en: "Policy set", ja: "ポリシーセット" },
+  policy_bundle_version: { en: "Policy set version", ja: "ポリシーセットの版" },
+  matched_conditions: { en: "Conditions matched", ja: "一致した条件" },
+  cache_status: { en: "Cache", ja: "キャッシュ" },
+  bypass: { en: "Bypass", ja: "バイパス" },
+  action: { en: "Action", ja: "操作" },
+  result: { en: "Result", ja: "結果" },
+  event_type: { en: "Event", ja: "出来事" },
+  target_type: { en: "Target type", ja: "対象の種類" },
+  target_id: { en: "Target", ja: "対象" },
+  risk_state_id: { en: "Risk state", ja: "リスクの状態" },
+  risk_state_severity: { en: "Risk severity", ja: "リスクの深刻度" },
+  risk_recommended_action: { en: "Recommended action", ja: "推奨される対処" },
+  inspection_profile_id: { en: "Inspection profile", ja: "検査の設定" },
+  inspection_mode: { en: "Inspection mode", ja: "検査のモード" },
+  inspection_route_category: { en: "Inspection route", ja: "検査の経路" },
+  data_classification: { en: "Data classification", ja: "データの分類" },
+  tool_id: { en: "Tool", ja: "ツール" },
+  tool_action_type: { en: "Tool action", ja: "ツールの操作" },
+  context_boundary_id: { en: "Context boundary", ja: "コンテキストの境界" },
+  mcp_server_id: { en: "MCP server", ja: "MCPサーバー" },
+  runtime_environment_id: { en: "Runtime environment", ja: "実行環境" },
+};
+// Policy ids the product writes itself rather than an operator authoring them. Shown by name, with the id kept as
+// the tooltip; an operator's own rule ids are shown as they are.
+const _LA_BUILTIN_POLICY = {
+  east_west_policy: { en: "Connector-access rules", ja: "コネクタ経由アクセスのルール" },
+};
+function laFieldLabel(k) { return _LA_FIELD[k] ? bl(_LA_FIELD[k]) : String(k).replace(/_/g, " "); }
+// The server writes a decision's reason as an English sentence, for logs and exports. On the screen the
+// row's reason codes say the same thing in the reader's language; the server's sentence stays as the tooltip.
+// Any code without a phrase in this language keeps the server's sentence, rather than mixing the two.
+function laReasonSentence(row, raw) {
+  const codes = (Array.isArray(row && row.reason_codes) ? row.reason_codes : []).filter((c) => c !== "policy_matched");
+  const list = codes.length ? codes : ((row && Array.isArray(row.reason_codes) && row.reason_codes.includes("policy_matched")) ? ["policy_matched"] : []);
+  if (!list.length || list.some((c) => !_LA_REASON[c])) return raw;
+  return bl({ en: raw, ja: list.map((c) => _LA_REASON[c].ja).join("・") });
+}
+// What kind of actor made the request, in the reader's words (acceptance C: "human" was shown as the value).
+const _LA_ACTOR_TYPE = {
+  human: { en: "Person", ja: "人" },
+  nhi: { en: "Non-human identity", ja: "非人間ID" },
+  agent: { en: "AI agent", ja: "AIエージェント" },
+  service: { en: "Service", ja: "サービス" },
+};
+const _LA_TIME_FIELDS = new Set(["timestamp", "auth_time", "created_at", "updated_at", "expires_at"]);
+function laFieldRow(k, v, row) {
   let node;
-  if (k === "decision") node = laDecisionBadge(v);
+  if (k === "actor_type" && typeof v === "string" && _LA_ACTOR_TYPE[v]) node = el("span", { text: bl(_LA_ACTOR_TYPE[v]), title: v });
+  else if (_LA_TIME_FIELDS.has(k) && typeof v === "string" && Number.isFinite(Date.parse(v)) && typeof window.dsseFormatTime === "function") node = el("span", { text: window.dsseFormatTime(v), title: v });
+  else if (k === "decision") node = laDecisionBadge(v);
+  else if (k === "reason" && typeof v === "string") node = el("span", { text: laReasonSentence(row, v), title: v });
   else if (k === "reason_codes" && Array.isArray(v)) node = el("span", { style: "display:flex;gap:4px;flex-wrap:wrap" }, v.map(laReasonChip));
   else if (k === "source_ip") node = el("span", { text: laSrcIp({ source_ip: v }) });
+  else if (k === "policy_id" && _LA_BUILTIN_POLICY[v]) node = el("span", { text: bl(_LA_BUILTIN_POLICY[v]), title: String(v) });
   else node = el("span", { text: Array.isArray(v) ? v.join(", ") : String(v) });
   return el("div", { style: "display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--ui-border,#eee)" }, [
-    el("span", { class: "ui-view-desc", style: "min-width:180px;flex:none", text: k.replace(/_/g, " ") }), node,
+    el("span", { class: "ui-view-desc", style: "min-width:180px;flex:none", text: laFieldLabel(k), title: k }), node,
   ]);
 }
 // One-line summary of a related record (grant / approval / inspection / decision-trace) linked to a decision.
@@ -1033,7 +1209,14 @@ function laRelatedSummary(s, r) {
   if (s === "delegated_access_grants") return [laVal(r, "grantee_id", "actor_nhi_id", "user_id"), laVal(r, "scope", "application_id", "tool_id"), laVal(r, "event_type", "action", "status")].filter(Boolean).join(" · ") || "—";
   if (s === "human_approval_events") return [laVal(r, "requester_user_id", "user_id", "subject_user_id"), "→", laVal(r, "approver_user_id", "approver_id"), laVal(r, "outcome", "result")].filter(Boolean).join(" ") || "—";
   if (s === "inspection_events") return [laPretty(laVal(r, "finding_type", "event_type")), laVal(r, "inspection_mode"), laVal(r, "severity")].filter(Boolean).join(" · ") || "—";
-  return Object.keys(r).slice(0, 3).map((k) => k + "=" + laVal(r, k)).join(" ") || "—";
+  // ★ A RELATED RECORD READ "actor_type=human" (2026-11-08, acceptance C): the field's wire name and its stored
+  // value, beside a drawer that names the same field and value in the reader's words. The summary uses them too.
+  return Object.keys(r).slice(0, 3).map((k) => laFieldLabel(k) + ": " + laRelatedValue(k, r[k])).join(" · ") || "—";
+}
+function laRelatedValue(k, v) {
+  if (k === "actor_type" && typeof v === "string" && _LA_ACTOR_TYPE[v]) return bl(_LA_ACTOR_TYPE[v]);
+  if (_LA_TIME_FIELDS.has(k) && typeof v === "string" && Number.isFinite(Date.parse(v)) && typeof window !== "undefined" && typeof window.dsseFormatTime === "function") return window.dsseFormatTime(v);
+  return Array.isArray(v) ? v.join(", ") : String(v == null ? "" : v);
 }
 // Fetch the records LINKED to an access decision (its grant, approval, inspection, decision trace) and show
 // them — so a grant/approval is visible right from the access-log entry it authorized.
@@ -1073,10 +1256,10 @@ function laDetail(row) {
   _LA_GROUPS.forEach((g) => {
     const rows = g.keys.filter((k) => { const v = row[k]; return v !== undefined && v !== null && String(v) !== "" && !(Array.isArray(v) && !v.length); });
     rows.forEach((k) => present.add(k));
-    if (rows.length) body.push(el("div", { style: "margin:6px 0" }, [el("div", { class: "ui-field-label", text: bl(g.title) })].concat(rows.map((k) => laFieldRow(k, row[k])))));
+    if (rows.length) body.push(el("div", { style: "margin:6px 0" }, [el("div", { class: "ui-field-label", text: bl(g.title) })].concat(rows.map((k) => laFieldRow(k, row[k], row)))));
   });
   const other = Object.keys(row).filter((k) => !present.has(k) && k !== "metadata" && row[k] !== undefined && row[k] !== null && String(row[k]) !== "");
-  if (other.length) body.push(el("div", { style: "margin:6px 0" }, [el("div", { class: "ui-field-label", text: bl({ en: "Other", ja: "その他" }) })].concat(other.map((k) => laFieldRow(k, row[k])))));
+  if (other.length) body.push(el("div", { style: "margin:6px 0" }, [el("div", { class: "ui-field-label", text: bl({ en: "Other", ja: "その他" }) })].concat(other.map((k) => laFieldRow(k, row[k], row)))));
   // Link the grant / approval / inspection / decision-trace records to THIS access decision.
   const decId = laVal(row, "access_decision_id");
   if (decId) { const relHost = el("div", { style: "margin:10px 0" }); body.push(relHost); laRelatedRecords(relHost, decId); }

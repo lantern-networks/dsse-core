@@ -86,12 +86,13 @@ function renderDevicesTab(content) {
 // — every field already comes from the existing /admin/steer-exclusions/observed + /admin/device-runtime calls.
 // The device's certificate as one table cell: how long it has left, and when it renews itself. The expiry is
 // the fact with a deadline; the renewal date is what says the deadline will never arrive. A device with no
-// observed certificate says so — "not observed" is a state, not an empty cell that reads as fine.
+// observed certificate says so — "not observed" is a state, not an empty cell that reads as fine. The facts are
+// the deployment's, read from the control plane: every Edge reports what devices present to it.
 function deviceCertCell(cert) {
   if (!cert) {
     return el("span", { class: "dev-risk-ok", text: bl({ en: "not observed", ja: "未観測" }),
-      title: bl({ en: "This device has not presented a certificate since this node started.",
-                  ja: "このノードの起動以降、この端末は証明書を提示していません。" }) });
+      title: bl({ en: "No Edge of this deployment has reported this device presenting a certificate yet.",
+                  ja: "この配備のどの Edge からも、この端末の証明書の報告がまだありません。" }) });
   }
   const days = cert.days_left;
   const tone = cert.expired ? "danger" : (days != null && days <= 30 ? "warn" : "ok");
@@ -501,9 +502,9 @@ async function renderList(host) {
   } catch (e) { /* best-effort */ }
   // The certificate each device is actually presenting at the (T) handshake — expiry, issuer, and when it
   // renews next. Lives HERE because a device's certificate is a fact about the device, not a separate page
-  // (operator decision 2026-07-31; the standalone Device-certificates screen is retired). Observed, so a
-  // device that has not connected since this node started simply has no certificate fact — shown as such,
-  // never as healthy.
+  // (operator decision 2026-07-31; the standalone Device-certificates screen is retired). Observed by the Edges
+  // and held by the control plane, so a device no Edge has reported simply has no certificate fact — shown as
+  // such, never as healthy.
   let certMap = {};
   try {
     const rc = await apiFetch("GET", "/admin/device-certificates");

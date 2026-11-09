@@ -29,7 +29,7 @@ type postgresAdminSiteStore struct {
 var _ adminSiteStore = (*postgresAdminSiteStore)(nil)
 
 // adminSiteColumns is the canonical column order shared by every SELECT/scan in this store.
-const adminSiteColumns = "tenant_id, site_id, name, region, expected_connector_count, routing_namespace, deployment_type, ha_policy, bootstrap_secret_hash, bootstrap_secret_rotated_at, created_at, updated_at"
+const adminSiteColumns = "tenant_id, site_id, name, region, expected_connector_count, routing_namespace, deployment_type, ha_policy, bootstrap_secret_hash, bootstrap_secret_rotated_at, created_at, updated_at, door_order"
 
 // postgresAdminSiteSchemaSQL is the in-code schema contract; migrations/025_admin_sites.sql must match it
 // (asserted by TestPostgresAdminSiteMigrationMatchesSchemaSQL).
@@ -56,6 +56,12 @@ func postgresAdminSiteSchemaSQL() []string {
 	}
 }
 
+// postgresAdminSiteDoorOrderSQL is migrations/061_admin_site_door_order.sql, held here as the 025 contract is
+// (asserted by TestPostgresAdminSiteDoorOrderMigrationMatches).
+func postgresAdminSiteDoorOrderSQL() []string {
+	return []string{"ALTER TABLE admin_sites ADD COLUMN IF NOT EXISTS door_order text NOT NULL DEFAULT ''"}
+}
+
 // setupPostgresAdminSiteStore wires the Postgres Site backend onto the admin auth connection. It requires
 // admin-auth-store=postgres (the shared handle) and applies the component migration. Returns an error — never
 // falls back silently — so a misconfigured control plane fails fast instead of starting with the wrong backend.
@@ -69,7 +75,7 @@ func setupPostgresAdminSiteStore(ctx context.Context, adminAuthStore adminAuthRu
 		if err != nil {
 			return nil, fmt.Errorf("load site migrations: %w", err)
 		}
-		migrations, err = selectPostgresComponentMigrations(migrations, "sites", postgresMigrationAdminSites)
+		migrations, err = selectPostgresComponentMigrations(migrations, "sites", postgresAdminSiteMigrationVersions()...)
 		if err != nil {
 			return nil, err
 		}
@@ -267,8 +273,8 @@ func (p *postgresAdminSiteStore) Upsert(ctx context.Context, site adminSiteModel
 	defer func() { _ = tx.Rollback() }()
 	row := tx.QueryRowContext(ctx, strings.Join([]string{
 		"INSERT INTO admin_sites",
-		"(tenant_id, site_id, name, region, expected_connector_count, routing_namespace, deployment_type, ha_policy, bootstrap_secret_hash, bootstrap_secret_rotated_at, created_at, updated_at)",
-		"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz, $11::timestamptz, $12::timestamptz)",
+		"(tenant_id, site_id, name, region, expected_connector_count, routing_namespace, deployment_type, ha_policy, bootstrap_secret_hash, bootstrap_secret_rotated_at, created_at, updated_at, door_order)",
+		"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz, $11::timestamptz, $12::timestamptz, $13)",
 		"ON CONFLICT (tenant_id, site_id) DO UPDATE SET",
 		"name = EXCLUDED.name,",
 		"region = EXCLUDED.region,",
@@ -276,6 +282,7 @@ func (p *postgresAdminSiteStore) Upsert(ctx context.Context, site adminSiteModel
 		"routing_namespace = EXCLUDED.routing_namespace,",
 		"deployment_type = EXCLUDED.deployment_type,",
 		"ha_policy = EXCLUDED.ha_policy,",
+		"door_order = EXCLUDED.door_order,",
 		"bootstrap_secret_hash = CASE WHEN EXCLUDED.bootstrap_secret_hash = '' THEN admin_sites.bootstrap_secret_hash ELSE EXCLUDED.bootstrap_secret_hash END,",
 		"bootstrap_secret_rotated_at = CASE WHEN EXCLUDED.bootstrap_secret_hash = '' THEN admin_sites.bootstrap_secret_rotated_at ELSE EXCLUDED.bootstrap_secret_rotated_at END,",
 		"updated_at = EXCLUDED.updated_at",
@@ -283,7 +290,7 @@ func (p *postgresAdminSiteStore) Upsert(ctx context.Context, site adminSiteModel
 	}, " "),
 		normalized.TenantID, normalized.SiteID, normalized.Name, normalized.Region, normalized.ExpectedConnectorCount,
 		normalized.RoutingNamespace, normalized.DeploymentType, normalized.HAPolicy, normalized.BootstrapSecretHash,
-		rotatedAt, createdAt.UTC(), updatedAt.UTC())
+		rotatedAt, createdAt.UTC(), updatedAt.UTC(), strings.Join(normalized.DoorOrder, ","))
 	saved, err := scanAdminSiteRow(row.Scan)
 	if err != nil {
 		return adminSiteModel{}, fmt.Errorf("%w: %v", errAdminSitePersistence, err)
@@ -349,12 +356,17 @@ func scanAdminSiteRow(scan func(...any) error) (adminSiteModel, error) {
 	var site adminSiteModel
 	var rotatedAt sql.NullTime
 	var createdAt, updatedAt time.Time
+	// NULL reads as no order: a row written before migration 061, or by anything that leaves the column unset.
+	var doorOrder sql.NullString
 	if err := scan(
 		&site.TenantID, &site.SiteID, &site.Name, &site.Region, &site.ExpectedConnectorCount,
 		&site.RoutingNamespace, &site.DeploymentType, &site.HAPolicy, &site.BootstrapSecretHash, &rotatedAt,
-		&createdAt, &updatedAt,
+		&createdAt, &updatedAt, &doorOrder,
 	); err != nil {
 		return adminSiteModel{}, err
+	}
+	if order := strings.TrimSpace(doorOrder.String); doorOrder.Valid && order != "" {
+		site.DoorOrder = strings.Split(order, ",")
 	}
 	if rotatedAt.Valid {
 		rotated := rotatedAt.Time.UTC().Format(time.RFC3339)

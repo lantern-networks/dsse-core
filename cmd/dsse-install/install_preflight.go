@@ -288,10 +288,15 @@ func installPreflight(ctx context.Context, p *Plan, dir, machine string, deps se
 			e = json.Unmarshal(raw, &meta)
 		}
 		matches := e == nil && meta.OS == "linux" && normalizeSetupArch(meta.Architecture) == arch && arch != "" && meta.ID != ""
-		add(fmt.Sprintf("local image %d", i+1), matches, "preload the declared Linux image for this host's architecture; preflight never pulls images or prints registry credentials")
+		// ★ NAME THE IMAGE (acceptance C, 2026-11-07). "local image 1" and "local image 7" were all a reader got,
+		// and the two were the installer's own pinned ClickHouse and HAProxy — which the operator had not pulled
+		// because only the five reviewed images had been staged. An image reference is public (a name and a
+		// digest), so saying which one is missing costs nothing and is the whole of what the reader needs.
+		imageDetail := preflightImageDetail(image, e, meta.OS, normalizeSetupArch(meta.Architecture), arch)
+		add(fmt.Sprintf("local image %d", i+1), matches, imageDetail)
 		if image == serviceImage || image == env["DSSE_CONSOLE_IMAGE"] {
 			matches = matches && revision != "" && revision != "unknown" && meta.Config.Labels["org.opencontainers.image.revision"] == revision
-			add(fmt.Sprintf("first-party image revision %d", i+1), matches, "service and Console images must carry the plan's reviewed OCI revision label; mutable tags alone are not build identity")
+			add(fmt.Sprintf("first-party image revision %d", i+1), matches, "service and Console images must carry the plan's reviewed OCI revision label; mutable tags alone are not build identity: "+image)
 		}
 		if image == serviceImage {
 			serviceImageAvailable = matches
@@ -381,4 +386,21 @@ func verifyPortalInsideImage(ctx context.Context, dir, image string, env map[str
 		return fmt.Errorf("service image refused the Portal chain")
 	}
 	return nil
+}
+
+// preflightImageDetail says which declared image a local-image check is about and, when it fails, why: absent
+// from this host, or present for another platform. Preflight never pulls images or prints registry credentials;
+// the reader pulls exactly the images the generated Compose file names.
+func preflightImageDetail(image string, inspectErr error, os, imageArch, hostArch string) string {
+	switch {
+	case inspectErr != nil:
+		return fmt.Sprintf("%s is not on this host: pull the images the generated Compose file names "+
+			"(docker compose --env-file deployment.env config --images) before -preflight; preflight never pulls "+
+			"images or prints registry credentials", image)
+	case os != "linux" || imageArch != hostArch || hostArch == "":
+		return fmt.Sprintf("%s is %s/%s and this host is linux/%s: preload the image built for this host's "+
+			"architecture", image, os, imageArch, hostArch)
+	default:
+		return image + " is on this host for its architecture"
+	}
 }

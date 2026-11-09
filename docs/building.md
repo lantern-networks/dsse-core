@@ -56,7 +56,7 @@ the exact five scanned image digests; local tags are not release evidence.
 
 Every PostgreSQL 18 installation plan must select one immutable data-layer
 cohort before `-preflight` or `-start-node`. Use the images published with the
-release (see the [0.4.0 release README](releases/0.4.0/README.md#server-container-images))
+release (see the [0.4.1 release README](releases/0.4.1/README.md#server-container-images))
 or images you built (see [Build the data-layer images](#build-the-data-layer-images)):
 
 ```json
@@ -146,7 +146,7 @@ the main module; see [CONTRIBUTING.md](../CONTRIBUTING.md) for checks.
 
 ## Windows packages
 
-Build on Windows with Go, a .NET SDK, WiX 7.0.0, and the Windows SDK signing tools. Driver
+Build on Windows with Go, a .NET SDK, WiX 7.0.1, and the Windows SDK signing tools. Driver
 source builds also need the WDK. See the [packaging guide](../clients/windows-wfp/packaging/README.md)
 for the actual commands and [Windows installation](windows-agent.md) for provisioning.
 

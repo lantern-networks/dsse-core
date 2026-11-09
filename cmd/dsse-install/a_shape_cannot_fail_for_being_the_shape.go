@@ -24,6 +24,17 @@ import "strings"
 // installer built. A deployment with no control-plane peers, no database peers and one region in its map IS
 // one machine, and it says so about itself.
 func deploymentIsASingleMachine(dir string) bool {
+	// ★ THE PLAN'S OWN COUNT FIRST, WHEN THERE IS ONE (review FINAL-A-R2, 2026-11-09). The signals below are
+	// what the installer rendered, and the renderer does not yet list a second control plane declared in the
+	// same region without a profile — so such a plan rendered no peers, read as one machine, and the store
+	// check beside this was exempted from asking a store that could not lose a place. A deployment installed
+	// from a plan declares how many machines it has; that declaration wins, and the rendered signals answer
+	// only for a deployment that has no plan.
+	if plan, err := loadInstallPlan(dir, ""); err == nil && plan != nil {
+		if len(plan.machines()) != 1 {
+			return false
+		}
+	}
 	env := readDeploymentEnv(dir)
 	if strings.TrimSpace(env["DSSE_CP_PEERS"]) != "" || strings.TrimSpace(env["DSSE_CP_DATA_PEERS"]) != "" {
 		return false

@@ -29,6 +29,8 @@ function capacityFixture(body) {
   const context = vm.createContext({el, bl: value => value.en, freshRender: () => () => true,
     uiState: () => {}, uiBadge: text => el('span', {text}),
     apiFetch: async (...args) => {calls.push(args); return {ok: true, body};}});
+  const ui = source('./ui.js'), seats = ui.indexOf('function uiSeatsInUse(');
+  vm.runInContext(ui.slice(seats, ui.indexOf('\n}\n', seats) + 3), context);
   vm.runInContext(source('./operatorhome.js'), context);
   return {host, calls, render: () => context.renderOperatorCapacity(host)};
 }
@@ -42,6 +44,13 @@ test('operator capacity reads the licence API seat total and tenant usage', asyn
   assert.match(f.host.textContent, /Left: 15/);
   assert.match(f.host.textContent, /Customer\n5\n1/);
   assert.doesNotMatch(f.host.textContent, /Pool unknown|No licence/);
+});
+
+test('operator capacity says which seats are connectors', async () => {
+  const f = capacityFixture({licensed: true, seats: 20, unallocated: 15, allocated: 5,
+    tenants: [{tenant_id: 'customer', display_name: 'Customer', allocated: 5, used: 2, connectors: 1}]});
+  await f.render();
+  assert.match(f.host.textContent, /Customer\n5\n2 \(1 device, 1 connector\)/);
 });
 
 test('operator capacity keeps a missing licensed pool unknown', async () => {

@@ -37,6 +37,14 @@ function renderApplicationsView(content) {
   renderAppList(host);
 }
 
+// appSensitivityLabel names an application's sensitivity in the reader's words. The list printed the stored value,
+// so an application published from a connector read "medium" in English on a Japanese screen (2026-11-08,
+// acceptance C). The values come from the form (low/normal/high) and from built-in route profiles.
+function appSensitivityLabel(v) {
+  const labels = { low: { en: "Low", ja: "低" }, normal: { en: "Normal", ja: "標準" }, medium: { en: "Medium", ja: "中" }, high: { en: "High", ja: "高" }, critical: { en: "Critical", ja: "重大" }, internal: { en: "Internal", ja: "社内" } };
+  const key = String(v || "normal").trim().toLowerCase();
+  return labels[key] ? bl(labels[key]) : String(v);
+}
 function appTypeLabel(t) {
   return t === "saas" ? bl({ en: "SaaS app", ja: "SaaS アプリ" }) : t === "private_app" ? bl({ en: "Internal app", ja: "社内アプリ" }) : (t || "—");
 }
@@ -76,7 +84,7 @@ async function renderAppList(host) {
     return el("tr", {}, [
       el("td", {}, [el("strong", { text: a.name || a.application_id }), el("div", { class: "ui-view-desc" }, el("code", { text: a.application_id }))]),
       el("td", { text: appTypeLabel(a.application_type) }),
-      el("td", {}, uiBadge(a.application_sensitivity || "normal", a.application_sensitivity === "high" ? "warn" : "off")),
+      el("td", {}, uiBadge(appSensitivityLabel(a.application_sensitivity), (a.application_sensitivity === "high" || a.application_sensitivity === "critical") ? "warn" : "off")),
       el("td", {}, publishedBadge),
       el("td", {}, uiBadge(a.status === "active" ? bl({ en: "Active", ja: "有効" }) : (a.status || "—"), a.status === "active" ? "ok" : "off")),
       el("td", { class: "ui-row-actions" }, actions),
@@ -237,9 +245,14 @@ function openPublishWizard(content, existing) {
 
   const reviewBox = el("div", { class: "ui-preview" });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Review & Publish", ja: "確認して公開" }) });
+  // What publishing is for, in one line (the operator, acceptance C third walk: the walk's instructions made it a
+  // step of Connector Access, and it is not one — a steered device needs only the Connector Access rule).
+  const purpose = el("div", { class: "ui-field-hint", text: bl({
+    en: "For devices without the agent, used from a browser. A steered device needs only a Connector Access rule.",
+    ja: "エージェントの無い端末がブラウザから使うためのものです。ステアリングされた端末は、コネクタ経由アクセスのルールだけで届きます。" }) });
   const modal = uiModal({
     title: bl({ en: "Publish a Private App", ja: "社内アプリを公開" }),
-    body: [idF.el, nameF.el, typeF.el, destF.el, ipEvidence, portF.el, siteF.el, nsF.el, reviewBox],
+    body: [purpose, idF.el, nameF.el, typeF.el, destF.el, ipEvidence, portF.el, siteF.el, nsF.el, reviewBox],
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => modal.close() }), submit],
   });
   const destInput = destF.el.querySelector("input");

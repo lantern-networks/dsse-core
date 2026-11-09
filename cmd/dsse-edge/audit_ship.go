@@ -26,9 +26,13 @@ import (
 // Cross-region durability (docs/cross_region_control_plane_failover_design.md, Phase 2): on a CP outage the
 // shipper RETAINS un-acked records in a bounded pending spool and REPLAYS them when a CP is reachable again —
 // including after an Edge→CP region failover (it ships to the current leader via the same cp_endpoint_failover
-// selector). Ingest is idempotent by (tenant, stream, event_id) on every hot-store backend — Postgres upserts ON
-// CONFLICT; ClickHouse sets an insert_deduplication_token — so a replay never double-counts. Only when the bounded
-// spool overflows are the oldest records dropped — logged, never silent (the local jsonl still holds them).
+// selector). How far a replay is collapsed depends on the store, not on this shipper (stated as the code does it
+// after a review found the old sentence promised more, 2026-11-09): Postgres upserts ON CONFLICT (tenant, stream,
+// event_id), so a replayed record is one row there; ClickHouse is given an insert_deduplication_token computed over
+// the BATCH's (stream, event_id) pairs, so it recognises a batch sent again unchanged and NOT a record that comes
+// back inside a different batch; and the receiver's own jsonl appends every delivery. Two drops, both counted and
+// logged, with the local jsonl still holding the records: when the bounded pending spool overflows its OLDEST
+// records go, and when the intake channel is full the NEW record is not enqueued.
 
 // defaultAuditShipStreams are the log streams shipped to the control plane by default (audit + access, plus
 // device_state so the control plane's Postgres holds device-state CHANGE history for the GUI to read — the Edge
@@ -45,6 +49,15 @@ import (
 // Adding a stream here also requires adding it to the Console's _LA_SHIPPED_STREAMS, or its tab reads the edge.
 var defaultAuditShipStreams = []string{"audit.log.jsonl", "access.log.jsonl", "device_state.log.jsonl",
 	"inspection_events.log.jsonl", "config_generations.log.jsonl",
+	// ★★★ A CONNECTOR'S CONNECTIONS ARE WRITTEN WHERE ITS TUNNEL LANDS (0.4.1 acceptance D, 2026-11-09). On a
+	// layout whose Edges run on their own machines, the connector attached, failed over between regions, came
+	// back and was deleted — and the Console's Connector stream stayed at zero rows, because the Edge wrote
+	// connector.log.jsonl to its own disk and this list did not carry it: the control plane's store held no
+	// connector row at all, and the Console read the tab from an Edge, which answers with its own file. Why the
+	// layouts walked before showed rows was not established; it does not change the fix. Shipped like access —
+	// the rows are the Edge's own account of a tunnel it holds — and the Console now reads the tab from the
+	// control plane.
+	"connector.log.jsonl",
 	// Each device's own account of what it is applying — reverse telemetry. Added 2026-08-23 so the durable
 	// copy lives on the control plane instead of the Edge writing it into Postgres itself. See
 	// observed_exclusion_ship.go.
@@ -204,7 +217,7 @@ func newRemoteAuditShipper(url, token, caPEMFile string, streams []string, bufSi
 	s := &remoteAuditShipper{
 		url:         url,
 		token:       strings.TrimSpace(token),
-		client:      &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: tlsCfg}},
+		client:      &http.Client{Timeout: 10 * time.Second, Transport: edgeTransport(tlsCfg)},
 		streams:     set,
 		ch:          make(chan auditShipItem, bufSize),
 		maxPending:  bufSize,

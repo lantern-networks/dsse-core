@@ -1,9 +1,14 @@
 # Authentication state during rolling upgrades
 
-## Fresh declared shared-fleet installations
+## Fresh installations from a plan
 
-After the full plan's members are started and database synchronization is ready,
-run `dsse-install -activate-auth -dir /opt/dsse -admin-token-file
+Every installation made from a plan, including the single-machine and three-region plans,
+includes this step in `-order`, before `-verify`. Until it has run, revocation reauthentication and ceremony
+recovery are off: revoking an approval does not require a fresh sign-in, and an existing
+identity-provider sign-in may authorize a new approval.
+
+After the full plan's members are started (and, for the declared shared-fleet profiles,
+database synchronization is ready), run `dsse-install -activate-auth -dir /opt/dsse -admin-token-file
 /opt/dsse/authority/operator-api-token` on the issuer. The private token file is
 created by `-bootstrap-admin -admin-token-file ...`, never copied into carries.
 The helper uses the existing authority API, retains all currently enabled

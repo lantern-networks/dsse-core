@@ -227,7 +227,12 @@ func TestTheGeneratedSecretsAreRealAndDistinct(t *testing.T) {
 			t.Errorf("unreadable line in deployment.env: %q", line)
 			continue
 		}
-		if !strings.HasPrefix(v, "'") || !strings.HasSuffix(v, "'") {
+		singleQuoted := strings.HasPrefix(v, "'") && strings.HasSuffix(v, "'")
+		// A value that carries single quotes of its own (the store's host list) is written in double quotes
+		// with nothing the shell would expand inside, the same form shellQuoted uses for the plan-generated
+		// file; compose reads both.
+		doubleQuoted := strings.HasPrefix(v, `"`) && strings.HasSuffix(v, `"`) && !strings.ContainsAny(v[1:len(v)-1], "\"$`\\")
+		if !singleQuoted && !doubleQuoted {
 			t.Errorf("deployment.env is sourced by a shell and this value is unquoted, so a metacharacter in "+
 				"it would be executed: %q", line)
 		}

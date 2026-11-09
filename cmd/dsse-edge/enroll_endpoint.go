@@ -176,7 +176,12 @@ func registerEnrollEndpointWithIdP(mux *http.ServeMux, signer *deviceca.Signer, 
 				pendingSpend = tok.ID
 				// Attribution becomes WHICH ADMIN APPROVED THIS MACHINE. Months later, that is the question an
 				// operator has when they find a device somewhere it should not be — not who ran the installer.
-				lastEnrolmentAttribution.Store(req.DeviceID, "enrolled with a token issued by "+tok.IssuedBy)
+				//
+				// ★ BY THE NAME THE TOKEN RECORDED (2026-11-06). The token carries who its issuer was at issuance
+				// (IssuedByLabel, e.g. the administrator's email); the note used the principal id alone, and the
+				// approval screen named only the account id ("adm_7f15…") on a three-region acceptance. The id stays in
+				// parentheses so the record still names the account exactly.
+				lastEnrolmentAttribution.Store(req.DeviceID, "enrolled with a token issued by "+enrolmentIssuerText(tok))
 				if logf != nil {
 					logf("enroll_eligibility_token device=%q token_id=%q issued_by=%q", req.DeviceID, tok.ID, tok.IssuedBy)
 				}
@@ -529,4 +534,14 @@ func enrolmentAuthorityWasUnreachable(err error) bool {
 		}
 	}
 	return false
+}
+
+// enrolmentIssuerText names a token's issuer for the enrolment record: the label it recorded at issuance, with
+// the principal id beside it, or the id alone when the token recorded no label.
+func enrolmentIssuerText(tok enrolltoken.Token) string {
+	id, label := strings.TrimSpace(tok.IssuedBy), strings.TrimSpace(tok.IssuedByLabel)
+	if label == "" || label == id {
+		return id
+	}
+	return label + " (" + id + ")"
 }

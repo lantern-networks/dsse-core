@@ -65,6 +65,11 @@ func TestFirstPartyOnboardingAndLoginEndpoints(t *testing.T) {
 		t.Fatalf("invite: want 201, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	link, _ := decode(rec)["activation_link"].(string)
+	// Re-review RR5: the token rides the fragment, and a bare "activate" query marks the page as an
+	// activation link so a standby Console keeps it on this origin instead of redirecting the token away.
+	if !strings.Contains(link, "/?activate#activate=") {
+		t.Fatalf("activation link is not marker-plus-fragment: %q", link)
+	}
 	idx := strings.Index(link, "activate=")
 	if idx < 0 {
 		t.Fatalf("activation_link missing token: %q", link)
@@ -72,8 +77,11 @@ func TestFirstPartyOnboardingAndLoginEndpoints(t *testing.T) {
 	token := link[idx+len("activate="):]
 
 	// 2) activation: validate token, set password, enroll TOTP, complete
-	if rec := do(http.MethodGet, "/admin/activate?token="+token, "", ""); rec.Code != http.StatusOK {
-		t.Fatalf("activate GET: want 200, got %d", rec.Code)
+	if rec := do(http.MethodGet, "/admin/activate?token="+token, "", ""); rec.Code == http.StatusOK {
+		t.Fatalf("activate GET: the token must not travel in the URL (security review S6), got %d", rec.Code)
+	}
+	if rec := do(http.MethodPost, "/admin/activate", "", `{"token":"`+token+`"}`); rec.Code != http.StatusOK {
+		t.Fatalf("activate POST: want 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	if rec := do(http.MethodPost, "/admin/activate/password", "", `{"token":"`+token+`","new_password":"a-strong-passphrase-123"}`); rec.Code != http.StatusOK {
 		t.Fatalf("set password: want 200, got %d body=%s", rec.Code, rec.Body.String())

@@ -104,6 +104,16 @@ func (f *FilePersistence) Delete(ctx context.Context, id, tenantID string) error
 	return f.saveLocked(candidate, "delete", id)
 }
 
+// Sync writes the snapshot this instance last read or saved, and returns nil only when that write is
+// confirmed durable. A save that put its bytes in place without confirming them (ErrDurabilityUnconfirmed)
+// leaves a file that reads back as the new state; Sync is how a caller that was told "unconfirmed" gets a
+// confirmation for it, since a Delete of a row that is no longer visible writes nothing (review C3-RRR1).
+func (f *FilePersistence) Sync(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.saveLocked(f.candidateLocked(), "sync", "")
+}
+
 func (f *FilePersistence) candidateLocked() map[string]*Policy {
 	candidate := make(map[string]*Policy, len(f.byID))
 	for id, p := range f.byID {

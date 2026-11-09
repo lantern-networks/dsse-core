@@ -363,10 +363,9 @@ func (c *winDivertCapture) steerBypassReason(srcPort, dstPort uint16, dstIP neti
 	// hundred lines up is still built once at open, so on this backend a late destination stops the flow from
 	// being steered but does not stop it from being captured. The wfp backend, which is what ships, re-pushes
 	// the whole rule set and has no such split.
-	for _, d := range c.cfg.effectiveDests() {
-		if d.Addr() == dstIP && (d.Port() == 0 || d.Port() == dstPort) { // port 0 = bypass all ports to this dest
-			return "excluded_dest"
-		}
+	// Port 0 = bypass all ports to this dest. An IPv4 rule matches the IPv4-mapped form too (C18).
+	if destinationExcluded(c.cfg.effectiveDests(), dstIP, dstPort) {
+		return "excluded_dest"
 	}
 	if bypass, reason := c.bypass.bypassReason(srcPort); bypass {
 		return reason

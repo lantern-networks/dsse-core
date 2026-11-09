@@ -57,7 +57,8 @@ async function renderOperatorOrganizations(host) {
 
   const rows = tenants.map((t) => el("tr", { "data-op-setup": t.tenant_id }, [
     el("td", {}, [el("strong", { text: t.display_name || t.tenant_id })]),
-    el("td", {}, uiBadge(t.status || "active", t.status === "active" ? "ok" : "warn")),
+    // The status in the reader's words (acceptance C: "active" was shown as the word itself).
+    el("td", {}, uiBadge(typeof orgStatusLabel === "function" ? orgStatusLabel(t.status) : (t.status || "active"), (t.status || "active") === "active" ? "ok" : "warn")),
     el("td", { class: "ui-view-desc", text: "…" }),
     el("td", { class: "ui-row-actions" }, [
       el("button", { class: "ui-btn ui-btn-sm ui-btn-primary", text: bl({ en: "Enter", ja: "入る" }), onClick: () => enterTenant(t.tenant_id) }),
@@ -112,7 +113,7 @@ async function renderOperatorCapacity(host) {
       return;
     }
     const body = r.body || {};
-    const allocations = (body.tenants || []).map((t) => ({ tenant_id: t.display_name || t.tenant_id, seats: t.allocated || 0, used: t.used || 0 }));
+    const allocations = (body.tenants || []).map((t) => ({ tenant_id: t.display_name || t.tenant_id, seats: t.allocated || 0, used: t.used || 0, connectors: t.connectors || 0 }));
     const allocated = typeof body.allocated === "number" ? body.allocated : allocations.reduce((n, a) => n + a.seats, 0);
     const pool = typeof body.seats === "number" ? body.seats : (body.licensed ? null : 0);
     if (!current()) return;
@@ -143,7 +144,7 @@ async function renderOperatorCapacity(host) {
       el("tbody", {}, allocations.map((a) => el("tr", {}, [
         el("td", { text: a.tenant_id }),
         el("td", { text: a.seats ? String(a.seats) : bl({ en: "none", ja: "なし" }) }),
-        el("td", { text: String(a.used) })]))),
+        el("td", { text: uiSeatsInUse(a.used, a.connectors) })]))),
     ]));
   } catch (e) { if (!current()) return; uiState(host, "error", String(e)); }
 }

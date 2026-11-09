@@ -166,6 +166,12 @@ var operatorElevatedActs = []operatorElevatedAct{
 
 // operatorActNeedsElevation reports whether this request is one of them, and why.
 func operatorActNeedsElevation(method, path string) (string, bool) {
+	act, ok := operatorElevatedActFor(method, path)
+	return act.Why, ok
+}
+
+// operatorElevatedActFor returns the entry this request matched.
+func operatorElevatedActFor(method, path string) (operatorElevatedAct, bool) {
 	method = strings.ToUpper(strings.TrimSpace(method))
 	segments := splitRoutePath(path)
 	for _, act := range operatorElevatedActs {
@@ -173,10 +179,21 @@ func operatorActNeedsElevation(method, path string) (string, bool) {
 			continue
 		}
 		if routePatternMatches(splitRoutePath(act.Path), segments) {
-			return act.Why, true
+			return act, true
 		}
 	}
-	return "", false
+	return operatorElevatedAct{}, false
+}
+
+// Key names the act as it is written in the list ("DELETE /admin/tenant-cas/*/*"). The refusal carries it so a
+// screen can say WHICH act in its reader's language: Why is the list's own argument, written for whoever
+// maintains it, in English — and it was being shown, as written, inside a Japanese confirmation (2026-11-04,
+// acceptance A, third run).
+func (a operatorElevatedAct) Key() string {
+	if a.Method == "" {
+		return ""
+	}
+	return strings.ToUpper(a.Method) + " " + a.Path
 }
 
 func splitRoutePath(path string) []string {

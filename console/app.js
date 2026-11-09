@@ -303,13 +303,20 @@ const GROUPS = [
 // ---------------------------------------------------------------------------
 // State + i18n
 // ---------------------------------------------------------------------------
-let lang = localStorage.getItem("lang") || "en";
+let lang = (typeof window !== "undefined" && window.dsseInitialLang) ? window.dsseInitialLang() : (localStorage.getItem("lang") || "en");
 function t(key) { return (window.I18N[lang] && window.I18N[lang][key]) || (window.I18N.en[key]) || key; }
 function bl(obj) { return (obj && (obj[lang] || obj.en)) || ""; }
 
-function applyI18n() {
+// applyStaticI18n translates the page's fixed text (the header, the buttons) and nothing else. It needs no
+// network, so it runs before the layout is shown; the header used to appear in English ("Admin Console",
+// "Operating as", "Sign out") for as long as the entitlement and clock reads took (acceptance C, third walk).
+function applyStaticI18n() {
   document.documentElement.lang = lang;
   document.querySelectorAll("[data-i18n]").forEach((el) => { el.textContent = t(el.getAttribute("data-i18n")); });
+}
+
+function applyI18n() {
+  applyStaticI18n();
   document.getElementById("lang-en").classList.toggle("active", lang === "en");
   document.getElementById("lang-ja").classList.toggle("active", lang === "ja");
   const activeGroup = document.querySelector(".nav button.active")?.dataset.group;
@@ -330,7 +337,10 @@ function applyI18n() {
   renderGroup(active && !requested ? active.dataset.group : landing);
 }
 
-function setLang(l) { lang = l; localStorage.setItem("lang", l); applyI18n(); refreshModeBanner(); }
+// ★ THE OPERATING BANNER IS REDRAWN TOO (2026-11-04, found while photographing the Console in Japanese). It is
+// built with bl() when the organization is entered, so switching language afterwards left "Operating within …"
+// and "Exit tenant" in English on every screen until a reload.
+function setLang(l) { lang = l; localStorage.setItem("lang", l); applyI18n(); refreshModeBanner(); if (operateTenant) renderOperatingBanner(operatingOrganizationName || operateTenant); }
 
 // ---------------------------------------------------------------------------
 // API helper
@@ -363,6 +373,7 @@ const CP_AUTHORED_WRITES = [
 	"POST /admin/applications/{application_id}/publish",
 	"POST /admin/applications/{application_id}/unpublish",
 	"DELETE /admin/applications/{application_id}",
+	"POST /admin/risk-signals/legacy-unattributed/resolve",
   "POST /admin/swg/tenant-restriction",
   "DELETE /admin/assets/endpoints/{id}",
   "DELETE /admin/assets/groups/{id}",
@@ -401,6 +412,11 @@ const CP_AUTHORED_WRITES = [
   "POST /admin/connectors/{connector_id}/routes",
   "POST /admin/delegated-grants",
   "POST /admin/delegated-grants/{grant_id}/revoke",
+  // ★★ AN ACCESS APPROVAL IS REVOKED WHERE IT IS HELD (2026-11-08, acceptance C). This went to an Edge, and an
+  // Edge that pulls its configuration refuses it: it cannot say the revocation is authoritative. The refusal
+  // was a 503 that did not name the control plane in the words the retry below looks for, so every press of
+  // "Revoke" failed, on every node, before and after leadership moved.
+  "POST /admin/grants/{id}/revoke",
   "POST /admin/device-groups",
   "POST /admin/dlp-allowlist",
   "POST /admin/dlp-classifiers",
@@ -584,13 +600,61 @@ const CP_AUTHORED_READS = [
   "GET /admin/device-runtime",
   // An Edge is started and stopped at any time, so what the fleet observed is held by the control plane.
   "GET /admin/policy-candidates",
+  // ★ THE SAME DEVICE READ "NOT OBSERVED" ON ONE REGION'S CONSOLE AND "59 DAYS LEFT" ON ANOTHER'S (2026-11-07,
+  // three-region acceptance rerun). Each Console asked its own region's Edge, which knows only the handshakes it
+  // terminated since it started; the device was on another region. Every Edge ships what it sees to the control
+  // plane and re-sends it each minute, so the control plane is where the deployment's answer is.
+  "GET /admin/device-certificates",
+  // The approvals a revocation acts on are read from the same place, so the list shows what the revoke changed.
+  "GET /admin/grants",
+  // And what each device reports it is steering around, which travels the same way and is kept by the control
+  // plane in its database: a device on another region was simply absent from this Console's view of it.
+  "GET /admin/steer-exclusions/observed",
+  "GET /admin/steer-exclusions/observed/by-app",
+  // And each device's update outcome: a device reports to its Edge, and the control plane builds the fleet's
+  // picture as those reports arrive (audit_ingest_receiver.go). An Edge knows only its own devices.
+  "GET /admin/agent/device-updates",
+  "GET /admin/agent-rollout",
   "GET /admin/east-west/observations",
+  // ★★ WHAT THIS SCREEN JUST WROTE IS READ BACK FROM WHERE IT WAS WRITTEN (2026-11-04, found by configuring a new
+  // organization from a browser). These are written to the control plane and were read back from an Edge, which
+  // has them only once it has pulled them: Networks, a site's networks, a connector's routes, internal CAs and
+  // the rule catalogs each said "could not be confirmed" or showed the old list right after a save that had
+  // succeeded, and a reload showed everything saved. The editor's list is the authored one.
+  "GET /admin/vlan-objects",
+  "GET /admin/internal-cas",
+  "GET /admin/rules",
+  // ★★ AND THE REST OF THEM (2026-11-07, three-region acceptance rerun). The list above was written pair by pair,
+  // so the pairs nobody wrote down kept the defect: the connector-access banner read its mode from an Edge right
+  // after the mode was written to the control plane, and showed the old one in every tab until a reload. These
+  // are every read of a path these screens also write to the control plane; a test now derives them from the
+  // screens, so the next one cannot be left out.
+  "GET /admin/applications",
+  "GET /admin/device-groups",
+  "GET /admin/dns-policy",
+  "GET /admin/east-west",
+  "GET /admin/human-identities",
+  "GET /admin/idp-connections",
+  "GET /admin/inspection-posture",
+  "GET /admin/legacy-exceptions",
+  "GET /admin/non-human-identities",
+  "GET /admin/risk-signals",
+  "GET /admin/server-initiated",
+  "GET /admin/assets/endpoints",
+  "GET /admin/assets/groups",
+  "GET /admin/assets/services",
 ];
 
 function cpAuthoredRead(method, path) {
   if (method !== "GET") return false;
   const clean = String(path).split("?")[0];
   if (/^\/admin\/policy-candidates\/[^/]+$/.test(clean)) return true;
+  if (/^\/admin\/sites\/[^/]+\/networks$/.test(clean) || /^\/admin\/connectors\/[^/]+(\/routes)?$/.test(clean)) return true;
+  // ★ THE DETAIL A SAVE IS BUILT ON IS READ WHERE THE SAVE GOES (review of 2026-11-07, R3). The applications
+  // list was moved to the control plane and its per-id detail was not; an edit read the detail from an Edge
+  // that had not pulled the last save, merged the form into it and wrote the whole record back — the previous
+  // destination and routes, restored by a rename. The same shape for a site's detail.
+  if (/^\/admin\/applications\/[^/]+$/.test(clean) || /^\/admin\/sites\/[^/]+$/.test(clean)) return true;
   return CP_AUTHORED_READS.some((entry) => entry.slice(entry.indexOf(" ") + 1) === clean);
 }
 
@@ -644,6 +708,17 @@ let operateTenant = (function () {
   } catch (e) { return null; }
 })();
 
+// ★★ AND WHAT ANOTHER TAB WROTE REACHES THIS ONE (2026-11-07, three-region acceptance rerun). Only the banner was
+// told: a rule saved in one tab left another tab's list reading "no rules yet" until it was reloaded. Every
+// successful write is announced with the organization it was made in. A tab working in that organization reads
+// its banner again, and its screen is drawn again when it is next looked at — unless something has been typed
+// into the screen since it was drawn, which a redraw would throw away. Then the redraw is offered instead. See
+// catchUpWithOtherTabs.
+const WRITE_ANNOUNCED_KEY = "dsse.consoleWriteAnnounced";
+function announceWriteToOtherTabs(tenant) {
+  try { localStorage.setItem(WRITE_ANNOUNCED_KEY, JSON.stringify({ tenant: tenant || "", at: Date.now() })); } catch (e) { /* storage unavailable */ }
+}
+
 // tenantOverride names the organization for ONE call, without touching the console's current selection.
 //
 // ★ A GLOBAL MUTATED BY AN ASYNC LOOP IS HOW THE CONSOLE ENDED UP IN AN ORGANIZATION NOBODY CHOSE
@@ -681,6 +756,7 @@ async function apiFetch(method, path, body, plane, signal, tenantOverride, retri
   let parsed;
   try { parsed = JSON.parse(text); } catch (e) { parsed = text; }
   const answer = { status: res.status, ok: res.ok, body: parsed };
+  if (method !== "GET" && res.ok) announceWriteToOtherTabs(actingTenant);
 	// The operator may switch organizations while a response is in flight. An automatic retry must
 	// never read that new selection and replay the earlier request in another organization.
   if (tenantOverride === undefined && operateTenant !== actingTenant) return answer;
@@ -727,10 +803,57 @@ async function apiFetch(method, path, body, plane, signal, tenantOverride, retri
   return answer;
 }
 
+// ELEVATED_ACT_LABELS says which act needs the time, keyed by the entry of the Edge's elevated list the refusal
+// names (elevation_required.act, as operator_elevated_acts.go writes it). The list's own "why" is its
+// maintainers' argument, in English; it was shown as written inside the Japanese confirmation (2026-11-04,
+// acceptance A, third run). A test fails if the list gains an entry this table does not name.
+const ELEVATED_ACT_LABELS = {
+  "POST /admin/tenant-device-authority": { en: "creating the authority this organization's devices are enrolled under", ja: "この組織の端末を登録する認証局を作る" },
+  "POST /admin/tenant-transport-authority": { en: "creating the authority for the certificate devices check when they connect", ja: "端末が接続時に確かめる証明書の認証局を作る" },
+  "POST /admin/tenant-transport-authority/rotate": { en: "starting to move every device to a new connection authority", ja: "接続用の認証局の切り替えを始める（全端末）" },
+  "POST /admin/tenant-transport-authority/retire-previous": { en: "retiring the previous connection authority", ja: "前の接続用の認証局を廃止する" },
+  "POST /admin/tenant-transport-authority/rename": { en: "changing the name every device connects to", ja: "全端末が接続する名前を変える" },
+  "POST /admin/tenant-transport-authority/retire-previous-name": { en: "ending connections to the previous name", ja: "前の名前での接続を終わらせる" },
+  "POST /admin/tenant-transport-authority/abandon-rotation": { en: "calling off the switch to a new connection authority", ja: "接続用の認証局の切り替えを取りやめる" },
+  "POST /admin/tenant-device-authority/abandon-rotation": { en: "calling off the switch to a new enrolment authority", ja: "端末登録の認証局の切り替えを取りやめる" },
+  "POST /admin/tenant-transport-authority/abandon-rename": { en: "going back to the previous name", ja: "前の名前に戻す" },
+  "POST /admin/tenant-device-authority/rotate": { en: "starting to move device certificates to a new enrolment authority", ja: "端末登録の認証局の切り替えを始める" },
+  "POST /admin/tenant-device-authority/retire-previous": { en: "refusing devices that still hold a certificate from the previous authority", ja: "前の認証局の証明書を持つ端末を受け付けなくする" },
+  "POST /admin/tenant-interception-authority/root-crl": { en: "publishing which interception certificates are revoked", ja: "傍受用の証明書の失効情報を公開する" },
+  "POST /admin/tenant-interception-authority/revoke-delegation": { en: "permanently revoking an Edge's interception CA", ja: "Edge の傍受用 CA を失効させる（元に戻せません）" },
+  "POST /admin/tenant-interception-authority/promote": { en: "making the prepared interception authority the one in use", ja: "準備した傍受用の認証局を使い始める" },
+  "POST /admin/tenant-interception-authority/withdraw-incoming": { en: "withdrawing the new interception root devices were asked to trust", ja: "端末に配った新しい傍受ルート証明書を取り下げる" },
+  "POST /admin/tenant-interception-authority": { en: "accepting the interception authority this organization handed over", ja: "組織から預かった傍受用の認証局を受け入れる" },
+  "POST /admin/interception-intermediate/*/revoke": { en: "revoking the certificate that signs this organization's intercepted traffic", ja: "傍受の署名に使う証明書を失効させる" },
+  "POST /admin/interception-intermediate/*": { en: "replacing the certificate that signs this organization's intercepted traffic", ja: "傍受の署名に使う証明書を入れ替える" },
+  "DELETE /admin/tenant-cas/*/*": { en: "no longer admitting devices under this CA", ja: "この CA の端末を受け付けなくする" },
+  "DELETE /admin/tenant-cas/*": { en: "removing every CA this organization's devices are admitted under", ja: "この組織の端末の CA をすべて外す" },
+  "POST /admin/interception-roots/*": { en: "creating or replacing the interception root devices trust", ja: "端末が信頼する傍受ルート証明書を作る・入れ替える" },
+  "DELETE /admin/interception-roots/*": { en: "removing this organization's own interception root", ja: "この組織の傍受ルート証明書を外す" },
+  "POST /admin/transport-admission/revoke": { en: "taking a device off the network now", ja: "端末を今すぐネットワークから外す" },
+};
+
+// elevatedActText names the act. An entry this Console does not know (an Edge newer than the screen) is
+// described in general terms rather than in the list's English argument.
+function elevatedActText(need) {
+  const label = need && ELEVATED_ACT_LABELS[String(need.act || "")];
+  if (label) return bl(label);
+  return bl({ en: "an act that changes the whole organization or cannot be undone", ja: "組織全体に影響する、または元に戻せない操作" });
+}
+
 // offerOperatorElevation asks the operator whether to take the time this act needs, and takes it if they say
 // so. Returns true when the act may now be retried.
+// The organization the dialog names, as the reader knows it. The Edge's refusal carries the tenant ID; when that is
+// the organization being operated in, the dialog says its name (2026-11-06: the heading showed the
+// tenant ID in place of the organization's name on a three-region acceptance).
+function elevationOrganizationName(need) {
+  const id = (need && need.tenant_id) || "";
+  if (operatingOrganizationName && (!id || id === operateTenant)) return operatingOrganizationName;
+  return id || operatingOrganizationName || "";
+}
+
 async function offerOperatorElevation(need, plane, targetTenant, selectionIsImplicit) {
-  const org = (need && need.tenant_id) || operatingOrganizationName || "";
+  const org = elevationOrganizationName(need);
   // ★★★ IT USED TO ASK FOR A REASON AND SAY "THIS ORGANIZATION SEES IT" (2026-08-22, measured — the Edge was
   // logging the field being dropped on every grant).
   //
@@ -748,8 +871,8 @@ async function offerOperatorElevation(need, plane, targetTenant, selectionIsImpl
   const ok = await uiConfirm({
     title: bl({ en: "This needs time granted inside " + org, ja: org + " の中で作業する時間が要ります" }),
     body: bl({
-      en: "What it is for: " + (need.why || "") + ". " + org + " sees that you took it, when, and that it ended. It ends by the clock; nothing renews it.",
-      ja: "対象: " + (need.why || "") + "。" + org + " からは、誰がいつ取得し、いつ終わったかが見えます。時間が来れば自動で終わり、更新もされません。" }),
+      en: "What it is for: " + elevatedActText(need) + ". " + org + " sees that you took it, when, and that it ended. It ends by the clock; nothing renews it.",
+      ja: "対象: " + elevatedActText(need) + "。" + org + " からは、誰がいつ取得し、いつ終わったかが見えます。時間が来れば自動で終わり、更新もされません。" }),
     confirmLabel: bl({ en: "Ask for 20 minutes", ja: "20分もらう" }),
   });
   if (!ok) return false;
@@ -1081,7 +1204,14 @@ const CUSTOM_VIEWS = {
   agentProfile: "renderAgentProfileView",
 };
 
+// Whether another tab wrote something this screen may be showing, and whether anything has been typed into this
+// screen since it was drawn. See catchUpWithOtherTabs.
+let otherTabWrotePending = false;
+let editedSinceDrawn = false;
+
 function renderGroup(groupId) {
+  editedSinceDrawn = false;
+  document.getElementById("other-tab-change")?.remove();
   const group = GROUPS.find((g) => g.id === groupId) || GROUPS[0];
   document.querySelectorAll(".nav button").forEach((b) => b.classList.toggle("active", b.dataset.group === group.id));
   const content = document.getElementById("content");
@@ -1304,20 +1434,39 @@ async function init() {
     window.location.replace("index.html");
   };
 
+  // "Checking your session…" too, in the reader's language from the first frame.
+  applyStaticI18n();
   const signedIn = await ensureSignedIn();
   if (!signedIn) { window.location.replace("index.html"); return; }
 
   const gate = document.getElementById("gate-status");
   if (gate) gate.style.display = "none";
+  applyStaticI18n();
   document.getElementById("console-layout").style.display = "";
   renderWhoami();
   // Resolve feature entitlements (the license gate) before the nav is built, so unlicensed paid-feature surfaces
   // (DLP) are hidden from the start.
   try { const r = await apiFetch("GET", "/admin/entitlements"); if (r && r.ok && r.body && r.body.features) window.dsseEntitlements = r.body.features; } catch (e) { /* default all-on */ }
+  await adoptOperatedOrganizationClock();
   applyI18n();
   refreshModeBanner();
   // Keep the posture banner current even if the mode is changed elsewhere (another operator / the API).
   if (!modeBannerTimer) modeBannerTimer = setInterval(refreshModeBanner, 15000);
+}
+
+// ★ THE CLOCK OF THE ORGANIZATION BEING OPERATED IN (2026-11-07, three-region acceptance rerun). The session
+// carries the signed-in administrator's own organization's zone, so an operator working inside a customer read
+// that customer's logs in the operator's zone — UTC, for an organization set to Asia/Tokyo. Entering an
+// organization reloads the page, so reading its zone here, before anything is drawn, covers every screen. An
+// organization with no zone set reads UTC, as the administrator's own does: never somebody else's clock.
+async function adoptOperatedOrganizationClock() {
+  if (!operateTenant) return;
+  try {
+    const r = await apiFetch("GET", "/admin/tenant");
+    if (!r || !r.ok || !r.body) return;
+    const zone = typeof r.body.timezone === "string" ? r.body.timezone.trim() : "";
+    window.dsseTenantTimezone = zone || "UTC";
+  } catch (e) { /* keep the session's zone; every time shown still names the zone it is in */ }
 }
 
 // ensureSignedIn reads GET /admin/session and captures the operator identity when an admin-session cookie
@@ -1665,9 +1814,80 @@ async function setEastWestMode(mode, confirmMsg) {
     const res = await apiFetch("POST", "/admin/east-west", { mode });
     if (!res || !res.ok) {
       window.alert(bl({ en: "Failed to change connector-access posture (status ", ja: "コネクタ経由アクセスの変更に失敗(状態 " }) + (res ? res.status : "?") + ")");
+    } else {
+      announceModeChangeToOtherTabs();
     }
   } catch (e) { window.alert(String(e)); }
   refreshModeBanner();
 }
+
+// ★ ANOTHER TAB OF THE SAME CONSOLE KEPT SAYING "OBSERVE" (2026-11-06, three-region acceptance). The banner is
+// re-read every 15 seconds, but a browser stretches a background tab's timers to a minute or more, so the tab
+// the administrator came back to still showed the old mode until reloaded. A change made here is announced to
+// the other tabs of this browser, and a tab that comes back into view reads the mode again at once.
+const MODE_CHANGED_KEY = "dsse.connectorAccessModeChangedAt";
+function announceModeChangeToOtherTabs() {
+  try { localStorage.setItem(MODE_CHANGED_KEY, String(Date.now())); } catch (e) { /* storage unavailable: the timer still runs */ }
+}
+window.addEventListener("storage", (e) => { if (e && e.key === MODE_CHANGED_KEY) refreshModeBanner(); });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refreshModeBanner(); });
+
+// What another tab wrote reaches this one: see announceWriteToOtherTabs, beside apiFetch.
+//
+// ★ "NOTHING TYPED" WAS JUDGED FROM INPUT EVENTS INSIDE #content ALONE (review of 2026-11-07, R4). A form in a
+// modal lives under <body>, not #content, so a name being typed into "Edit site" counted as nothing; the list
+// behind it was redrawn, and the modal's save then saw a stale screen and closed without saving. And a form
+// changed by buttons — the ↑↓ that order a device configuration's entrances — fires no input event at all. So:
+// any input or change anywhere, and any button pressed inside the screen or a modal, means the screen may hold
+// work; and an open modal is work in progress whatever fired. The cost of judging too much is one offered
+// redraw instead of an automatic one.
+function noteWorkInProgress(e) {
+  const t = e && e.target;
+  if (!t || typeof t.closest !== "function") return;
+  const content = document.getElementById("content");
+  if ((content && content.contains(t)) || t.closest(".ui-modal-backdrop")) editedSinceDrawn = true;
+}
+document.addEventListener("input", noteWorkInProgress, true);
+document.addEventListener("change", noteWorkInProgress, true);
+document.addEventListener("click", (e) => {
+  const t = e && e.target;
+  if (t && typeof t.closest === "function" && t.closest("button")) noteWorkInProgress(e);
+}, true);
+function screenMayHoldWork() {
+  return editedSinceDrawn || !!document.querySelector(".ui-modal-backdrop");
+}
+window.addEventListener("storage", (e) => {
+  if (!e || e.key !== WRITE_ANNOUNCED_KEY || !e.newValue) return;
+  let change = null;
+  try { change = JSON.parse(e.newValue); } catch (err) { return; }
+  if (!change || (change.tenant || "") !== (operateTenant || "")) return;
+  refreshModeBanner();
+  otherTabWrotePending = true;
+  if (document.visibilityState === "visible") catchUpWithOtherTabs();
+});
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") catchUpWithOtherTabs(); });
+function catchUpWithOtherTabs() {
+  if (!otherTabWrotePending) return;
+  otherTabWrotePending = false;
+  const group = document.querySelector(".nav button.active")?.dataset.group;
+  if (!group) return;
+  if (!screenMayHoldWork()) { renderGroup(group); return; }
+  const content = document.getElementById("content");
+  if (!content || !content.parentNode || document.getElementById("other-tab-change")) return;
+  const bar = el("div", { id: "other-tab-change", class: "mode-banner observing", role: "status" }, [
+    el("span", { class: "mode-banner-label", text: bl({ en: "● Changed in another tab.", ja: "● 別のタブで変更されました。" }) }),
+    el("button", { class: "mode-banner-btn", text: bl({ en: "Show the latest", ja: "最新を表示" }), onClick: () => renderGroup(group) }),
+  ]);
+  content.parentNode.insertBefore(bar, content);
+}
+
+// A number field steps its value when the wheel turns over it while it has focus, silently, as the reader scrolls
+// the page. Found on 0.4.1 acceptance B: a site's expected connector count went from 1 to 0 under the wheel, and
+// saving it would have authored a site that expects no connector. Every number field in the Console has the same
+// shape, so this is answered once, here: the wheel scrolls the page, and a number changes only when it is typed.
+document.addEventListener("wheel", (e) => {
+  const field = e && e.target;
+  if (field && field.tagName === "INPUT" && field.type === "number" && document.activeElement === field) field.blur();
+}, { passive: true });
 
 document.addEventListener("DOMContentLoaded", init);

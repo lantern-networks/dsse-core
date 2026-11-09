@@ -230,11 +230,21 @@ func runtimeViewFromRecord(rec fleetDeviceRecord, now time.Time) deviceRuntimeVi
 	return view
 }
 
-// seedFleetDeviceProjection builds the projection from the canonical history, once.
+// seedFleetDeviceProjection builds the projection from the canonical history, once it can be read.
 //
 // Bounded the same way the per-request query was — a 48-hour window and a row cap — because this is the same
 // read, moved. What changed is how often it runs: once per process instead of once per Console load, which is
 // the difference between a 10-second query nobody notices and a 10-second query on every page.
+//
+// ★★★ AND UNTIL IT HAS BEEN READ, NOT ONCE (2026-11-08, acceptance C). A control plane that started a moment
+// before its history store tried once, was refused — "clickhouse dsse-clickhouse:8123: connection refused" — and
+// never tried again. The rows that arrived afterwards were folded, but the projection stayed unseeded, so the
+// fleet view answered "this node only" for as long as the process lived: the device page showed every device's
+// operating system as unknown and its posture as unreported, with the banner saying the fleet's state could
+// not be read, while the device was reporting the whole time. It read correctly the moment leadership moved to
+// a control plane whose single attempt had happened to succeed. The other two control planes had succeeded only
+// because they had crashed and restarted during installation. So a failure is retried, with a growing pause,
+// until the history is read.
 func seedFleetDeviceProjection(p *fleetDeviceProjection, store hotstore.Store, tenantID string) {
 	if p == nil || store == nil {
 		// Nothing to seed from. Leaving `seeded` false is the point: the fleet view then says it is answering
@@ -243,17 +253,31 @@ func seedFleetDeviceProjection(p *fleetDeviceProjection, store hotstore.Store, t
 			"fleet view will answer for this node only")
 		return
 	}
-	started := time.Now()
-	rows, err := adminLogSearchWithLimitBounds(store, tenantID, "device_state", fleetDeviceRuntimeQuery(time.Now()), 2000, 5000)
-	if err != nil {
-		log.Printf("★ device-runtime: could not seed the fleet projection (%v) — the fleet view will answer for "+
-			"this node only until shipped events fill it in", err)
-		return
+	pause := fleetProjectionSeedFirstPause
+	for attempt := 1; ; attempt++ {
+		started := time.Now()
+		rows, err := adminLogSearchWithLimitBounds(store, tenantID, "device_state", fleetDeviceRuntimeQuery(time.Now()), 2000, 5000)
+		if err == nil {
+			n := p.Seed(rows.rows)
+			log.Printf("device-runtime: fleet projection seeded from %d shipped row(s) -> %d device(s) in %s (attempt %d)",
+				len(rows.rows), n, time.Since(started).Truncate(time.Millisecond), attempt)
+			return
+		}
+		log.Printf("★ device-runtime: could not seed the fleet projection (attempt %d: %v) — the fleet view answers for "+
+			"this node only; trying again in %s", attempt, err, pause)
+		fleetProjectionSeedSleep(pause)
+		if pause *= 2; pause > fleetProjectionSeedMaxPause {
+			pause = fleetProjectionSeedMaxPause
+		}
 	}
-	n := p.Seed(rows.rows)
-	log.Printf("device-runtime: fleet projection seeded from %d shipped row(s) -> %d device(s) in %s",
-		len(rows.rows), n, time.Since(started).Truncate(time.Millisecond))
 }
+
+// The pause between attempts. Variables so a test can run the retry without waiting for it.
+var (
+	fleetProjectionSeedFirstPause = 2 * time.Second
+	fleetProjectionSeedMaxPause   = time.Minute
+	fleetProjectionSeedSleep      = time.Sleep
+)
 
 // boolPtrFromRow reads a tri-state from a shipped row: true, false, or ABSENT.
 //

@@ -1865,7 +1865,7 @@ func buildAgentUpdateSourceClient(caFile string) (*http.Client, error) {
 	}
 	return &http.Client{
 		Timeout:   30 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: tlsCfg},
+		Transport: edgeTransport(tlsCfg),
 		// ★ NO REDIRECTS AT ALL. Go's default follows up to ten and re-sends headers to the new host on a
 		// same-host hop — and a control plane that has been talked into answering 302 is exactly the situation
 		// where the admin token must not travel. There is no legitimate redirect on this path.

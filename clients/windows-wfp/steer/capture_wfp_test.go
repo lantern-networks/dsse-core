@@ -75,8 +75,9 @@ func TestBuildWFPPolicyMarshalsAppsAndDests(t *testing.T) {
 	if got := nulString(p.Apps[0][:]); got != "automation" {
 		t.Fatalf("app[0] = %q, want automation (lowercased)", got)
 	}
-	if p.NumDests != 1 || p.Dests[0].Family != afInet {
-		t.Fatalf("dest rule wrong: num=%d fam=%d", p.NumDests, p.Dests[0].Family)
+	// The authored IPv4 rule, then its IPv4-mapped IPv6 twin for dual-stack sockets (C18).
+	if p.NumDests != 2 || p.Dests[0].Family != afInet || p.Dests[1].Family != afInet6 {
+		t.Fatalf("dest rules wrong: num=%d fam=%d,%d", p.NumDests, p.Dests[0].Family, p.Dests[1].Family)
 	}
 	// 443 in network order is 0x01bb.
 	if p.Dests[0].Port != 0x01bb {
@@ -188,11 +189,16 @@ func TestBypassDestWholeHostWildcard(t *testing.T) {
 		t.Fatalf("bare-IP bypass addr = %s, want 10.10.0.10", got)
 	}
 	p := mustBuildWFPPolicy(t, captureConfig{localPort: 18099, bypassDests: aps})
-	if p.NumDests != 1 || p.Dests[0].Family != afInet || p.Dests[0].Port != 0 {
-		t.Fatalf("wildcard dest rule wrong: num=%d fam=%d port=%d", p.NumDests, p.Dests[0].Family, p.Dests[0].Port)
+	// The authored IPv4 rule and its IPv4-mapped IPv6 twin (C18), both whole-host (port 0) (review C3-R8: this
+	// test expected one rule and was not run on Windows before the MSI was judged).
+	if p.NumDests != 2 || p.Dests[0].Family != afInet || p.Dests[0].Port != 0 || p.Dests[1].Family != afInet6 || p.Dests[1].Port != 0 {
+		t.Fatalf("wildcard dest rules wrong: num=%d fam=%d/%d port=%d/%d", p.NumDests, p.Dests[0].Family, p.Dests[1].Family, p.Dests[0].Port, p.Dests[1].Port)
 	}
 	if [4]byte{p.Dests[0].Addr[0], p.Dests[0].Addr[1], p.Dests[0].Addr[2], p.Dests[0].Addr[3]} != [4]byte{10, 10, 0, 10} {
 		t.Fatalf("wildcard dest addr = %v, want 10.10.0.10", p.Dests[0].Addr[:4])
+	}
+	if p.Dests[1].Addr != netip.MustParseAddr("::ffff:10.10.0.10").As16() {
+		t.Fatalf("wildcard mapped dest addr = %v, want ::ffff:10.10.0.10", p.Dests[1].Addr)
 	}
 }
 
@@ -211,4 +217,27 @@ func nulString(b []byte) string {
 		}
 	}
 	return string(b)
+}
+
+// TestADualStackConnectToAnExcludedIPv4AddressIsExcluded reproduces C18 at the driver's input: .NET connects to
+// an IPv4 entrance through a dual-stack socket, the driver classifies it at the IPv6 layer as ::ffff:a.b.c.d,
+// and compares IPv6 rules byte for byte. The policy has to carry that exact form.
+func TestADualStackConnectToAnExcludedIPv4AddressIsExcluded(t *testing.T) {
+	p := mustBuildWFPPolicy(t, captureConfig{localPort: 18099, bypassDests: parseAddrPorts([]string{"57.180.243.182:443"})})
+	want := netip.MustParseAddr("::ffff:57.180.243.182").As16()
+	for i := uint32(0); i < p.NumDests; i++ {
+		if p.Dests[i].Family == afInet6 && p.Dests[i].Addr == want && p.Dests[i].Port == 0x01bb {
+			return
+		}
+	}
+	t.Fatalf("no IPv6 rule for [::ffff:57.180.243.182]:443 among %d rules; PowerShell's connection would be steered", p.NumDests)
+}
+
+// TestAnApplicationTypedWithItsDriveLetterReachesTheDriverWithout: the driver matches image-path substrings of
+// NT device paths, which carry no drive letter.
+func TestAnApplicationTypedWithItsDriveLetterReachesTheDriverWithout(t *testing.T) {
+	p := mustBuildWFPPolicy(t, captureConfig{localPort: 18099, bypassApps: []string{`C:\Program Files\Git\usr\bin\ssh.exe`}})
+	if p.NumApps != 1 || nulString(p.Apps[0][:]) != `\program files\git\usr\bin\ssh.exe` {
+		t.Fatalf("app[0] = %q; the drive letter would keep it from ever matching", nulString(p.Apps[0][:]))
+	}
 }

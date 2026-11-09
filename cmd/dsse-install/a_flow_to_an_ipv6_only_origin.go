@@ -87,7 +87,7 @@ func edgesDeclareIPv6Egress(client *http.Client, edgeAdmins []string) bool {
 		if admin == "" {
 			continue
 		}
-		code, raw, err := get(client, admin+"/healthz", "")
+		code, raw, err := getNodeHealth(client, admin+"/healthz")
 		if err != nil || code != 200 {
 			continue
 		}

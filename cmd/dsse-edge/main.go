@@ -985,6 +985,8 @@ func main() {
 		log.Fatal(err)
 	}
 	initMetricsStart(time.Now())
+	// Before any client to the control plane is built: they all dial through this (C-1, third walk).
+	installEdgeDoorsFromEnvironment()
 	mode := flag.String("mode", "edge", "run mode: edge, postgres-export-worker, postgres-audit-publisher, or postgres-domain-event-publisher")
 	listen := flag.String("listen", ":8080", "listen address")
 	// the Edge serves TLS, never plaintext. The main -listen serves HTTPS using -tls-cert/-key
@@ -3048,6 +3050,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("init steer exclusion store: %v", err)
 	}
+	// An Edge that pulls its configuration RECEIVES this set; its file is a cache for the next start and must not
+	// be re-read over what the control plane sent (review C3-R3).
+	if strings.TrimSpace(*configSourceURL) != "" || strings.TrimSpace(*steerExclusionSourceURL) != "" {
+		steerExclusions.SetReceiver()
+	}
 
 	// The authorities each organization vouches for when this Edge verifies one of that organization's PRIVATE
 	// assets after decrypting the flow to it. Durable in the same place as every other authored object: the
@@ -3521,6 +3528,9 @@ func main() {
 		configBundlePuller = &configBundleSource{
 			url: cfgURL, endpoints: cpEndpointSel, token: token, tenantID: evaluator.PolicyBundle.TenantID,
 			interval: *configSourcePoll, client: cfgClient, status: configSyncStatus,
+			// A connector that just left this node asks for an early pull, and every pull wakes the flows held for
+			// it — see a_connector_that_just_left_is_waited_for.go.
+			hurry: connectorDepartures.hurryRequests(), pulled: connectorDepartures.announce,
 			// Tell the control plane which generation this Edge actually holds. Without it, "applied" in the
 			// Console means "applied on whichever Edge the console front door proxies to" — the sentence that
 			// made the 2026-08-10 incident undiagnosable. See fleet_config_status.go.
@@ -3583,7 +3593,7 @@ func main() {
 				if trimmed := strings.TrimSuffix(strings.TrimRight(base, "/"), "/audit-ingest"); trimmed != "" {
 					machineURL = trimmed + "/enrolment-report"
 					machineClient = &http.Client{Timeout: 20 * time.Second,
-						Transport: &http.Transport{TLSClientConfig: cfg}}
+						Transport: edgeTransport(cfg)}
 				}
 			}
 		}
@@ -5454,6 +5464,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 					tenantModels:    tenantModelAdminStoreOrNil(config.TenantModelStore),
 					vlan:            vlanBoundary,
 					connectors:      connectorCatalogTarget,
+					steerExclusions: config.SteerExclusions,
 					nhi:             nonHumanIdentities,
 					humanIdentities: config.HumanIdentities,
 					delegatedGrants: delegatedGrants,
@@ -5502,6 +5513,17 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	agentToolStore := config.AgentToolStore
 	endpointInventoryStore := config.EndpointInventoryStore
 	tenantModelStore := config.TenantModelStore
+	if tenantModelStore != nil {
+		organizationZone = func(tenantID string) *time.Location {
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			tenant, err := tenantModelStore.Get(ctx, tenantID)
+			if err != nil {
+				return time.UTC
+			}
+			return tenantLocation(tenant)
+		}
+	}
 	var fleetResidency sharedFleetResidencyCheck
 	if strings.TrimSpace(config.ConfigSourceURL) != "" {
 		fleetResidency = newSharedFleetResidencyCheck(os.Getenv("DSSE_TOPOLOGY_PROFILE"), evaluator.EdgeRegionID, tenantModelStore)
@@ -5583,6 +5605,8 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			}
 			return counts.Principals > 0, true
 		}, config.LocalCredentials, config.StandbyAudit)
+	// What a node says about itself beyond its status is for the operator — see a_node_tells_only_its_operator_what_it_is.go.
+	mayReadNodeDetail := newNodeDetailReader(evaluator, writer, adminAuditOutbox, adminAuth, adminToken, devMode, config.LocalCredentials)
 	mux := http.NewServeMux()
 	configSyncStatus := config.ConfigSyncStatus                  // Phase 1 config-bundle puller status (nil = authoritative-local)
 	revocationSyncState := config.RevocationSyncStatus           // Phase 3 fast revocation puller status (nil = no CP sync)
@@ -5591,10 +5615,16 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// control plane) restarts. The aggregate generation is in-memory and resets on restart, so the epoch lets a
 	// puller detect a CP restart and re-baseline instead of freezing on a stale higher generation.
 	configBundleEpoch := strconv.FormatInt(time.Now().UnixNano(), 10)
-	// Prometheus metrics (unauthenticated, like /healthz) — served ONLY on the admin/management listener (the
-	// data plane and public origin 404 it via the surface middlewares), so it is scraped from the management
-	// network. Highest-value operational signal for a fail-closed ZTNA: decision throughput + allow/deny rate.
+	// Prometheus metrics — served ONLY on the admin listener (the data plane and public origin 404 it via the
+	// surface middlewares). Highest-value operational signal for a fail-closed ZTNA: decision throughput +
+	// allow/deny rate. ★ The admin listener is reached through the public entrance by name, so this asks for
+	// the operator's credential (a scraper sends a named API token as a bearer); see
+	// a_node_tells_only_its_operator_what_it_is.go.
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		if !mayReadNodeDetail(r) {
+			writeError(w, http.StatusUnauthorized, fmt.Errorf("admin authentication is required"))
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		setDecisionsInFlight(decisionStore.InFlightCount())
 		writePrometheusMetrics(w, time.Now())
@@ -5611,15 +5641,17 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		_, _ = w.Write([]byte(`{"leader":false}` + "\n"))
 	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		// Everybody gets the status code and {"status": ...}; the fields are for the operator.
+		detailed := mayReadNodeDetail(r)
 		// Phase 4 graceful drain: once draining, report 503 so the LB stops sending NEW connections here while
 		// in-flight requests bleed out. The data port keeps serving until Shutdown — this is what makes a
 		// rolling upgrade zero-outage.
 		if config.DrainState != nil && config.DrainState.Load() {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "draining"})
+			writeNodeHealth(w, http.StatusServiceUnavailable, map[string]any{"status": "draining"}, detailed)
 			return
 		}
 		if !configBundleReadyForTraffic(config.ConfigBundleSource, configSyncStatus) {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "awaiting_initial_config_bundle"})
+			writeNodeHealth(w, http.StatusServiceUnavailable, map[string]any{"status": "awaiting_initial_config_bundle"}, detailed)
 			return
 		}
 		// Key custody readiness. A signing key that cannot sign means this node can no longer intercept any
@@ -5627,11 +5659,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// balancer PULLS this rather than the node pushing itself out: a node broken enough to matter may be
 		// too broken to execute a removal, and a hung one fails readiness simply by not answering.
 		if ready, reason := config.KeyCustodyMonitor.Ready(); !ready {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			writeNodeHealth(w, http.StatusServiceUnavailable, map[string]any{
 				"status": "key_custody_unhealthy",
 				"detail": reason,
 				"note":   "the interception signing key cannot sign; already-cached leaves still work, but no NEW hostname can be intercepted",
-			})
+			}, detailed)
 			return
 		}
 		// Egress-broker readiness (design §"What to build" items 2+3): with no fallback engine, a broker that
@@ -5639,11 +5671,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// egress has no transport, so an HA balancer must send NEW flows to a node whose broker works. The gate
 		// is the cached monitor, never a per-request probe. nil monitor = browser-mimic egress off = ready.
 		if ready, reason := brokerHealth.Ready(); !ready {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			writeNodeHealth(w, http.StatusServiceUnavailable, map[string]any{
 				"status": "egress_broker_unusable",
 				"detail": reason,
 				"note":   "decrypt-all egress has no engine while the broker is unusable (there is no fallback); bypass and connector-tunnel paths are unaffected. In an HA set this node should be drained; on a single node flows fail legibly until the broker recovers",
-			})
+			}, detailed)
 			return
 		}
 		body := map[string]any{"status": "ok"}
@@ -5802,7 +5834,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				"last_error":           snap["last_error"],
 			}
 		}
-		writeJSON(w, http.StatusOK, body)
+		writeNodeHealth(w, http.StatusOK, body, detailed)
 	})
 	// Phase 1 config distribution: the Edge's config-bundle puller status (the last CP generation it applied,
 	// last poll/error). A fleet-health checker compares last_applied_generation to the control plane's current
@@ -6540,7 +6572,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// only by curl.
 	registerAgentDeviceUpdateRoutes(mux, adminEndpoint, deviceStore, config.EnrolledLedger, agentTelemetry,
 		publishedStoreOrEmpty(config.PublishedAgentUpdateStore), config.PublishedUpdates,
-		agentRolloutPlans, config.AgentRolloutCache, config.AgentUpdatePins)
+		agentRolloutPlans, config.AgentRolloutCache, config.AgentUpdatePins, registry)
 	registerAgentUpdatePublishRoutes(mux, adminEndpoint, publishedStoreOrEmpty(config.PublishedAgentUpdateStore),
 		config.AgentUpdatePins, config.PullsAgentUpdates, writer, evaluator, config.AgentUpdateArtifactDir,
 		config.PublishedUpdates, config.AgentUpdateSigner, config.AgentUpdateSignFloor, config.OperatorTenantID)
@@ -7063,10 +7095,12 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// (bound to the identity just proven) so the held flow is released. The user then retries.
 		if challengeID, ok := eastWestChallengeFromRequest(r); ok {
 			http.SetCookie(w, expiredEastWestChallengeCookie())
-			if grant, gerr := eastwest.CompleteCeremony(policyStore, eastWestAuthChallenges, challengeID, session.TenantID, session.UserID, time.Now()); gerr != nil {
+			proof := eastwest.CeremonyProof{TenantID: session.TenantID, SubjectUserID: session.UserID, DeviceID: stringPtrValue(session.DeviceID)}
+			if grant, gerr := eastwest.CompleteCeremony(policyStore, eastWestAuthChallenges, challengeID, proof, time.Now()); gerr != nil {
 				log.Printf("east_west_ceremony grant_not_issued reason=%s", gerr.Error())
 			} else {
-				log.Printf("east_west_ceremony_completed protocol=%s", grant.Protocol)
+				log.Printf("east_west_ceremony_completed protocol=%s destination=%s authenticated_by=%s held_device=%s device_verified=%t",
+					grant.Protocol, grant.Destination, grant.AuthenticatedBy, grant.DeviceID, grant.CeremonyDeviceVerified)
 				writeEastWestCeremonySuccess(w)
 				return
 			}
@@ -7135,28 +7169,38 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		log.Printf("clientless_front_door_granted tenant=%q app=%q user=%q -> connector relay", tenantID, appID, session.UserID)
 		handleConnectorApplication(w, withVerifiedClientlessSession(r, session), connAppDeps)
 	})
-	mux.HandleFunc("POST /auth/events", func(w http.ResponseWriter, r *http.Request) {
-		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
-		if !authorized {
-			return
-		}
-		var event model.AuthenticationEvent
-		if err := decodeLimitedJSONBody(w, r, &event, maxEdgeRuntimeJSONBodyBytes); err != nil {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("decode authentication event: %w", err))
-			return
-		}
-		session, err := sessionStore.CreateFromAuthenticationEvent(event, evaluator.PolicyBundle.ID, callerTenant, time.Now())
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		appendAuthenticationDomainEvent(r.Context(), domainEventOutbox, event, time.Now())
-		if err := writer.Append("audit.log.jsonl", authenticationEventAuditLog(event, session, evaluator)); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		writeJSON(w, http.StatusCreated, session)
-	})
+	// ★★★ A SESSION IS MINTED BY THE IDENTITY PROVIDER'S CALLBACK, OR BY AN ADMINISTRATOR'S BREAK-GLASS
+	// APPROVAL, AND BY NOTHING A CONNECTOR SAYS (2026-11-07, security review S1). This route accepted an authentication EVENT from any connector-class caller and turned it
+	// into a live session whose id, user, MFA state and groups were all the caller's words. Nothing in the
+	// product calls it; it was a lab harness's way of seeding a session. Outside -lab-mode a session therefore
+	// had a second birthplace that proved nothing, and every reader of a session (the application routes, the
+	// clientless front door, the decision evaluator) trusted it as if the IdP had spoken. Lab harnesses keep
+	// it; a production node does not register it at all, so the answer there is 404, the same as any other
+	// route that does not exist. See a_session_is_minted_only_by_the_identity_provider_test.go.
+	if devMode {
+		mux.HandleFunc("POST /auth/events", func(w http.ResponseWriter, r *http.Request) {
+			callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+			if !authorized {
+				return
+			}
+			var event model.AuthenticationEvent
+			if err := decodeLimitedJSONBody(w, r, &event, maxEdgeRuntimeJSONBodyBytes); err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("decode authentication event: %w", err))
+				return
+			}
+			session, err := sessionStore.CreateFromAuthenticationEvent(event, evaluator.PolicyBundle.ID, callerTenant, time.Now())
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			appendAuthenticationDomainEvent(r.Context(), domainEventOutbox, event, time.Now())
+			if err := writer.Append("audit.log.jsonl", authenticationEventAuditLog(event, session, evaluator)); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			writeJSON(w, http.StatusCreated, session)
+		})
+	}
 	mux.HandleFunc("POST /break-glass/requests", adminEndpoint("admin.break_glass.write", func(w http.ResponseWriter, r *http.Request) {
 		var req breakGlassSessionRequest
 		if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
@@ -8138,7 +8182,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// mTLS device + trusted posture) instead of an impossible OOB ceremony (EastWestRule.DeviceAttestedAuto).
 		// Empty when no posture was reported (fail-closed: no posture => not device-attestation-eligible).
 		connectDeviceTrustLevel := ""
-		if p, ok := deviceRuntime.ingestFromConnect(transportDeviceID, runtimeEvaluator.PolicyBundle.TenantID, r.Header, sourceIPFromRequest(r), time.Now()); ok {
+		if p, ok := ingestSteerMuxConnect(deviceRuntime, r, tcaReg, runtimeEvaluator.PolicyBundle.TenantID, transportDeviceID, time.Now()); ok {
 			// The steer-mux CONNECT carries only the NETWORK-ADMISSION posture axes (disk-encryption + firewall),
 			// so derive its trust tier against JUST those axes (honoring the env toggles for them). Requiring a
 			// signal this channel never carries (screen-lock / agent-health / OS-version, part of the FULL device
@@ -8274,6 +8318,15 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			}
 			port, _ := strconv.Atoi(portStr)
 			req := steerDecisionRequest(flowTenant, host, port)
+			// ★ THE OBSERVED TUNNEL SOURCE, AS THE INTERCEPT PATH RECORDS IT (2026-11-04, found on a fresh single-machine
+			// install: allowed https rows named the device's address and the denied row beside them showed "—"). A flow
+			// decided here at the mux OPEN — every denial, and every non-https flow — wrote no source at all.
+			if src := edgeplane.RemoteAddrString(clientConn); src != "" {
+				if h, _, splitErr := net.SplitHostPort(src); splitErr == nil {
+					src = h
+				}
+				req.SourceIP = src
+			}
 			// Classify a custom-port flow on a live governed Connector route as
 			// Connector Access before evaluating policy. A client-supplied connector
 			// identifier is never used as this proof.
@@ -8395,7 +8448,20 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			// unconditionally, so one logging policy governs every path. Note what that guarantees here: a deny or
 			// a step-up is ALWAYS recorded (a rule's log=false cannot suppress a policy action), which is exactly
 			// the case the stderr breadcrumbs were the only witness for.
-			if shouldLogAccessDecision(dec) {
+			// A decision that needs the user's sign-in is recorded below, once it is known whether this flow is
+			// HELD for it or already let through by a sign-in that happened earlier (see
+			// access_log_after_authentication.go). Recording it here wrote "authenticate_required" for every flow
+			// the user had already signed in for.
+			authRecordedLater := federatedAuthGateForEgress != nil && decisionRequiresOIDCRedirect(dec.Decision)
+			if shouldLogAccessDecision(dec) && !authRecordedLater {
+				if err := appendAccessDecisionLogs(r.Context(), writer, domainEventOutbox, dec, time.Now()); err != nil {
+					logErrorf("steer_mux_access_log_failed dst_port=%d decision=%s: %v", port, dec.Decision, err)
+				}
+			}
+			logHeldForAuthentication := func() {
+				if !authRecordedLater {
+					return
+				}
 				if err := appendAccessDecisionLogs(r.Context(), writer, domainEventOutbox, dec, time.Now()); err != nil {
 					logErrorf("steer_mux_access_log_failed dst_port=%d decision=%s: %v", port, dec.Decision, err)
 				}
@@ -8425,12 +8491,15 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				if federatedAuthGateForEgress != nil && decisionRequiresOIDCRedirect(dec.Decision) {
 					_, matched, grantErr := federatedAuthGateForEgress.liveGrantStatusWithRequirements(dec.TenantID, transportDeviceID, requirements)
 					if grantErr != nil {
+						logHeldForAuthentication()
 						logWarnf("steer_mux_auth_authority_unavailable dst_port=%d — no new authentication ceremony issued", port)
 						return
 					}
 					if matched {
+						// Recorded by authorizeResume, as allowed after authentication, once policy is re-checked.
 						allowedByGrant = true
 					} else {
+						logHeldForAuthentication()
 						stepUpURL = federatedAuthGateForEgress.stepUpURLForRequest(r, authority, transportDeviceID, dec.TenantID, requirements)
 						if start, err := url.Parse(stepUpURL); err == nil {
 							requirements.RequestID = start.Query().Get("request_id")
@@ -8485,11 +8554,19 @@ func newServerWithConfig(config serverConfig) http.Handler {
 						}, requirements.RequestID, requirements.OSPrincipal, requirements.OSSession)
 					if !permitted {
 						log.Printf("steer_mux_auth_resume_denied device=%q", transportDeviceID)
+						refused := decisionRefusedAtResume(dec, current)
+						if err := appendAccessDecisionLogs(r.Context(), writer, domainEventOutbox, refused, time.Now()); err != nil {
+							logErrorf("steer_mux_auth_resume_audit_failed: %v", err)
+						}
 						return false
 					}
 					dec = current
+					if decisionRequiresOIDCRedirect(dec.Decision) {
+						// permitted means the authentication this decision asks for was verified; say so.
+						dec = decisionAllowedByAuthentication(dec)
+					}
 					decisionStore.Upsert(dec)
-					if shouldLogAccessDecision(dec) {
+					if shouldLogAccessDecision(dec) || decisionWasAllowedByAuthentication(dec) {
 						if err := appendAccessDecisionLogs(r.Context(), writer, domainEventOutbox, dec, time.Now()); err != nil {
 							logErrorf("steer_mux_auth_resume_audit_failed: %v", err)
 						}
@@ -8548,9 +8625,15 @@ func newServerWithConfig(config serverConfig) http.Handler {
 						// allowed flow does not take this branch), it is what somebody is looking for, and
 						// without it the only remaining explanation is the network.
 						logWarnf("steer_mux_denied device=%q host=%s dst_port=%d family=%s decision=%s reason=%q "+
-							"— the flow was closed with no bytes; from the device this looks like a network "+
-							"failure, so this line is the only place it does not",
+							"— web traffic this Edge can answer is shown the refusal page; anything else is closed "+
+							"with no bytes, which from the device looks like a network failure, so this line is the "+
+							"only place it does not",
 							transportDeviceID, host, port, req.ServiceFamily, dec.Decision, steerDenialReason(dec))
+						// A refusal decided here is answered the way a refusal at the request is: with the page,
+						// written by this Edge, and nothing dialled. See a_refused_web_flow_is_answered_with_the_page.go.
+						serveSteerRefusalPage(vc, edgeplane.NetworkExtensionRuntimeCopyTCPRoute{
+							Host: host, Port: port, DeviceIdentity: transportDeviceID, TenantID: req.TenantID,
+						}, req.ServiceFamily, config.NetworkExtensionLabTLS, dec)
 						return
 					}
 				}
@@ -8668,6 +8751,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// The flow tenant's residency boundary (allowed regions) — the reach layer denies a connector whose region is
 	// outside it. Resolved per-flow from the admin tenant model; nil for an unpinned tenant (no restriction).
 	tenantResidency := tenantResidencyResolver(tenantModelStore)
+	// The live tunnels as every egress path that serves a DEVICE sees them: which connectors are here, and which
+	// just left — a flow for one that is moving between Regions is held, not refused. The mesh ingress below
+	// keeps the plain manager on purpose: it cannot relay onward, so holding a relayed flow buys nothing.
+	// See a_connector_that_just_left_is_waited_for.go.
+	egressTunnels := tunnelsThatRememberDepartures{Manager: tunnelManager, departures: connectorDepartures}
 	// Multi-region MESH: peerEdges/meshEligible come from -mesh-peers/-mesh-eligible-hosts. Both nil when
 	// the fabric is unconfigured, so mesh fails closed (self-gating) and every cross-region app hairpins.
 	if config.SWGEgressBrowserMimic {
@@ -8677,7 +8765,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// knowledge of the route layer — would direct-dial into internal address space, where the SSRF pre-flight
 		// then refuses it. Without this split, publishing an app behind a connector makes it UNREACHABLE from a
 		// steered browser, which is the core promise of the product.
-		mimicConnectorDial := edgeplane.ConnectorEgressDialContextWithCandidates((&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Control: swg.EgressControl}).DialContext, connectorDestinationResolver(registry), connectorDestinationCandidates(registry), tunnelManager, networkExtensionRuntimeCopyTenantID, evaluator.EdgeRegionID, tenantResidency, config.PeerEdges, config.MeshEligible)
+		mimicConnectorDial := edgeplane.ConnectorEgressDialContextWithCandidates((&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Control: swg.EgressControl}).DialContext, connectorDestinationResolver(registry), connectorDestinationCandidates(registry), egressTunnels, networkExtensionRuntimeCopyTenantID, evaluator.EdgeRegionID, tenantResidency, config.PeerEdges, config.MeshEligible)
 		mimicConnectorTransport := &http.Transport{
 			DialContext:         mimicConnectorDial,
 			MaxIdleConns:        256,
@@ -8743,7 +8831,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	} else {
 		// Engine unchanged on this branch: with the browser-faithful engine off there is nothing to choose, and
 		// the external route keeps the client the deployment handed in. Only the ENGINE has to be paired.
-		swgEgressDeviceConfig.ProxyClient = edgeplane.ConnectorAwareProxyClient(proxyClient, connectorDestinationResolver(registry), tunnelManager, networkExtensionRuntimeCopyTenantID, evaluator.EdgeRegionID, tenantResidency, config.PeerEdges, config.MeshEligible)
+		swgEgressDeviceConfig.ProxyClient = edgeplane.ConnectorAwareProxyClient(proxyClient, connectorDestinationResolver(registry), egressTunnels, networkExtensionRuntimeCopyTenantID, evaluator.EdgeRegionID, tenantResidency, config.PeerEdges, config.MeshEligible)
 	}
 	// Only the steered (decrypt-all) device path gets the federated-auth gate: an "authenticate" decision on
 	// a browser flow redirects to the IdP instead of 401. The external connector route keeps serving 401.
@@ -8770,7 +8858,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	networkExtensionRuntimeCopySessionDialer = edgeplane.ConnectorEgressDialer{
 		ResolveConnector: connectorDestinationResolver(registry),
 		ListConnectors:   connectorDestinationCandidates(registry),
-		Tunnels:          tunnelManager,
+		Tunnels:          egressTunnels,
 		TenantID:         networkExtensionRuntimeCopyTenantID,
 		LocalRegion:      evaluator.EdgeRegionID,
 		Residency:        tenantResidency,
@@ -8999,9 +9087,29 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// ★★★ AND THE AUTHORITY LEARNS THAT IT IS ALIVE. Without this the control plane's copy stops at the
 		// moment of registration and every connector reads Offline on the Console for ever — see
 		// a_connectors_liveness_has_to_reach_the_authority.go, found by looking at the screen.
+		//
+		// ★★★ AND ONLY THE NODE HOLDING ITS TUNNEL SAYS WHERE IT IS (2026-11-07, 0.4.1 acceptance B). This report
+		// names THIS region as where the connector is attached, and the authority takes the last such report as the
+		// truth. A heartbeat is not a tunnel: the one a connector sends in the second it changes door lands on the
+		// node it is leaving, and once the connector redials at once (it does now — see the connector's tunnel
+		// loop), that report can arrive after the new node's and put the deployment's answer back where the
+		// connector no longer is, for up to connectorLivenessFloor. A report without the region is no fix: the
+		// authority then writes this node's whole copy of the registration back, which is the stale overwrite the
+		// attachment path exists to avoid. So a node without the tunnel carries nothing; the connector's next
+		// heartbeat reaches the node that has it, through the same door.
+		//
+		// ★ AND A NODE WITHOUT THE TUNNEL STILL CARRIES THAT IT IS ALIVE (review of 2026-11-07). The multi-node
+		// layouts balance the agent door by least connections, so a heartbeat lands on whichever node has the
+		// fewest connections, tunnel or not; a node that carried nothing would leave the authority's
+		// last_heartbeat frozen for as long as that lasted. So it carries the liveness alone — marked so the
+		// authority records that and nothing else. See connectorReport.LivenessOnly.
 		if connectorCPReport != nil && connectorLiveness.shouldCarry(conn.ID, conn.Status, evaluator.EdgeRegionID, time.Now()) {
-			connectorCPReport.Report(connectorReport{Registration: conn, TenantID: conn.TenantID,
-				AttachedRegionID: evaluator.EdgeRegionID})
+			if _, holdsItsTunnel := tunnelManager.Get(conn.ID); holdsItsTunnel {
+				connectorCPReport.Report(connectorReport{Registration: conn, TenantID: conn.TenantID,
+					AttachedRegionID: evaluator.EdgeRegionID})
+			} else {
+				connectorCPReport.Report(connectorReport{Registration: conn, TenantID: conn.TenantID, LivenessOnly: true})
+			}
 		}
 		if discoveryErr != nil {
 			log.Printf("connector %q heartbeat recorded; route discovery not saved: %v", conn.ID, discoveryErr)
@@ -9076,11 +9184,19 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		func(ctx context.Context, tenantID string) ([]regionEndpoint, error) {
 			return tenantProfileRegionEndpointsChecked(ctx, regionMap.Catalog(), tenantModelStore, tenantID,
 				strings.TrimSpace(config.ConnectorEnrollmentEdgeURL), evaluator.EdgeRegionID)
-		}, func(cid string) string {
-			if c, ok := registry.Get(cid); ok {
-				return c.ConnectorGroupID
+		}, func(ctx context.Context, tenantID, cid string) (string, []string, string) {
+			c, ok := registry.Get(cid)
+			if !ok {
+				return "", nil, ""
 			}
-			return ""
+			// The site's chosen door order travels with the site in the config bundle, so every Edge answers
+			// a connector in the same order (a_site_chooses_the_order_of_its_doors.go).
+			if config.SiteStore != nil && strings.TrimSpace(c.ConnectorGroupID) != "" {
+				if site, found, err := config.SiteStore.Get(ctx, tenantID, c.ConnectorGroupID); err == nil && found {
+					return c.ConnectorGroupID, site.DoorOrder, site.Region
+				}
+			}
+			return c.ConnectorGroupID, nil, ""
 		})
 	mux.HandleFunc("GET /connectors/{connector_id}/tunnel", func(w http.ResponseWriter, r *http.Request) {
 		connectorID := r.PathValue("connector_id")
@@ -9109,6 +9225,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		}
 		tunnelID := randomEdgeID("tun_", time.Now().UTC())
 		session, reconnect := tunnelManager.Register(connectorID, tunnelID, wsConn)
+		connectorDepartures.arrived(connectorID)
 		log.Printf("connector_tunnel_attached connector=%s node=%s region=%s reconnect=%t — flows for what this connector fronts can be served from THIS node, and only this node",
 			connectorID, edgeNodeIdentity(), evaluator.EdgeRegionID, reconnect)
 		// ★★★ SAY WHERE IT IS, NOT WHERE IT SAID IT WOULD BE. This node is terminating the tunnel, so it is the
@@ -9116,7 +9233,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// wherever it enrolled, which after a failover is the region it LEFT. Recorded as runtime state, so a
 		// connector moving between regions cannot move the deployment's config generation.
 		if recorder, ok := registry.(connectorAttachmentRecorder); ok {
-			if moved, err := recorder.RecordAttachedRegion(connectorID, evaluator.EdgeRegionID); err != nil {
+			if moved, err := recorder.RecordAttachedRegion(conn.TenantID, connectorID, evaluator.EdgeRegionID); err != nil {
 				log.Printf("could not record where connector %s is attached (%s): %v — until this succeeds, "+
 					"Edges elsewhere route this connector to whatever region its registration names", connectorID, evaluator.EdgeRegionID, err)
 			} else if moved {
@@ -9139,6 +9256,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		}
 		runErr := session.Run()
 		tunnelManager.Unregister(connectorID, tunnelID)
+		// A newer tunnel for the same connector may already have replaced this one on this node; only when none
+		// is left has the connector LEFT, and only then is what arrives for it worth holding for a moment.
+		if _, stillHere := tunnelManager.Get(connectorID); !stillHere {
+			connectorDepartures.departed(connectorID)
+		}
 		details := map[string]any{"tunnel_id": tunnelID}
 		if runErr != nil {
 			details["reconnect_reason"] = runErr.Error()
@@ -10397,9 +10519,8 @@ func denyRuntimeEvidence(dec model.AccessDecision, reason string, reasonCodes []
 }
 
 func sessionIDFromRequest(r *http.Request) string {
-	if value := r.URL.Query().Get("session_id"); value != "" {
-		return value
-	}
+	// A session id is a bearer credential. It is read from a header or a cookie and never from the query
+	// string, where it would land in access logs, proxies and browser history (security review S1).
 	if value := r.Header.Get("x-session-id"); value != "" {
 		return value
 	}

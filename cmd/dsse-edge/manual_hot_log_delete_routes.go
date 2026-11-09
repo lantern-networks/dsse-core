@@ -46,6 +46,8 @@ func registerManualHotLogDeleteRoutes(mux *http.ServeMux, adminEndpoint func(str
 		}
 		return job, true
 	}
+	// control-plane-only: the deletion manager is built only with -is-control-plane; an Edge registers this
+	// route and answers 503 without accepting anything, and the Console sends it to the control plane.
 	mux.HandleFunc("POST /admin/manual-hot-log-delete/preview", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
 		if manager == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("shared manual hot-log deletion is unavailable"))
@@ -124,6 +126,8 @@ func registerManualHotLogDeleteRoutes(mux *http.ServeMux, adminEndpoint func(str
 		}
 		writeJSON(w, http.StatusOK, job)
 	}))
+	// control-plane-only: the deletion manager is built only with -is-control-plane; an Edge registers this
+	// route and answers 503 without accepting anything, and the Console sends it to the control plane.
 	mux.HandleFunc("POST /admin/manual-hot-log-delete/{job_id}/confirm", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
 		job, ok := read(w, r)
 		if !ok {
@@ -164,6 +168,8 @@ func registerManualHotLogDeleteRoutes(mux *http.ServeMux, adminEndpoint func(str
 		}
 		writeJSON(w, http.StatusAccepted, updated)
 	}))
+	// control-plane-only: the deletion manager is built only with -is-control-plane; an Edge registers this
+	// route and answers 503 without accepting anything, and the Console sends it to the control plane.
 	mux.HandleFunc("POST /admin/manual-hot-log-delete/{job_id}/cancel", adminEndpoint("admin.tenant.admin", func(w http.ResponseWriter, r *http.Request) {
 		if manager == nil || manager.hotCH == nil || !manualHotLogDeleteDeploymentHistoryAllowed(r) {
 			writeError(w, http.StatusForbidden, fmt.Errorf("deployment operator is required"))

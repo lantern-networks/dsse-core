@@ -35,6 +35,9 @@ public struct DsseUpdateReport: Sendable {
     /// The architecture the device RUNS ON, a separate fact from the platform. Without it the Edge guessed a
     /// constant per OS (macOS meant arm64), so an Intel Mac was compared against a release it cannot run.
     public let arch: String
+    /// An `installed` report that says only that a refusal reported earlier no longer applies (the Go updater's
+    /// AppendRefusalCleared). Carried to the Edge so the fleet's success rate does not count it as an install.
+    public let refusalCleared: Bool
 
     init?(fileURL: URL, json: [String: Any]) {
         guard let status = json["status"] as? String, !status.isEmpty,
@@ -52,6 +55,7 @@ public struct DsseUpdateReport: Sendable {
         self.rejectedDigest = json["rejected_digest"] as? String ?? ""
         self.platform = json["platform"] as? String ?? ""
         self.arch = json["arch"] as? String ?? ""
+        self.refusalCleared = json["refusal_cleared"] as? Bool ?? false
     }
 }
 
@@ -233,6 +237,9 @@ public enum DsseUpdateReportStore {
         if !report.fromVersion.isEmpty { meta["from_version"] = report.fromVersion }
         if report.status == "rolled_back" { meta["rolled_back"] = true }
         if report.status == "refused" { meta["refused"] = true }
+        // ★ A CLEARED REFUSAL IS NOT AN INSTALL (2026-11-05). It goes as `installed` so the
+        // Devices screen puts the device back in step, and with this mark so the success rate does not count it.
+        if report.refusalCleared { meta["refusal_cleared"] = true }
         // ★ THE ONLY THING THAT IDENTIFIES A REFUSAL OF AN UNVERIFIABLE DOCUMENT. Without it the fleet sees "no
         // version, generic signature error" and cannot tell a second substituted document from a repeat.
         if !report.rejectedDigest.isEmpty { meta["rejected_manifest_sha256"] = report.rejectedDigest }

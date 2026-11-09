@@ -114,7 +114,12 @@ profile still contains all three origins as failover candidates; it does not
 make an Edge serve every Portal. Cross-Region DNS takeover of an existing
 Portal hostname is not part of this topology. Another authorized Region can
 serve a **new** authentication request through its own Portal origin.
-Verify it locally with `dsse-install -verify-portal-certificate -dir <deployment-directory>`. Origin
+Verify it locally with `dsse-install -verify-portal-certificate -dir <deployment-directory>`.
+The final `-verify` of the install order runs on the founding control-plane machine, which holds
+no Edge and so no Portal certificate. When the Portals' certificates come from a CA that the machine
+running `-verify` does not already trust (a browser trusting it is not enough: the check runs on
+that machine, not in a browser), give that CA's certificate to the check with `-portal-ca <file>`
+(the CA certificate only, never a Portal key); without it the Portal check measures no pairs and fails. Origin
 selection uses an explicit allowlist, with one fixed OIDC redirect URI and recovery
 binding per origin. Multi-Edge authentication starts require a verified endpoint request and
 active ceremony recovery; anonymous process-local starts are refused.

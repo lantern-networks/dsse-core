@@ -38,11 +38,12 @@ func TestPostgresAdminSiteSchemaSecurityContracts(t *testing.T) {
 	}
 }
 
-// TestPostgresAdminSiteMigrationVersions confirms the component migration set is the single 025 migration.
+// TestPostgresAdminSiteMigrationVersions confirms the component migration set: the table (025), then the door
+// order a site gives its connectors (061, acceptance C third walk).
 func TestPostgresAdminSiteMigrationVersions(t *testing.T) {
 	versions := postgresAdminSiteMigrationVersions()
-	if len(versions) != 1 || versions[0] != postgresMigrationAdminSites {
-		t.Fatalf("site migration versions = %#v, want [%s]", versions, postgresMigrationAdminSites)
+	if len(versions) != 2 || versions[0] != postgresMigrationAdminSites || versions[1] != postgresMigrationAdminSiteDoorOrder {
+		t.Fatalf("site migration versions = %#v, want [%s %s]", versions, postgresMigrationAdminSites, postgresMigrationAdminSiteDoorOrder)
 	}
 }
 

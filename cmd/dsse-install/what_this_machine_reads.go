@@ -185,6 +185,7 @@ var installerReadsFromDeploymentEnv = []string{
 	"DSSE_RECOVERY_SNI",
 	"DSSE_REGION_ENDPOINTS",
 	"DSSE_AUTHORITY_ORIGIN",
+	"DSSE_AUTH_ROLLOUT_REPORT_ORIGIN",
 	"ADMIN_CONSOLE_ORIGIN",
 	// ★★★ AND THE TWO DOORS' PEERS (2026-08-28). This program reads them when it renders a region's doorway,
 	// and the carry withheld them because no compose SERVICE names them — so a machine that later re-rendered
@@ -192,6 +193,8 @@ var installerReadsFromDeploymentEnv = []string{
 	// only what its containers read; this installer runs there too.
 	"DSSE_CP_PEERS",
 	"DSSE_CP_DATA_PEERS",
+	"DSSE_CP_DOORWAY_PEERS",
+	"DSSE_CP_DATA_DOORWAY_PEERS",
 	"DSSE_PG_PEERS",
 }
 

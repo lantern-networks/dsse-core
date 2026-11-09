@@ -19,7 +19,8 @@ For configuration and current enforcement limits, see [IdP integration](idp.md),
 ## One binary, two roles
 
 `dsse-edge` is the Edge. Told so with `-control-plane`, the same binary is the control plane. They differ in
-what they hold, and each node reports that about itself at `GET /healthz` (`role`, `holds_database`).
+what they hold, and each node reports that about itself to the operator at `GET /healthz` (`role`,
+`holds_database`). Without the operator's credential `/healthz` answers only the status, and `/metrics` answers 401.
 
 ```
    device agent                         Edge (dsse-edge)                control plane (dsse-edge -control-plane)

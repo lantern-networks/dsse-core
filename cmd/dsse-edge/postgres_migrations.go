@@ -41,6 +41,7 @@ const (
 	postgresMigrationAdminTenantModel            = "023"
 	postgresMigrationAdminTenantModelOperator    = "024"
 	postgresMigrationAdminSites                  = "025"
+	postgresMigrationAdminSiteDoorOrder          = "061"
 	postgresMigrationApplicationCatalog          = "026"
 	postgresMigrationApplicationCatalogImport    = "057"
 	postgresMigrationObservedExclusions          = "027"
@@ -217,6 +218,7 @@ func postgresAgentTelemetryMigrationVersions() []string {
 func postgresAdminSiteMigrationVersions() []string {
 	return []string{
 		postgresMigrationAdminSites,
+		postgresMigrationAdminSiteDoorOrder,
 	}
 }
 

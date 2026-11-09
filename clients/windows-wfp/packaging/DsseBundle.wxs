@@ -8,7 +8,7 @@
   signed artifact for distribution. The packaged agent is pure Go + a kernel driver, so it needs NO VC++ redist.
 
   Build:
-    wix build DsseBundle.wxs -ext WixToolset.BootstrapperApplications.wixext/7.0.0 -ext WixToolset.Util.wixext/7.0.0
+    wix build DsseBundle.wxs -ext WixToolset.BootstrapperApplications.wixext/7.0.1 -ext WixToolset.Util.wixext/7.0.1
               -b <dir-with-DsseAgent.msi> -d Version=x.y.z -o DsseAgentSetup.exe
 -->
 <!-- Guarded: an unguarded <?define?> WINS over the build's -d, so it is an override wearing a default's

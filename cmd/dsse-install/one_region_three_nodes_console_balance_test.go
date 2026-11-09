@@ -14,10 +14,12 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/frontdoor"
 )
 
 func TestOneRegionThreeNodesConsoleOrderIsStable(t *testing.T) {
-	ordered, err := oneRegionThreeNodesConsoleBackends("10.20.0.1:19544,10.20.0.2:19544,10.20.0.3:19544", "console.example.test")
+	ordered, err := oneRegionThreeNodesConsoleBackends("10.20.0.1:19544,10.20.0.2:19544,10.20.0.3:19544", "console.example.test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +27,7 @@ func TestOneRegionThreeNodesConsoleOrderIsStable(t *testing.T) {
 		"10.20.0.3:19544,10.20.0.1:19544,10.20.0.2:19544",
 		"10.20.0.2:19544,10.20.0.3:19544,10.20.0.1:19544",
 	} {
-		got, err := oneRegionThreeNodesConsoleBackends(raw, "console.example.test")
+		got, err := oneRegionThreeNodesConsoleBackends(raw, "console.example.test", "")
 		if err != nil || got != ordered {
 			t.Errorf("Console candidates depend on input order: %v\n%s", err, got)
 		}
@@ -43,7 +45,7 @@ func TestOneRegionThreeNodesConsoleSelectsOneCandidateDuringOverlap(t *testing.T
 	var consoles [3]*httptest.Server
 	for i := range consoles {
 		name := fmt.Sprintf("console-%d", i+1)
-		consoles[i] = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		consoles[i] = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/ready" {
 				if ready[i].Load() {
 					w.WriteHeader(http.StatusOK)
@@ -54,9 +56,13 @@ func TestOneRegionThreeNodesConsoleSelectsOneCandidateDuringOverlap(t *testing.T
 			}
 			fmt.Fprint(w, name)
 		}))
+		// The doorway now states the browser's address with send-proxy (review R2), so a Console stand-in
+		// reads the header the way the Console does, from the doorway's address.
+		consoles[i].Listener = frontdoor.NewProxyProtocolListener(consoles[i].Listener, frontdoor.ParseTrustedNets("127.0.0.1"))
+		consoles[i].StartTLS()
 		t.Cleanup(consoles[i].Close)
 	}
-	backend, err := oneRegionThreeNodesConsoleBackends("10.20.0.1:19544,10.20.0.2:19544,10.20.0.3:19544", "console.example.test")
+	backend, err := oneRegionThreeNodesConsoleBackends("10.20.0.1:19544,10.20.0.2:19544,10.20.0.3:19544", "console.example.test", "")
 	if err != nil {
 		t.Fatal(err)
 	}

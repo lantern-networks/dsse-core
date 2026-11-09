@@ -861,6 +861,14 @@ func registerConnectorReportRoute(mux *http.ServeMux, registry connectorRegistry
 			// AttachedRegionID marks an ATTACHMENT report: a node saying where this connector's tunnel is
 			// terminating NOW, which is not what the connector declared when it enrolled.
 			AttachedRegionID string `json:"attached_region_id,omitempty"`
+			// LivenessOnly marks a report from a node that received the connector's heartbeat without holding
+			// its tunnel: the heartbeat and status are taken, and nothing else — not where the connector is,
+			// and not the reporter's copy of the registration.
+			LivenessOnly bool `json:"liveness_only,omitempty"`
+			// QueuedAt is when the reporting Edge made this report — when it observed what it says. A report
+			// replayed from the Edge's outbox keeps it, so the authority can tell an old observation from a new
+			// one (review C3-R5).
+			QueuedAt string `json:"queued_at,omitempty"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("connector-report: %w", err))
@@ -884,6 +892,42 @@ func registerConnectorReportRoute(mux *http.ServeMux, registry connectorRegistry
 		// rename or their authored routes — a joining node erasing what somebody decided, which this
 		// deployment has already been bitten by more than once. Where the connector is not known yet, the
 		// registration is recorded as before, so the report is never simply lost.
+		if body.LivenessOnly {
+			// ★ A HEARTBEAT WITHOUT THE TUNNEL IS LIVENESS AND NOTHING ELSE (review of 2026-11-07). Recording the
+			// reporter's region here would put the deployment's answer back where the connector no longer is;
+			// registering its copy would be the stale overwrite the attachment path exists to avoid. A connector
+			// the authority does not know yet is not learned from a heartbeat either: its registration report
+			// is what adds it.
+			existing, known := registry.Get(reg.ID)
+			if !known {
+				log.Printf("connector_liveness_dropped connector=%q: a heartbeat-only report for a connector the "+
+					"authority does not know; its registration report adds it", reg.ID)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			if existing.TenantID != reg.TenantID {
+				writeError(w, http.StatusForbidden, fmt.Errorf("connector-report: this connector belongs to another tenant"))
+				return
+			}
+			live, recordable := registry.(connectorLivenessRecorder)
+			switch {
+			case !recordable:
+				log.Printf("connector_liveness_dropped connector=%q: this control plane's connector store cannot record liveness", reg.ID)
+			case strings.TrimSpace(reg.LastHeartbeatAt) == "":
+				log.Printf("connector_liveness_dropped connector=%q: the report carried no heartbeat time", reg.ID)
+			default:
+				if moved, err := live.RecordLiveness(reg.ID, reg.Status, reg.LastHeartbeatAt); err != nil {
+					writeError(w, http.StatusConflict, err)
+					return
+				} else if moved {
+					log.Printf("connector_liveness_recorded connector=%q heartbeat=%q status=%q (heartbeat-only report from %q)",
+						reg.ID, reg.LastHeartbeatAt, reg.Status, shipper.Identity)
+				}
+			}
+			recordConnectorRuntime(registry, reg, "", connectorReportObservedAt(body.QueuedAt, reg.LastHeartbeatAt, time.Now()))
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if region := strings.TrimSpace(body.AttachedRegionID); region != "" {
 			if recorder, ok := registry.(connectorAttachmentRecorder); ok {
 				if existing, known := registry.Get(reg.ID); known {
@@ -891,7 +935,7 @@ func registerConnectorReportRoute(mux *http.ServeMux, registry connectorRegistry
 						writeError(w, http.StatusForbidden, fmt.Errorf("connector-report: this connector belongs to another tenant"))
 						return
 					}
-					if _, err := recorder.RecordAttachedRegion(reg.ID, region); err != nil {
+					if _, err := recorder.RecordAttachedRegion(reg.TenantID, reg.ID, region); err != nil {
 						writeError(w, http.StatusConflict, err)
 						return
 					}
@@ -937,16 +981,29 @@ func registerConnectorReportRoute(mux *http.ServeMux, registry connectorRegistry
 								reg.ID, reg.LastHeartbeatAt, reg.Status)
 						}
 					}
+					recordConnectorRuntime(registry, reg, region, connectorReportObservedAt(body.QueuedAt, reg.LastHeartbeatAt, time.Now()))
 					w.WriteHeader(http.StatusNoContent)
 					return
 				}
 			}
 			reg.AttachedRegionID = region
 		}
+		// ★ A REGISTRATION REPORT DOES NOT CARRY THE RUNTIME FACTS INTO THE CATALOGUE (review C3-RR2, C3-RRR2).
+		// This path replaces the stored registration, and the facts an Edge reported about the connector since —
+		// version, uptime, where its tunnel is, and when that was observed — rode along in its metadata, so a
+		// registration replayed from an outbox after a newer report put the old version and uptime back and
+		// erased the tunnel. Register keeps the held facts itself, inside its own lock or transaction
+		// (connector.PreserveHeldRuntime): kept from a Get made here first, a newer fact recorded in between was
+		// still lost. The report's own facts are offered to recordConnectorRuntime, which takes them only when
+		// they were observed later than what is held.
+		reported := reg
+		reported.Metadata = copyConnectorMetadata(reg.Metadata)
+		observed := connectorReportObservedAt(body.QueuedAt, reg.LastHeartbeatAt, time.Now())
 		if _, err := registry.Register(reg, time.Now()); err != nil {
 			writeError(w, http.StatusConflict, err)
 			return
 		}
+		recordConnectorRuntime(registry, reported, "", observed)
 		log.Printf("connector_report accepted from %q: %q joined %q", shipper.Identity, reg.ID, body.TenantID)
 		w.WriteHeader(http.StatusNoContent)
 	})

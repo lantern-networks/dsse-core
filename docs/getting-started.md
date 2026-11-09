@@ -124,9 +124,16 @@ this at all: you would bootstrap a named administrator and close the break-glass
 curl --cacert tls.crt https://localhost:18443/healthz
 ```
 
-It answers a JSON document rather than `ok` — the region it believes it is in, whether it holds a database,
-where its logs go and whether they are durable, and which address families it can egress on. On a first run
-the useful line is `"status":"ok"`.
+Asked like that, with no credential, it answers `{"status":"ok"}` and nothing else: whether a node takes traffic
+is for anybody, including a load balancer, and what the node is belongs to the operator. Ask as the operator
+and it answers a JSON document — the region it believes it is in, whether it holds a database, where its logs
+go and whether they are durable, and which address families it can egress on:
+
+```sh
+curl --cacert tls.crt -H "Authorization: Bearer labtoken" https://localhost:18443/healthz
+```
+
+On a first run the useful line is still `"status":"ok"`.
 
 A decision:
 

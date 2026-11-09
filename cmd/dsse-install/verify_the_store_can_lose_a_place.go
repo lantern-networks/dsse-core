@@ -76,15 +76,24 @@ func storeSurvivalByPlace(members []storeMemberReport) (storeQuorumSurvival, err
 // losing one of the places those members sit in leaves a quorum.
 func verifyTheStoreCanLoseAPlace(dir string, env map[string]string) []verifyResult {
 	hosts := storeClientHosts(env["DSSE_ETCD_HOSTS"])
-	if !strings.EqualFold(strings.TrimSpace(env["DSSE_ETCD_CLIENT_SCHEME"]), "https") || len(hosts) == 0 {
-		// ★ A ONE-HOST DEPLOYMENT HAS NOTHING TO SAY HERE, and saying nothing is the honest answer: its store
-		// is three members on the machine that is the deployment, and losing that machine loses everything
-		// either way. This check is about a store whose members are in different places.
+	// ★ A ONE-HOST DEPLOYMENT HAS NOTHING TO SAY HERE, and saying nothing is the honest answer: its store is
+	// the machine that is the deployment, and losing that machine loses everything either way. This check is
+	// about a store whose members are in different places.
+	//
+	// ★★ AND THE SHAPE IS ASKED THE WAY EVERY OTHER CHECK HERE ASKS IT (0.4.1 final acceptance A, 2026-11-09).
+	// This used to recognise one host by its store speaking plain HTTP. Security review S4 (2026-11-07) put the
+	// one-host store on TLS with client certificates — correctly — and from then on the published single-region
+	// layout failed its own -verify with "1 voting member(s) in 1 place(s) … LOSING ONE LEAVES 0", reporting
+	// a deployment installed exactly as documented as not ready to hand over. The layouts walked after S4 were
+	// all multi-machine, so nothing noticed until the single-machine one was walked again. The test for "one
+	// machine" is deploymentIsASingleMachine, which the doorway check beside this one already uses; the old
+	// condition stays only for a store this walk could not ask anyway.
+	if deploymentIsASingleMachine(dir) || !strings.EqualFold(strings.TrimSpace(env["DSSE_ETCD_CLIENT_SCHEME"]), "https") || len(hosts) == 0 {
 		return []verifyResult{{
 			ok:   true,
 			name: "the consensus store spans places",
 			note: "this deployment keeps state in one place, so there is no place it can lose — the question " +
-				"this asks does not apply to it",
+				"this asks does not apply to it. " + singleMachineNote("consensus store"),
 		}}
 	}
 	client, err := storeClient(dir)

@@ -343,6 +343,8 @@ func (s *Store) Stash(src, version string) (string, error) {
 		} else if !os.IsNotExist(packageErr) {
 			return "", fmt.Errorf("rollbackstore: stat existing package before replacement: %w", packageErr)
 		}
+		// durable-write: staged — not a write: the temporary file only reserves a unique holding name for moving an
+		// existing marker aside, and is removed before the rename.
 		placeholder, createErr := os.CreateTemp(s.root, namePrefix+"marker-*")
 		if createErr != nil {
 			return "", fmt.Errorf("rollbackstore: reserve marker holding path: %w", createErr)

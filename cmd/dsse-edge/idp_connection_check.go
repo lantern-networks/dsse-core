@@ -17,6 +17,15 @@ type idpConnectionCheck struct {
 	Name   string `json:"name"`
 	OK     bool   `json:"ok"`
 	Detail string `json:"detail"`
+	// Code says which outcome this is, so the Console can say it in the reader's language; Detail stays the
+	// English sentence for logs and as the screen's tooltip (2026-11-07, three-region acceptance rerun: the
+	// results read "reachable, 2 RSA key(s)" and "issuer matches, endpoints agree" on a Japanese screen).
+	Code string `json:"code,omitempty"`
+	// RSAKeys is how many RSA signing keys the provider publishes, for code jwks_ok.
+	RSAKeys int `json:"rsa_keys,omitempty"`
+	// Differ names the endpoints the connection sets differently from the provider's discovery document, for
+	// code issuer_matches. Empty means they agree.
+	Differ []string `json:"differ,omitempty"`
 }
 
 // idpConnectionTestResult is the "Test" verdict the Console shows as OK / not-OK after registering an IdP. It
@@ -40,7 +49,7 @@ func testIdPConnection(conn idpregistry.Connection) idpConnectionTestResult {
 	client, cerr := idpHTTPClient(&http.Client{Timeout: 8 * time.Second}, conn)
 	if cerr != nil {
 		return idpConnectionTestResult{OK: false, Checks: []idpConnectionCheck{{
-			Name: "certificate authority", OK: false, Detail: cerr.Error(),
+			Name: "certificate authority", OK: false, Detail: cerr.Error(), Code: "ca_unusable",
 		}}}
 	}
 
@@ -49,15 +58,15 @@ func testIdPConnection(conn idpregistry.Connection) idpConnectionTestResult {
 	jwks := idpConnectionCheck{Name: "jwks"}
 	switch {
 	case strings.TrimSpace(conn.JWKSURI) == "":
-		jwks.Detail = "no jwks_uri configured"
+		jwks.Detail, jwks.Code = "no jwks_uri configured", "jwks_not_configured"
 	default:
 		if n, err := fetchJWKSRSAKeyCount(client, conn.JWKSURI); err != nil {
-			jwks.Detail = err.Error()
+			jwks.Detail, jwks.Code = err.Error(), "jwks_unreachable"
 		} else if n == 0 {
-			jwks.Detail = "jwks document has no RSA signing keys"
+			jwks.Detail, jwks.Code = "jwks document has no RSA signing keys", "jwks_no_rsa_keys"
 		} else {
 			jwks.OK = true
-			jwks.Detail = fmt.Sprintf("reachable, %d RSA key(s)", n)
+			jwks.Detail, jwks.Code, jwks.RSAKeys = fmt.Sprintf("reachable, %d RSA key(s)", n), "jwks_ok", n
 		}
 	}
 
@@ -67,13 +76,15 @@ func testIdPConnection(conn idpregistry.Connection) idpConnectionTestResult {
 	disc := idpConnectionCheck{Name: "discovery"}
 	discoveryHardFail := false
 	if meta, err := fetchOIDCDiscovery(client, conn.Issuer); err != nil {
-		disc.Detail = "advisory: discovery not reachable (" + err.Error() + ")"
+		disc.Detail, disc.Code = "advisory: discovery not reachable ("+err.Error()+")", "discovery_unreachable"
 	} else if !sameIssuer(meta.Issuer, conn.Issuer) {
 		disc.Detail = fmt.Sprintf("issuer mismatch: discovery=%q vs configured=%q", meta.Issuer, conn.Issuer)
+		disc.Code = "issuer_mismatch"
 		discoveryHardFail = true
 	} else {
 		disc.OK = true
-		disc.Detail = "issuer matches" + endpointAgreement(meta, conn)
+		disc.Detail, disc.Code = "issuer matches"+endpointAgreement(meta, conn), "issuer_matches"
+		disc.Differ = endpointsThatDiffer(meta, conn)
 	}
 
 	return idpConnectionTestResult{
@@ -148,6 +159,16 @@ func sameIssuer(a, b string) bool {
 // endpointAgreement appends a short note when the configured endpoints disagree with discovery (advisory — the
 // broker uses the configured endpoints, but a mismatch is usually a copy-paste error worth surfacing).
 func endpointAgreement(meta oidcDiscovery, conn idpregistry.Connection) string {
+	diffs := endpointsThatDiffer(meta, conn)
+	if len(diffs) == 0 {
+		return ", endpoints agree"
+	}
+	return ", but these differ from discovery: " + strings.Join(diffs, ", ")
+}
+
+// endpointsThatDiffer names the endpoints the connection sets differently from the provider's discovery
+// document. A connection that leaves one unset is not counted: it uses discovery's.
+func endpointsThatDiffer(meta oidcDiscovery, conn idpregistry.Connection) []string {
 	var diffs []string
 	if e := strings.TrimSpace(conn.AuthorizationEndpoint); e != "" && meta.AuthorizationEndpoint != "" && e != meta.AuthorizationEndpoint {
 		diffs = append(diffs, "authorization_endpoint")
@@ -158,8 +179,5 @@ func endpointAgreement(meta oidcDiscovery, conn idpregistry.Connection) string {
 	if e := strings.TrimSpace(conn.JWKSURI); e != "" && meta.JWKSURI != "" && e != meta.JWKSURI {
 		diffs = append(diffs, "jwks_uri")
 	}
-	if len(diffs) == 0 {
-		return ", endpoints agree"
-	}
-	return ", but these differ from discovery: " + strings.Join(diffs, ", ")
+	return diffs
 }

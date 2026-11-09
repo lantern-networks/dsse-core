@@ -101,7 +101,7 @@ func buildWFPPolicy(cfg captureConfig) (wfpPolicy, error) {
 		p.NumApps++
 	}
 	for _, sub := range apps {
-		s := strings.ToLower(strings.TrimSpace(sub))
+		s := kernelAppSubstring(sub) // lower case, no drive letter: the driver sees NT device paths
 		if s == "" {
 			continue
 		}
@@ -123,17 +123,7 @@ func buildWFPPolicy(cfg captureConfig) (wfpPolicy, error) {
 		p.NumApps++
 	}
 	seenDests := make(map[netip.AddrPort]bool)
-	for _, d := range cfg.effectiveDests() {
-		if !d.IsValid() {
-			return wfpPolicy{}, fmt.Errorf("WFP destination bypass is invalid")
-		}
-		if seenDests[d] {
-			continue
-		}
-		seenDests[d] = true
-		if p.NumDests >= wfpMaxDests {
-			return wfpPolicy{}, fmt.Errorf("WFP destination bypasses exceed the v2 ABI capacity of %d", wfpMaxDests)
-		}
+	addDest := func(d netip.AddrPort) {
 		var rule wfpDestRule
 		if d.Addr().Is4() {
 			rule.Family = afInet
@@ -147,6 +137,39 @@ func buildWFPPolicy(cfg captureConfig) (wfpPolicy, error) {
 		rule.Port = d.Port() // native order; driver converts when matching
 		p.Dests[p.NumDests] = rule
 		p.NumDests++
+	}
+	native, mapped := kernelDestinations(cfg.effectiveDests())
+	for _, d := range native {
+		if !d.IsValid() {
+			return wfpPolicy{}, fmt.Errorf("WFP destination bypass is invalid")
+		}
+		if seenDests[d] {
+			continue
+		}
+		seenDests[d] = true
+		if p.NumDests >= wfpMaxDests {
+			return wfpPolicy{}, fmt.Errorf("WFP destination bypasses exceed the v2 ABI capacity of %d", wfpMaxDests)
+		}
+		addDest(d)
+	}
+	// The IPv4-mapped forms a dual-stack socket arrives with (C18). Every authored rule is already in; these
+	// fill what room is left, and a shortfall is said out loud, because the destinations without one go back to
+	// matching only IPv4 sockets — the failure this exists for.
+	skipped := 0
+	for _, d := range mapped {
+		if seenDests[d] {
+			continue
+		}
+		if p.NumDests >= wfpMaxDests {
+			skipped++
+			continue
+		}
+		seenDests[d] = true
+		addDest(d)
+	}
+	if skipped > 0 {
+		fmt.Printf("steer_capture: WARNING %d destination exclusion(s) have no IPv4-mapped IPv6 rule (the driver "+
+			"holds %d); a dual-stack program (PowerShell, .NET) connecting to them by IPv4 is steered\n", skipped, wfpMaxDests)
 	}
 	// Verified exact-APP_ID bypass: NT device paths whose signer identity userspace verified against a signature
 	// exclusion (subject:/thumbprint:/publisher:/signed:). The kernel matches the connecting flow's ALE_APP_ID

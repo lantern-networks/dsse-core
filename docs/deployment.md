@@ -120,7 +120,7 @@ export PATH="$PWD/bin:$PATH"
 
 Use the revision associated with the release you are evaluating. Each node needs the
 server images its generated Compose file names: either the images published with the
-release (see [Using the published images](releases/0.4.0/install-multi-edge.md#using-the-published-images)),
+release (see [Server container images](releases/0.4.1/README.md#server-container-images)),
 or both service images and the data-layer images built from this revision and loaded on
 every node, following [Building](building.md#build-the-service-images).
 Keep `dsse-install` on `PATH` when changing directories. If a separate build host is used,
@@ -142,7 +142,7 @@ Replace them before minting:
 | Field | Value to supply |
 |---|---|
 | `deployment` | DNS suffix under your control; `example.test` is only a private test example |
-| `agent_publisher` | Identity expected by the endpoint package verifier, matching your signed packages; not a display name or the example placeholder. For the published 0.4.0 packages use `M4U8GSBL6C` |
+| `agent_publisher` | Identity expected by the endpoint package verifier, matching your signed packages; not a display name or the example placeholder. For the published 0.4.0 and 0.4.1 packages use `M4U8GSBL6C` |
 | `regions[].id` | Stable region identifier |
 | `founding` | `true` on exactly one region, where authorities are first minted |
 | `holds_state` | `true` on each of the three voting regions |
@@ -161,8 +161,8 @@ Replace them before minting:
 
 The examples do not name the images to run, and the installer cannot generate a
 startable deployment without them. Add `image_revision`, `service_image`,
-`console_image` and `data_layer` before minting. For the published 0.4.0 images, copy
-the values from [Using the published images](releases/0.4.0/install-multi-edge.md#using-the-published-images);
+`console_image` and `data_layer` before minting. For the published 0.4.1 images, copy
+the values from [Using the published images](releases/0.4.1/README.md#using-the-published-images);
 for images you built, see [Building](building.md). Without `data_layer`, Compose refuses
 to start with `required variable DSSE_ETCD_IMAGE is missing a value`.
 

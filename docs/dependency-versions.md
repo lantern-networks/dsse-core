@@ -1,12 +1,10 @@
 # Dependency versions
 
-Updated for the 0.4.1 candidate (November 4, 2026). This page lists what the current
-source selects. It does not carry over the 0.4.0 acceptance: a changed digest or version
-has not run in an acceptance installation until the 0.4.1 release notes say it has. The
-0.4.0 versions, published digests and scan results stay in the
-[0.4.0 release README](releases/0.4.0/README.md#server-container-images). Scan results are
-recorded against the digest that was scanned; the 0.4.1 release notes will name the final
-digests and their scans.
+Updated for the 0.4.1 release (November 9, 2026). This page lists what the 0.4.1 source
+selects. The published 0.4.1 images and their digests are in the
+[0.4.1 release README](releases/0.4.1/README.md#server-container-images); the 0.4.0 versions
+and digests stay in the [0.4.0 release README](releases/0.4.0/README.md#server-container-images).
+Scan results are recorded against the digest that was scanned.
 Release builds fix the source, Go modules, base images and native archives,
 rather than resolving them at every build. The Go module manifests and native
 archive checksums are the authoritative build inputs. The image builds also apply
@@ -41,15 +39,15 @@ digests where available.
 
 | Purpose | Image reference | Status |
 |---|---|---|
-| HAProxy public and database entry | `haproxy:3.4.7-alpine3.24@sha256:2caaf8b1a1ef67f3f1ea9b721f2821675d3ba4500fb518e23884fecb93e8dbaa` | Digest fixed (upstream rebuilt 3.4.7 on Alpine 3.24.3; both child images changed). Scan and acceptance for 0.4.1 pending |
-| ClickHouse | `clickhouse/clickhouse-server:26.8.36.3-alpine@sha256:f5443f9ffa48f0154cdd50cab39fed732201762574a27f04f1f564bbba81832d` | Unchanged from 0.4.0 (newest 26.8 LTS patch); ran in both 0.4.0 acceptance installations. Rescan for 0.4.1 pending |
+| HAProxy public and database entry | `haproxy:3.4.7-alpine3.24@sha256:2caaf8b1a1ef67f3f1ea9b721f2821675d3ba4500fb518e23884fecb93e8dbaa` | Digest fixed (upstream rebuilt 3.4.7 on Alpine 3.24.3; both child images changed). Scanned for 0.4.1 with no high or critical finding; ran in the 0.4.1 acceptance installations |
+| ClickHouse | `clickhouse/clickhouse-server:26.8.36.3-alpine@sha256:f5443f9ffa48f0154cdd50cab39fed732201762574a27f04f1f564bbba81832d` | Unchanged from 0.4.0 (newest 26.8 LTS patch). Scanned for 0.4.1 with no high or critical finding; ran in the 0.4.0 and 0.4.1 acceptance installations |
 | PostgreSQL tools base | `postgres:18.6-alpine3.24@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5` | Digest fixed (upstream rebuilt 18.6 on Alpine 3.24.3). Its bundled `gosu` binary, which the derived image removes, is expected to carry scanner findings |
-| PostgreSQL tools derived image | Builds from the pinned PostgreSQL base, removes `gosu`, uses `su-exec` | Rebuilt for the 0.4.1 candidate on the new base. Scan and acceptance of the current candidate pending. No arm64 image is published |
-| etcd source-built image | Builds from the pinned v3.7.3 commit with Go 1.27.3 and patched `x/net` | Rebuilt for the 0.4.1 candidate. Scan and acceptance of the current candidate pending. No arm64 image is published |
-| Spilo/PostgreSQL runtime | Source commit `550c5d8c183340ccd98b19098f53f1261b71539a`, Patroni 4.1.5, PostgreSQL 18.6 only, source-built WAL-G 3.0.9 | Rebuilt for the 0.4.1 candidate with the updated WAL-G. Scan and acceptance of the current candidate pending; failover and backup/restore on a published image remain open acceptance items |
+| PostgreSQL tools derived image | Builds from the pinned PostgreSQL base, removes `gosu`, uses `su-exec` | Rebuilt for 0.4.1 on the new base and published as `dsse-postgres-tools`; passed the release scan and ran in the 0.4.1 acceptance installations. No arm64 image is published |
+| etcd source-built image | Builds from the pinned v3.7.3 commit with Go 1.27.3 and patched `x/net` | Rebuilt for 0.4.1 and published as `dsse-etcd`; passed the release scan and ran in the 0.4.1 acceptance installations. No arm64 image is published |
+| Spilo/PostgreSQL runtime | Source commit `550c5d8c183340ccd98b19098f53f1261b71539a`, Patroni 4.1.5, PostgreSQL 18.6 only, source-built WAL-G 3.0.9 | Rebuilt for 0.4.1 with the updated WAL-G and published as `dsse-postgres`; passed the release scan with the WAL-G exception below and ran in the 0.4.1 acceptance installations |
 | Spilo source-build base | `ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11` | Digest fixed; updated 2026-10-29 so the build installs the current Ubuntu security updates (CVE-2026-111497 in `libbrotli1`, fixed in `1.0.9-2ubuntu0.1`); obsolete Ubuntu 18.04 locale stage removed by the source patch |
-| DSSE product and Admin Console runtime | Built from the pinned Go builder and Alpine runtime with host-platform compilation for each target architecture | Rebuilt for the 0.4.1 candidate. Scan and acceptance of the current candidate pending. No arm64 image is published |
-| Product/Console builder | `golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb` | Digest fixed (upstream rebuilt on Alpine 3.24.3). Rescan for 0.4.1 pending |
+| DSSE product and Admin Console runtime | Built from the pinned Go builder and Alpine runtime with host-platform compilation for each target architecture | Rebuilt for 0.4.1 and published as `dsse-service` and `dsse-console`; passed the release scan and ran in the 0.4.1 acceptance installations. No arm64 image is published |
+| Product/Console builder | `golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb` | Digest fixed (upstream rebuilt on Alpine 3.24.3). A build input, not distributed; the images built from it passed the 0.4.1 release scan |
 
 The selected Spilo source currently uses Ubuntu 22.04 as its base. Track an
 upstream base-image migration before Ubuntu 22.04 standard support ends in

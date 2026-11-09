@@ -56,7 +56,7 @@ the exact five scanned image digests; local tags are not release evidence.
 
 Every PostgreSQL 18 installation plan must select one immutable data-layer
 cohort before `-preflight` or `-start-node`. Use the images published with the
-release (see the [0.4.0 release README](releases/0.4.0/README.md#server-container-images))
+release (see the [0.4.1 release README](releases/0.4.1/README.md#server-container-images))
 or images you built (see [Build the data-layer images](#build-the-data-layer-images)):
 
 ```json

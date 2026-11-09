@@ -1,10 +1,10 @@
 # Release overview and known limitations
 
 **Status: experimental.** The latest published version is
-[0.4.0 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.4.0-experimental) (October 30, 2026).
+[0.4.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.4.1-experimental) (November 9, 2026).
 Its notes and `release-manifest.json` identify the source, signed packages, server
-images and checksums. The [0.4.0 documentation](releases/0.4.0/README.md) records what
-was measured, the known issue and the acceptance items that remain open.
+images and checksums. The [0.4.1 documentation](releases/0.4.1/README.md) records what
+was checked.
 The evaluation records below identify their release and dates; use the documentation
 from the revision you build.
 The [documentation index](README.md) provides the full reading path.
@@ -60,6 +60,16 @@ condition: [IdP](idp.md), [Egress](egress-policy.md), [East-West and OOB](east-w
 These are documented constraints, not a complete security audit or vulnerability inventory.
 
 ## Release evidence
+
+### 0.4.1 — November 9, 2026
+
+The release includes signed generic macOS and Windows packages, the source and English
+documentation archives, a source SBOM, a source/artifact manifest and five server
+container images, all built from one public commit whose content identity they carry;
+see [Checking the images yourself](releases/0.4.1/README.md#checking-the-images-yourself).
+The image vulnerability gate passed. Each layout in the guides was installed from its
+published plan example on Linux hosts with a Windows endpoint; the
+[acceptance record](releases/0.4.1/verification.md) lists what each covered.
 
 ### 0.4.0 — October 30, 2026
 

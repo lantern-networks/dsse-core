@@ -1,5 +1,16 @@
 import { encodeQR } from "./vendor/qr.js";
 
+// sizeActivationQR gives the rendered code a size of its own. An authenticator app reads it from a phone held to
+// the screen, so it is drawn large and with square modules.
+function sizeActivationQR(host) {
+  const svg = host && host.querySelector ? host.querySelector("svg") : null;
+  if (!svg) return;
+  svg.setAttribute("width", "200");
+  svg.setAttribute("height", "200");
+  svg.setAttribute("shape-rendering", "crispEdges");
+  svg.setAttribute("role", "img");
+}
+
 "use strict";
 
 // ---------------------------------------------------------------------------
@@ -8,7 +19,7 @@ import { encodeQR } from "./vendor/qr.js";
 // This script deliberately carries NONE of the admin feature catalog (GROUPS),
 // endpoint map, or admin fetch/render code. It does exactly three things:
 //   1. email + password + TOTP sign-in  (POST /admin/login/password -> /totp)
-//   2. account activation                (the emailed /?activate=<token> link)
+//   2. account activation                (the emailed /?activate#activate=<token> link)
 //   3. on success / existing session -> hand off to the admin console (console.html)
 // Admin sign-in is FIRST-PARTY ONLY — SSO / IdP-federated admin login was abolished (admin access must
 // not depend on an external IdP). End-user (workforce) IdP federation is a separate, unaffected feature.
@@ -18,7 +29,7 @@ import { encodeQR } from "./vendor/qr.js";
 const CONSOLE_PAGE = "console.html";
 
 // --- i18n ---
-let lang = localStorage.getItem("lang") || "en";
+let lang = (typeof window !== "undefined" && window.dsseInitialLang) ? window.dsseInitialLang() : (localStorage.getItem("lang") || "en");
 function t(key) { return (window.I18N[lang] && window.I18N[lang][key]) || window.I18N.en[key] || key; }
 function applyI18n() {
   document.documentElement.lang = lang;
@@ -54,6 +65,22 @@ async function forwardIfSignedIn() {
   return false;
 }
 
+// ★★★ ONLY A REFUSAL OF THE CREDENTIAL IS "INVALID CREDENTIALS" (2026-11-04). Every non-200 answer was shown
+// that way, including the 502 the Console returns when it cannot reach the control plane — so an administrator
+// with the right password retyped it, because the page said the password was wrong when it was never checked.
+// 400/401 are the credential; 403 and 429 carry their own reason; 5xx means nothing was checked.
+async function signInRefusal(res) {
+  if (res.status >= 500) return t("signInUnreachable").replace("{status}", String(res.status));
+  if (res.status === 403 || res.status === 429) {
+    try {
+      const j = await res.json();
+      if (j && typeof j.error === "string" && j.error) return j.error;
+    } catch (e) { /* no reason given */ }
+    return t("signInRefused").replace("{status}", String(res.status));
+  }
+  return t("invalidCredentials");
+}
+
 // --- first-party sign-in: email + password -> (challenge) -> 2FA code -> session ---
 let pendingChallenge = null;
 async function firstPartySignIn() {
@@ -68,7 +95,7 @@ async function firstPartySignIn() {
         headers: { "content-type": "application/json", accept: "application/json" },
         body: JSON.stringify({ email, password }),
       });
-      if (!res.ok) { setConn("err", t("invalidCredentials")); return; }
+      if (!res.ok) { setConn("err", await signInRefusal(res)); return; }
       const j = await res.json();
       pendingChallenge = j.challenge_token;
       document.getElementById("totp-row").style.display = "";
@@ -83,7 +110,7 @@ async function firstPartySignIn() {
       body: JSON.stringify({ challenge_token: pendingChallenge, code }),
     });
     if (!res.ok) {
-      setConn("err", t("invalidCredentials"));
+      setConn("err", await signInRefusal(res));
       pendingChallenge = null;
       document.getElementById("totp-row").style.display = "none";
       return;
@@ -96,21 +123,30 @@ async function firstPartySignIn() {
   } catch (e) { setConn("err", e.message); }
 }
 
-// --- activation (from the emailed link: /?activate=<token>) ---
+// --- activation (from the emailed link: /?activate#activate=<token>; the bare query is a marker, the token is in the fragment) ---
 let activationToken = null;
 function setActivation(cls, msg) {
   const el = document.getElementById("activation-status");
   el.className = "conn-status " + cls; el.textContent = msg;
 }
+// The token is read from the fragment (the emailed link is /#activate=<token>), which the browser never sends
+// to any server, and the fragment is removed from the address bar once read so it does not stay in history.
+function activationTokenFromLocation(loc) {
+  const hash = (loc.hash || "").replace(/^#/, "");
+  const fromHash = new URLSearchParams(hash).get("activate");
+  if (fromHash) return fromHash;
+  return "";
+}
 function initActivationFromURL() {
-  const params = new URLSearchParams(window.location.search);
-  const token = params.get("activate");
+  const token = activationTokenFromLocation(window.location);
   if (!token) return false;
   activationToken = token;
+  try { history.replaceState(null, "", window.location.pathname + window.location.search); } catch (_) {}
   document.getElementById("signin-card").style.display = "none";
   document.getElementById("activation-panel").style.display = "";
   const base = edgeBase(); // "" => same-origin (front-door proxied)
-  fetch(base + "/admin/activate?token=" + encodeURIComponent(token))
+  // The token goes in the body, never the URL: it is the credential that sets this person's password.
+  fetch(base + "/admin/activate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token }) })
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error("invalid"))))
     .then((j) => { document.getElementById("activation-email").textContent = j.email || ""; })
     .catch(() => { setActivation("err", t("activationInvalid")); });
@@ -139,6 +175,10 @@ function wireActivation() {
         qrEl.innerHTML = "";
         try {
           qrEl.innerHTML = encodeQR(j.otpauth_uri, "svg", { ecc: "medium" });
+          // ★ THE CODE WAS THERE AND ZERO PIXELS WIDE (2026-11-08, acceptance C: "the screen says scan this and
+          // there is no image"). The SVG carries only a viewBox, and inside this inline-block box an SVG with no
+          // size of its own shrinks to nothing — the administrator saw the white padding and the secret text.
+          sizeActivationQR(qrEl);
         } catch (_) {
           qrEl.style.display = "none"; // fall back to the manual secret below
         }

@@ -458,6 +458,7 @@ async function loadInspectionPosture(result) {
   const current = freshRender(result);
   let data;
   try {
+    // two-planes-deliberate: /admin/tenant supplies only WHICH organization this is, and every row is checked to belong to it; an organization's identity does not change between the two answers (2026-11-06).
     const [r,tenant] = await Promise.all([apiFetch("GET", "/admin/inspection-posture"),apiFetch("GET","/admin/tenant")]);
  if(!tenant?.ok)throw new Error("Organization unavailable");
     if (!r.ok) { if (!current()) return; uiState(result, "error", "HTTP " + r.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadInspectionPosture(result) }); return; }

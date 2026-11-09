@@ -6,7 +6,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/tenantca"
+	"time"
 )
 
 // steerMuxFlowTenant is the organization a steered flow belongs to: the one the device's (T) certificate
@@ -74,4 +76,15 @@ func logSteerMuxResolvedTenant(deviceID, tenantID string) {
 	log.Printf("steer_mux_tenant_resolved device=%q tenant=%q — this flow's organization was proved from the "+
 		"device's certificate; its decision, its inspection authority and its record belong there",
 		deviceID, tenantID)
+}
+
+// ingestSteerMuxConnect records what a steer-mux CONNECT reports (OS, posture, presence) under the organization
+// the device's certificate proves — the same organization its flows are keyed to.
+//
+// ★★ IT WAS KEYED TO THIS NODE'S OWN ORGANIZATION (2026-11-06, measured on a three-region acceptance). The runtime
+// store keeps one entry per device and starts a new one when a write names another organization, so the
+// CONNECT (this node's organization) and the agent's 15-second report (the device's) replaced each other's
+// entry all day. The OS arrives only on the CONNECT, and the customer's Devices screen showed the OS as unknown.
+func ingestSteerMuxConnect(store *endpointRuntimeStore, r *http.Request, reg *tenantca.TenantCARegistry, nodeTenant, deviceID string, now time.Time) (model.DevicePostureSignals, bool) {
+	return store.ingestFromConnect(deviceID, steerMuxFlowTenant(r, reg, nodeTenant, deviceID), r.Header, sourceIPFromRequest(r), now)
 }

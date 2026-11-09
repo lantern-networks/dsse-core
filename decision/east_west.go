@@ -134,8 +134,33 @@ func eastWestDestinationMatches(selector []string, candidates ...string) bool {
 		return true
 	}
 	for _, s := range selector {
-		want, err := netip.ParseAddr(strings.TrimSpace(s))
+		s = strings.TrimSpace(s)
+		want, err := netip.ParseAddr(s)
 		if err != nil {
+			// ★★ A RANGE MATCHED NOTHING (2026-11-08, found while answering whether Connector Access needs an
+			// application published). The catalogue takes a network endpoint as "IP / CIDR / FQDN", and a rule's
+			// destination resolves to that address verbatim — but only an exact token or the same single address
+			// was compared here, so "10.0.0.0/8" matched no destination at all. An allow rule over a range
+			// silently allowed nothing, and a DENY over a range silently denied nothing. A range now matches the
+			// addresses inside it; a name still matches only itself.
+			prefix, perr := netip.ParsePrefix(s)
+			if perr != nil {
+				continue
+			}
+			prefix = prefix.Masked()
+			for _, c := range candidates {
+				got, err := netip.ParseAddr(strings.TrimSpace(c))
+				if err != nil {
+					continue
+				}
+				// Both spellings of an IPv4 address against the range as written (review C3-R7):
+				// "::ffff:10.47.1.0/120" is the same range as 10.47.1.0/24, and a destination may arrive as
+				// either 10.47.1.30 or ::ffff:10.47.1.30.
+				v4 := got.Unmap()
+				if prefix.Contains(got) || prefix.Contains(v4) || (v4.Is4() && prefix.Contains(netip.AddrFrom16(v4.As16()))) {
+					return true
+				}
+			}
 			continue
 		}
 		for _, c := range candidates {
@@ -218,6 +243,14 @@ type EastWestGrant struct {
 	// window stops releasing, even before ExpiresAt. IdleTTLSeconds 0 = no idle limit.
 	LastUsedAt     time.Time
 	IdleTTLSeconds int
+	// AuthenticatedBy is the subject the browser ceremony PROVED when this grant was issued. It is kept for
+	// attribution and is deliberately not a matching key: the held flow that this grant releases carries no
+	// user of its own, which is why SubjectUserID may be empty while this is not (security review S3).
+	AuthenticatedBy string
+	// CeremonyDeviceVerified is true when the ceremony's browser arrived with the same verified device identity
+	// as the held flow. False means the two could not be compared, not that they differed — a differing
+	// device never produces a grant.
+	CeremonyDeviceVerified bool
 }
 
 func (g EastWestGrant) matches(req model.DecisionRequest, now time.Time) bool {
@@ -249,13 +282,27 @@ func (g EastWestGrant) matches(req model.DecisionRequest, now time.Time) bool {
 	return true
 }
 
-func (e Evaluator) hasValidEastWestGrant(req model.DecisionRequest, now time.Time) bool {
+func (e Evaluator) validEastWestGrant(req model.DecisionRequest, now time.Time) (EastWestGrant, bool) {
 	for _, g := range e.EastWestGrants {
 		if g.matches(req, now) {
-			return true
+			return g, true
 		}
 	}
-	return false
+	return EastWestGrant{}, false
+}
+
+// eastWestGrantReleaseReason says who satisfied the authentication the grant stands for, so the access log of
+// the released flow names a person and not only a device (security review S3).
+func eastWestGrantReleaseReason(g EastWestGrant) string {
+	reason := "East-west access released by a valid ephemeral grant"
+	if by := strings.TrimSpace(g.AuthenticatedBy); by != "" {
+		reason += " (authenticated by " + by
+		if g.CeremonyDeviceVerified {
+			reason += " on the held flow's device"
+		}
+		reason += ")"
+	}
+	return reason + "."
 }
 
 // eastWestDeviceAttestationEligible reports whether a flow may be authorized by DEVICE attestation instead of
@@ -310,8 +357,8 @@ func (e Evaluator) eastWestDecisionFor(req model.DecisionRequest, now time.Time)
 		// held-request evidence. They cannot satisfy an explicit human ceremony.
 		requiresFederatedProof := rule.MaxAgeSecondsSet || rule.MaxAgeSeconds != 0 ||
 			strings.TrimSpace(rule.RequiredIdPID) != "" || strings.TrimSpace(rule.MinACR) != "" || len(rule.RequiredAMR) != 0
-		if !requiresFederatedProof && e.hasValidEastWestGrant(req, now) {
-			return "allow", "East-west access released by a valid ephemeral grant.", []string{"east_west_grant_satisfied"}, nil
+		if g, ok := e.validEastWestGrant(req, now); !requiresFederatedProof && ok {
+			return "allow", eastWestGrantReleaseReason(g), []string{"east_west_grant_satisfied"}, nil
 		}
 		// Device-attested auto (opt-in): a machine/non-interactive flow that cannot do an OOB ceremony is
 		// allowed by its verified mTLS device identity + trusted posture, instead of holding forever.

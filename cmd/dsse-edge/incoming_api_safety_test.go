@@ -73,7 +73,7 @@ func TestIncomingPartialUpdatePreservesRestrictions(t *testing.T) {
 		}
 		return ex
 	}
-	before := call(`{"id":"same","business_owner":"owner","expires_at":"2027-01-01T12:34:56Z","source_server":"10.0.0.1","device_group":"QA","service_family":"ssh","protocol":"tcp","port":22,"approval_required":true,"max_session_seconds":60,"mode":"deny","status":"disabled"}`, 200)
+	before := call(`{"id":"same","business_owner":"owner","expires_at":"2099-01-01T12:34:56Z","source_server":"10.0.0.1","device_group":"QA","service_family":"ssh","protocol":"tcp","port":22,"approval_required":true,"max_session_seconds":60,"mode":"deny","status":"disabled"}`, 200)
 	after := call(`{"id":"same","business_owner":"changed"}`, 200)
 	want := before
 	want.BusinessOwner = "changed"

@@ -37,7 +37,6 @@ DELETE /admin/transport-trust-anchors/{sha256}/acknowledge/{identity}
 DELETE /admin/vlan-objects/{object_id}
 GET /admin
 GET /admin/access-decisions/{decision_id}
-GET /admin/activate
 GET /admin/admins
 GET /admin/agent-profile/options
 GET /admin/agent-rollout
@@ -251,6 +250,7 @@ GET /steer/server-initiated-export
 GET /swg/tls-readiness/status
 GET /tenant-inspection-crl
 PATCH /admin/device-groups/{id}
+POST /admin/activate
 POST /admin/activate/password
 POST /admin/activate/totp/begin
 POST /admin/activate/totp/complete

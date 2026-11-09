@@ -64,6 +64,7 @@ func (s *LocalStore) WriteGzipJSONLStreamWithComment(filename, comment string, n
 	}
 	// Build beside the committed object. A failed source or disk write must
 	// never truncate the previous successful export/outbox delivery.
+	// durable-write: staged — written through gzip while its SHA-256 is computed, then handed to durablefile.Replace.
 	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
 	if err != nil {
 		return "", fmt.Errorf("create object export: %w", err)

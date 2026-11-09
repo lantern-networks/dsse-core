@@ -40,7 +40,7 @@ func probePKIRegionTrust(ctx context.Context, region regionEndpoint, tenant, ser
 	endpoint.RawPath = ""
 	endpoint.RawQuery = url.Values{"tenant": {tenant}}.Encode()
 	endpoint.Fragment = ""
-	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: organizationEnrolmentName(serverName), MinVersion: tls.VersionTLS12}, DisableKeepAlives: true}
+	transport := &http.Transport{DialContext: edgeDial, TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: organizationEnrolmentName(serverName), MinVersion: tls.VersionTLS12}, DisableKeepAlives: true}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)

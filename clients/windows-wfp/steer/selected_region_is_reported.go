@@ -51,7 +51,11 @@ func reportSelectedRegion(ctx context.Context, tc transportConfig, home string) 
 			return
 		case <-tick.C:
 			ae := tc.active.Load()
-			if ae == nil || (len(ae.dialAddrs) == 0 && ae.host == "") {
+			// ★ NOT BEFORE THE LIST HAS CHOSEN (review R1, 2026-11-08). At start-up the bootstrap endpoint is
+			// stored first, with a host and no region; reporting it then judged home from the host name — the
+			// guess C4 removed — and, this report being once only, the later correct selection was never said.
+			// The endpoint carries a region only once the region list has selected it.
+			if ae == nil || (len(ae.dialAddrs) == 0 && ae.host == "") || strings.TrimSpace(ae.region) == "" {
 				continue
 			}
 			where := strings.Join(ae.dialAddrs, ",")
@@ -59,7 +63,7 @@ func reportSelectedRegion(ctx context.Context, tc transportConfig, home string) 
 				where = ae.host
 			}
 			fmt.Printf("steer: ★ steering through region %s — dialling %s (verifying %q)\n",
-				describeSelection(ae.host, home), where, ae.serverName)
+				describeSelection(ae.host, ae.region, home), where, ae.serverName)
 			return
 		}
 	}
@@ -67,16 +71,36 @@ func reportSelectedRegion(ctx context.Context, tc transportConfig, home string) 
 
 // describeSelection says whether the endpoint in force is the home one, in the words an operator reading a
 // single line needs: "home" alone would hide the case this exists for.
-func describeSelection(activeHost, home string) string {
+//
+// ★ BY THE REGION THE LIST NAMES, NOT BY A WORD IN THE HOST NAME (acceptance C, 2026-11-07). This guessed from
+// whether the host contained the home region's name, which held while every entrance was called
+// agents.<region>.<deployment>. In one region with three nodes the entrances are agents.node-a.<deployment>
+// and so on, so a device on its home region's first node was told it was NOT home. The endpoint list says
+// which region each entrance serves; that is what is compared. The name is the fallback only before a region
+// has been selected from the list.
+func describeSelection(activeHost, activeRegion, home string) string {
 	a := strings.TrimSpace(activeHost)
+	r := strings.TrimSpace(activeRegion)
 	h := strings.TrimSpace(home)
 	if a == "" {
 		return fmt.Sprintf("(none yet; home=%q)", h)
 	}
-	if h != "" && strings.Contains(strings.ToLower(a), strings.ToLower(h)) {
-		return fmt.Sprintf("%q — the HOME region", a)
+	label := fmt.Sprintf("%q", a)
+	if r != "" {
+		label = fmt.Sprintf("%q (%s)", r, a)
 	}
-	return fmt.Sprintf("%q — NOT the home region (home=%q); nearest-healthy chose this one", a, h)
+	isHome := false
+	switch {
+	case h == "":
+	case r != "":
+		isHome = strings.EqualFold(r, h)
+	default:
+		isHome = strings.Contains(strings.ToLower(a), strings.ToLower(h))
+	}
+	if isHome {
+		return label + " — the HOME region"
+	}
+	return fmt.Sprintf("%s — NOT the home region (home=%q); nearest-healthy chose this one", label, h)
 }
 
 // describeUpstreams names the resolvers an out-of-band lookup was given, so a failure to resolve is a fact

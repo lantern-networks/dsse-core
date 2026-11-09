@@ -83,7 +83,7 @@ func authRolloutReporterFor(m authrollout.Manifest, target string, tc *tls.Confi
 	pin := hex.EncodeToString(sum[:])
 	for _, n := range m.Members {
 		if !n.Retired && n.CertificateSHA256 == pin && n.Role == role {
-			return &authRolloutReporter{census: m, member: n, url: target, client: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: tc}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+			return &authRolloutReporter{census: m, member: n, url: target, client: &http.Client{Timeout: 10 * time.Second, Transport: edgeTransport(tc), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 		}
 	}
 	return nil, fmt.Errorf("process identity and role are not in the expected deployment census")

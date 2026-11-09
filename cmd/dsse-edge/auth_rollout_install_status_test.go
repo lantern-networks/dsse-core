@@ -81,11 +81,12 @@ func TestAnonymousHealthDoesNotExposeOrReadDurableAuthenticationState(t *testing
 	}
 	syncStatus := &configBundleSyncStatus{source: "https://authority.example.test", interval: time.Second}
 	syncStatus.recordApplied(42, "test-epoch", 1, time.Now())
-	handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, Registry: connector.NewRegistry(), AdminAuth: seedAdminConnectorAPITokenAuth("reader", "read-only-token", []string{"admin.state.read"}), ConfigSyncStatus: syncStatus})
+	handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, Registry: connector.NewRegistry(), AdminAuth: seedAdminConnectorAPITokenAuth("reader", "read-only-token", []string{"admin.state.read"}), ConfigSyncStatus: syncStatus, OperatorTenantID: "tenant_lab_001"})
 	previous := theAuthRollout.Swap(edge)
 	defer theAuthRollout.Store(previous)
 	before := p.loads
 	for i := 0; i < 6; i++ {
+		// Anonymous: the status and nothing else (a_node_tells_only_its_operator_what_it_is.go).
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 		if rec.Code != 200 {
@@ -95,16 +96,31 @@ func TestAnonymousHealthDoesNotExposeOrReadDurableAuthenticationState(t *testing
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatal(err)
 		}
-		pull := body["config_pull"].(map[string]any)
+		if len(body) != 1 || body["status"] != "ok" {
+			t.Fatalf("anonymous health carried more than its status: %s", rec.Body.String())
+		}
+		// The operator: the sync diagnostic, still without the rollout and still without a durable read.
+		req := httptest.NewRequest("GET", "/healthz", nil)
+		req.Header.Set("Authorization", "Bearer read-only-token")
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		body = nil
+		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &body) != nil {
+			t.Fatalf("operator health: %d %s", rec.Code, rec.Body.String())
+		}
+		pull, _ := body["config_pull"].(map[string]any)
+		if pull == nil {
+			t.Fatalf("operator health lost the sync diagnostic: %s", rec.Body.String())
+		}
 		if _, present := pull["auth_rollout"]; present {
-			t.Fatal("anonymous health exposed rollout")
+			t.Fatal("health exposed rollout")
 		}
 		if pull["last_applied_generation"] != float64(42) {
-			t.Fatal("public sync diagnostic lost")
+			t.Fatal("operator sync diagnostic lost")
 		}
 	}
 	if p.loads != before {
-		t.Fatalf("anonymous health read durable rollout %d times", p.loads-before)
+		t.Fatalf("health read durable rollout %d times", p.loads-before)
 	}
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest("GET", "/admin/config-sync-status", nil))

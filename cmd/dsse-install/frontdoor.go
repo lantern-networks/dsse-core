@@ -342,7 +342,10 @@ func writeRegionFrontDoorConfig(dir string, names planeNames) error {
 	cpDataServers := "    server cp-a dsse-control-plane-a:8443 check check-ssl verify none port 9443 resolvers containers init-addr last,libc,none resolve-prefer ipv4\n" + peerControlPlaneDataServers(dir)
 	cpDataHealth := "    option httpchk GET /leader\n    http-check expect status 200\n"
 	cpServerDefaults := "    default-server on-marked-down shutdown-sessions\n"
-	consoleServers := "    server console dsse-console:8443 check check-ssl verify none resolvers containers init-addr last,libc,none resolve-prefer ipv4\n"
+	// ★ send-proxy TO THE CONSOLE, FOR THE SAME REASON AS THE AGENT PLANE (review R2). The Console bounds how
+	// fast one address may try to sign in, and behind a door that says nothing every browser is the door.
+	// The Console reads the header only from TRUSTED_FRONT_DOORS, which is this container's fixed address.
+	consoleServers := "    server console dsse-console:8443 check check-ssl verify none send-proxy resolvers containers init-addr last,libc,none resolve-prefer ipv4\n"
 	if frontEnv["DSSE_TOPOLOGY_PROFILE"] == "one-region-three-nodes" {
 		// Withdraw new connections before the generated Edge's 10s drain ends.
 		// A silent check is bounded too; inherited 5s/fall=3 can outlive drain.
@@ -361,7 +364,7 @@ func writeRegionFrontDoorConfig(dir string, names planeNames) error {
 			return err
 		}
 		cpDataHealth = oneRegionThreeNodesCPDataHealth(regionAdminName)
-		consoleServers, err = oneRegionThreeNodesConsoleBackends(frontEnv["DSSE_CONSOLE_BACKENDS"], names.Console)
+		consoleServers, err = oneRegionThreeNodesConsoleBackends(frontEnv["DSSE_CONSOLE_BACKENDS"], names.Console, consoleLocalBackend(frontEnv))
 		if err != nil {
 			return err
 		}
@@ -382,7 +385,7 @@ func writeRegionFrontDoorConfig(dir string, names planeNames) error {
 			return err
 		}
 		cpDataHealth = oneRegionThreeNodesCPDataHealth(names.Admin)
-		consoleServers, err = oneRegionThreeNodesConsoleBackends(frontEnv["DSSE_CONSOLE_BACKENDS"], names.Console)
+		consoleServers, err = oneRegionThreeNodesConsoleBackends(frontEnv["DSSE_CONSOLE_BACKENDS"], names.Console, consoleLocalBackend(frontEnv))
 		if err != nil {
 			return err
 		}
@@ -416,6 +419,12 @@ func writeRegionFrontDoorConfig(dir string, names planeNames) error {
 		if _, err = readPlanNodeAdminTargets(frontEnv); err != nil {
 			return err
 		}
+	}
+	if frontEnv["DSSE_TOPOLOGY_PROFILE"] == "" && len(peersNamedIn(dir, controlPlaneDoorwayPeersKey)) > 0 {
+		// A plan with more than one region: the other regions' control planes are reached at their own
+		// listeners, and their doorways only while none of those answers. See the_edges_door_must_reach_the_
+		// other_regions.go for the doorways and a_door_outage_must_not_hide_the_leader_test.go for why.
+		unavailableRouting, unavailableBackend, cpDataServers, cpDataHealth = multiRegionDirectPlanes(dir, frontEnv, names)
 	}
 	if frontEnv["DSSE_EDGE_BALANCE"] == "leastconn" {
 		if frontEnv["DSSE_STEER_MUX_ONLY"] != "true" {
@@ -622,13 +631,14 @@ func oneRegionThreeNodesControlPlaneBackends(adminPeers, dataPeers []string, adm
 // eligible. This is not a second, independent Console leader election.
 // During health-check overlap, the shared order selects one eligible Console
 // instead of distributing new connections across old and new candidates.
-func oneRegionThreeNodesConsoleBackends(raw, consoleName string) (string, error) {
+func oneRegionThreeNodesConsoleBackends(raw, consoleName, local string) (string, error) {
 	backends := strings.Split(raw, ",")
 	if len(backends) != 3 || !validPlanDNSName(consoleName) {
 		return "", fmt.Errorf("one-region-three-nodes needs three Console backends and a Console TLS name")
 	}
 	sort.Strings(backends)
 	seen := map[string]bool{}
+	matched := false
 	var servers strings.Builder
 	servers.WriteString("    balance first\n    option httpchk GET /ready\n    http-check expect status 200\n")
 	servers.WriteString(oneRegionThreeNodesManagementServerDefaults)
@@ -641,9 +651,43 @@ func oneRegionThreeNodesConsoleBackends(raw, consoleName string) (string, error)
 		// The Console may use an operator-provided certificate rather than the
 		// deployment CA. The health probe checks readiness; the browser verifies
 		// the actual end-to-end TLS connection through this TCP-only doorway.
-		fmt.Fprintf(&servers, "    server console-%d %s check check-ssl check-sni %s verify none\n", i+1, address, consoleName)
+		target := address
+		if local != "" && address == local {
+			// ★ THIS MACHINE'S OWN CONSOLE IS REACHED OVER THE CONTAINER NETWORK. Through the Node's published
+			// address the connection is relayed by the container runtime's port proxy, and the Console sees the
+			// network gateway — not the door's fixed address it trusts — so it refuses the PROXY header, and the
+			// door on the leader's Node had no Console at all. Other Nodes' Consoles keep the Node address, where
+			// the door's machine address arrives intact and is trusted.
+			target = "dsse-console:8443"
+			matched = true
+		}
+		fmt.Fprintf(&servers, "    server console-%d %s check check-ssl check-sni %s verify none send-proxy", i+1, target, consoleName)
+		if target != address {
+			servers.WriteString(" resolvers containers init-addr last,libc,none resolve-prefer ipv4")
+		}
+		servers.WriteString("\n")
+	}
+	if local != "" && !matched {
+		return "", fmt.Errorf("this machine's Console backend %s is not one of the Console backends", local)
 	}
 	return servers.String(), nil
+}
+
+// consoleLocalBackend names the Console backend that runs on this machine, so the door reaches it over the
+// container network. Without the generated value it falls back to the Console's bind address and port.
+func consoleLocalBackend(env map[string]string) string {
+	if v := strings.TrimSpace(env["DSSE_CONSOLE_LOCAL_BACKEND"]); v != "" {
+		return v
+	}
+	host := strings.TrimSuffix(strings.TrimSpace(env["DSSE_CONSOLE_BIND"]), ":")
+	if host == "" {
+		return ""
+	}
+	port := strings.TrimSpace(env["DSSE_CONSOLE_PORT"])
+	if port == "" {
+		port = fmt.Sprint(planConsolePortA)
+	}
+	return net.JoinHostPort(host, port)
 }
 
 // writeStandbyFrontDoorConfig writes the internal control-plane door for a region that runs a WARM STANDBY.
@@ -895,4 +939,47 @@ func thisRegionsOwnPlaneNames(dir string, names planeNames) string {
 			"    use_backend edge_fleet     if { req.ssl_sni -i " + own("recovery") + " }\n"
 	}
 	return out
+}
+
+// multiRegionDirectPlanes renders, for a plan with more than one region, the routing that falls back to the other
+// regions' doorways only while no direct control plane answers, the two doorway backends, and the authority's
+// direct servers with the check that proves both leadership and a reachable data listener.
+//
+// ★★ THE DATA LISTENER IS CHECKED ITSELF (2026-11-06). The authority's peers were checked on their
+// admin port only, so a 19545 a firewall had closed stayed "up" while every write to it failed, and the doorway
+// that would have worked was never chosen. The check is the one the one-region three-node profile uses: GET
+// /leader on the admin listener, then GET /healthz on the data listener itself. For that one check to fit every
+// server, this machine's own control plane is reached at its published listeners too.
+func multiRegionDirectPlanes(dir string, env map[string]string, names planeNames) (routing, backends, dataServers, dataHealth string) {
+	adminNames, dataNames := []string{names.Admin}, []string{names.Authority}
+	for _, entry := range strings.Split(env["DSSE_REGION_ENDPOINTS"], ";") {
+		if id, _, ok := strings.Cut(strings.TrimSpace(entry), "="); ok {
+			if id = strings.ToLower(strings.TrimSpace(id)); id != "" {
+				adminNames = append(adminNames, "admin."+id+"."+names.BareHost)
+				dataNames = append(dataNames, "authority."+id+"."+names.BareHost)
+			}
+		}
+	}
+	routing = "    # The other regions' doorways carry these only while no control plane answers at its own listener.\n" +
+		"    use_backend cp_admin_doorways if { req.ssl_sni -i " + strings.Join(adminNames, " ") + " } { nbsrv(cp_admin_plane) eq 0 }\n" +
+		"    use_backend cp_data_doorways  if { req.ssl_sni -i " + strings.Join(dataNames, " ") + " } { nbsrv(cp_data_plane) eq 0 }\n"
+	doorway := func(name, key, prefix string) string {
+		return "backend " + name + "\n" +
+			"    # Up only while that region's OWN control plane leads: the check names the node, which its doorway\n" +
+			"    # routes to its own control plane and nowhere else.\n" +
+			"    option httpchk GET /leader\n    http-check expect status 200\n" +
+			"    default-server on-marked-down shutdown-sessions\n" + peerControlPlaneDoorways(dir, key, prefix)
+	}
+	backends = doorway("cp_admin_doorways", controlPlaneDoorwayPeersKey, "cp-door-") + "\n" +
+		doorway("cp_data_doorways", controlPlaneDataDoorwayPeersKey, "cp-data-door-") + "\n"
+	dataHealth = oneRegionThreeNodesCPDataHealth(names.Admin)
+	if local := strings.TrimSuffix(strings.TrimSpace(env["DSSE_CP_A_BIND"]), ":"); local != "" {
+		dataServers = fmt.Sprintf("    server cp-a %s:%d check check-ssl check-sni %s verify none\n", local, planCPDataPortA, names.Admin)
+	}
+	for i, p := range controlPlaneDataPeers(dir) {
+		if _, address, found := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(p, "https://"), "http://"), "@"); found {
+			dataServers += fmt.Sprintf("    server cp-data-peer-%d %s check check-ssl check-sni %s verify none\n", i+1, address, names.Admin)
+		}
+	}
+	return routing, backends, dataServers, dataHealth
 }

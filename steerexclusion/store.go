@@ -87,6 +87,43 @@ type Store struct {
 	// snapshot.
 	refreshedAt time.Time
 	loadErr     error
+	// generation moves every time the set this node holds changes, whoever changed it.
+	//
+	// ★★★ THE CONTROL PLANE HELD THE EXCLUSION AND NO DEVICE EVER GOT IT (2026-11-08, acceptance C, third
+	// walk). An administrator excluded ssh.exe in the Console; the control plane saved it ("loaded 1 policy"
+	// on its next restart), every Edge held none, and the device logged "refreshed 0 signed exclusion(s)" once
+	// a minute while the list read "active". The Edges an installer produces pull ONE channel from the control
+	// plane — the config bundle — and the bundle did not carry this store; the separate pull that did was never
+	// configured by the installer and only ever asked for one organization. The set now rides the bundle, and
+	// an Edge applies a bundle only when its version is newer, so this store has to say when it changed.
+	//
+	// It counts changes SEEN, not writes made: a policy written through another control plane arrives here
+	// on the next re-read of the durable store, and that has to move the version as surely as a write here
+	// does. The number is this process's own; the bundle's epoch is per process too, so an Edge re-baselines
+	// when the answering control plane changes and never compares two processes' counts.
+	generation uint64
+	// receiver marks a node that RECEIVES its set (an Edge pulling the config bundle). Its persistence is a cache
+	// for the next start, not an authority: re-reading it on a timer would put back what the authority just
+	// removed whenever a write to the cache failed (review C3-R3). See SetReceiver.
+	receiver bool
+	// unconfirmed is set when a replacement's durable copy could not be confirmed, and cleared only by a pass
+	// that confirms it — a write of the whole durable state, not a read that happens to show the new rows
+	// (review C3-RRR1).
+	unconfirmed bool
+}
+
+// Syncer is a Persistence that can write its current state again and confirm the write. See
+// FilePersistence.Sync.
+type Syncer interface {
+	Sync(ctx context.Context) error
+}
+
+// SetReceiver makes this store a receiver: its durable copy is read once at start and written through, never
+// re-read while running. Call it before the store is shared.
+func (s *Store) SetReceiver() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.receiver = true
 }
 
 // refreshWindow is how stale a node's copy may be. Short enough that an operator who authors a policy and
@@ -99,7 +136,7 @@ const refreshWindow = 5 * time.Second
 // would remove every exclusion on a transient error, and these are the identifiers that keep the tools
 // managing this deployment off the steered path.
 func (s *Store) refreshLocked(now time.Time) {
-	if s.persistence == nil || now.Sub(s.refreshedAt) < refreshWindow {
+	if s.persistence == nil || s.receiver || now.Sub(s.refreshedAt) < refreshWindow {
 		return
 	}
 	s.refreshedAt = now
@@ -114,7 +151,60 @@ func (s *Store) refreshLocked(now time.Time) {
 			"policy(ies) it holds rather than reporting none", err, len(s.byID))
 		return
 	}
+	if !samePolicies(s.byID, fresh) {
+		s.generation++
+	}
 	s.byID = fresh
+}
+
+// samePolicies reports whether two held sets say the same thing. Times compare by instant: the copy read back
+// from the database carries no monotonic reading and may carry another location, and neither is a change.
+func samePolicies(a, b map[string]*Policy) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for id, x := range a {
+		y := b[id]
+		if y == nil || x.TenantID != y.TenantID || x.ScopeType != y.ScopeType || x.ScopeID != y.ScopeID ||
+			x.Note != y.Note || x.Status != y.Status || !x.CreatedAt.Equal(y.CreatedAt) || !x.UpdatedAt.Equal(y.UpdatedAt) ||
+			len(x.ExcludedAppSigningIDs) != len(y.ExcludedAppSigningIDs) {
+			return false
+		}
+		for i := range x.ExcludedAppSigningIDs {
+			if x.ExcludedAppSigningIDs[i] != y.ExcludedAppSigningIDs[i] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ConfigGeneration is the version of the set this node holds, for the config bundle's aggregate. It re-reads
+// the durable store first (within the refresh window), so a change made through another control plane moves
+// it here too.
+func (s *Store) ConfigGeneration() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshLocked(time.Now())
+	return s.generation
+}
+
+// SnapshotAllChecked is every organization's policies, for the config bundle. Like ListChecked it refuses to
+// present a retained set as the authority's answer: a bundle that carried a stale set would be applied by
+// every Edge as the whole truth.
+func (s *Store) SnapshotAllChecked() ([]Policy, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshLocked(time.Now())
+	if s.loadErr != nil {
+		return nil, s.loadErr
+	}
+	out := make([]Policy, 0, len(s.byID))
+	for _, p := range s.byID {
+		out = append(out, clonePolicy(*p))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
 }
 
 func NewStore() *Store {
@@ -231,6 +321,7 @@ func (s *Store) Upsert(p Policy, now time.Time) (Policy, error) {
 		}
 	}
 	s.byID[p.ID] = &stored
+	s.generation++
 	return clonePolicy(stored), nil
 }
 
@@ -301,6 +392,7 @@ func (s *Store) DeleteChecked(id, tenantID string, now time.Time) (bool, error) 
 		}
 	}
 	delete(s.byID, id)
+	s.generation++
 	return true, nil
 }
 
@@ -315,54 +407,111 @@ func (s *Store) ReplaceTenant(tenantID string, policies []Policy) {
 	}
 }
 
-// ReplaceTenantChecked rejects invalid or conflicting sets before touching the
-// cache. Configured cache persistence remains best-effort, as in ReplaceTenant.
+// ReplaceTenantChecked replaces one organization's set; see ReplaceTenantsChecked.
 func (s *Store) ReplaceTenantChecked(tenantID string, policies []Policy) error {
-	if err := ValidateTenantPolicies(tenantID, policies); err != nil {
-		return err
+	return s.ReplaceTenantsChecked(map[string][]Policy{tenantID: policies})
+}
+
+// ReplaceTenantsChecked replaces the sets of every organization it is given, together.
+//
+// ★ EVERYTHING IS CHECKED BEFORE ANYTHING CHANGES (review C3-R3 and the note under it). Validation, and the
+// ownership of every policy ID against what is held for the organizations NOT being replaced, happen first; one
+// refusal leaves every organization as it was. Before, a conflict in the second organization was found after the
+// first had been replaced.
+//
+// ★ A FAILED SAVE IS AN ERROR. The new set is what this node now holds — the authority sent it — so it stays in
+// memory; the error tells the caller the durable copy did not follow, so a config bundle is not recorded as
+// applied and is offered again. Before, a failed save was logged and reported as success, and five seconds later
+// the timer re-read the stale cache: a removed exclusion came back and nothing ever removed it again.
+func (s *Store) ReplaceTenantsChecked(sets map[string][]Policy) error {
+	incomingOwner := map[string]string{}
+	for tenantID, policies := range sets {
+		if err := ValidateTenantPolicies(tenantID, policies); err != nil {
+			return err
+		}
+		for _, p := range policies {
+			if other, seen := incomingOwner[p.ID]; seen && other != tenantID {
+				return ErrTenantConflict
+			}
+			incomingOwner[p.ID] = tenantID
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Validate ownership before removing any current policy. IDs are global keys.
-	for _, p := range policies {
-		if current := s.byID[p.ID]; current != nil && current.TenantID != tenantID {
-			return ErrTenantConflict
+	for id, tenant := range incomingOwner {
+		if current := s.byID[id]; current != nil && current.TenantID != tenant {
+			if _, replaced := sets[current.TenantID]; !replaced {
+				return ErrTenantConflict
+			}
 		}
 	}
-
-	// Persist the replace too, or the durable cache drifts from the store: this is the CP→Edge sync path, and
-	// before it also went through persistence, a synced-away policy stayed in the on-disk file and reappeared
-	// for a moment on the next restart (until the next sync corrected it). Mirror Upsert/Delete: Delete the
-	// removed ids, Upsert the incoming set. Best-effort — a persist failure must not drop the in-memory sync.
-	removed := []string{}
-	for id, p := range s.byID {
-		if p.TenantID == tenantID {
-			delete(s.byID, id)
-			removed = append(removed, id)
-		}
+	// What the durable copy must lose is read from the durable copy (review C3-RR1). Taken from memory, a
+	// removal whose save failed was forgotten: memory had already dropped it, so the retry found nothing to
+	// remove, reported success, and the stale row came back at the next start.
+	removed := map[string]string{} // id -> tenant
+	var persisted []*Policy
+	var readErr error
+	if s.persistence != nil {
+		persisted, readErr = s.persistence.LoadAll(context.Background())
 	}
-	for i := range policies {
-		stored := clonePolicy(policies[i])
-		if strings.TrimSpace(stored.ID) == "" || stored.TenantID != tenantID {
+	for _, p := range persisted {
+		if p == nil {
 			continue
 		}
-		s.byID[stored.ID] = &stored
-	}
-	if s.persistence != nil {
-		for _, id := range removed {
-			if err := s.persistence.Delete(context.Background(), id, tenantID); err != nil {
-				log.Printf("WARNING: persist steer-exclusion sync delete %s failed (durability at risk): %v", id, err)
-			}
+		if _, replaced := sets[p.TenantID]; replaced && incomingOwner[p.ID] != p.TenantID {
+			removed[p.ID] = p.TenantID
 		}
+	}
+	for id, p := range s.byID {
+		if _, replaced := sets[p.TenantID]; replaced {
+			delete(s.byID, id)
+		}
+	}
+	for tenantID, policies := range sets {
 		for i := range policies {
 			stored := clonePolicy(policies[i])
-			if strings.TrimSpace(stored.ID) == "" || stored.TenantID != tenantID {
-				continue
-			}
+			stored.TenantID = tenantID
+			s.byID[stored.ID] = &stored
+		}
+	}
+	s.generation++
+	if s.persistence == nil {
+		return nil
+	}
+	if readErr != nil {
+		// The received set is in force; the durable copy is left for the retry this error asks for.
+		s.unconfirmed = true
+		return fmt.Errorf("%w: the durable copy could not be read to replace it: %w", ErrPersistence, readErr)
+	}
+	var failed []error
+	for id, tenantID := range removed {
+		if err := s.persistence.Delete(context.Background(), id, tenantID); err != nil {
+			failed = append(failed, fmt.Errorf("remove %s: %w", id, err))
+		}
+	}
+	for tenantID, policies := range sets {
+		for i := range policies {
+			stored := clonePolicy(policies[i])
+			stored.TenantID = tenantID
 			if err := s.persistence.Upsert(context.Background(), &stored); err != nil {
-				log.Printf("WARNING: persist steer-exclusion sync upsert %s failed (durability at risk): %v", stored.ID, err)
+				failed = append(failed, fmt.Errorf("save %s: %w", stored.ID, err))
 			}
 		}
+	}
+	if len(failed) > 0 {
+		s.unconfirmed = true
+		return fmt.Errorf("%w: the received set is in force here, and its durable copy was not written: %w", ErrPersistence, errors.Join(failed...))
+	}
+	// A previous pass reported its durable copy unconfirmed. Reading the new rows back does not confirm them —
+	// a save can put its bytes in place and still fail to confirm them — so the whole state is written again
+	// and confirmed before this pass may say it is durable.
+	if s.unconfirmed {
+		if syncer, ok := s.persistence.(Syncer); ok {
+			if err := syncer.Sync(context.Background()); err != nil {
+				return fmt.Errorf("%w: the durable copy of an earlier replacement is still unconfirmed: %w", ErrPersistence, err)
+			}
+		}
+		s.unconfirmed = false
 	}
 	return nil
 }
@@ -386,11 +535,27 @@ func (s *Store) ResolveForDevice(tenantID, deviceIdentity, deviceGroup string) [
 		case scopeDeviceGroup:
 			match = deviceGroup != "" && p.ScopeID == deviceGroup
 		case scopeDevice:
-			match = deviceIdentity != "" && p.ScopeID == deviceIdentity
+			// The Console scopes a policy from one list and shows whether it applies by comparing lower-cased
+			// (deviceKey in ui.js), because the lists spell the same machine differently — a Windows host name
+			// in capitals in one, lower case in another.
+			//
+			// ★ THE SAME RELATION ENROLMENT USES, AND NO WIDER (review C3-R2). strings.EqualFold also folds
+			// Unicode equivalents — "desktop-s" and "desktop-ſ" (U+017F) are one under it and two enrolled
+			// devices under enrolledinventory.NormalizeIdentity (trim, then ToLower). An exclusion meant for one
+			// of them was signed for the other. Two identities are the same device here exactly when enrolment
+			// says they are.
+			match = deviceIdentity != "" && sameEnrolledIdentity(p.ScopeID, deviceIdentity)
 		}
 		if match {
 			merged = append(merged, p.ExcludedAppSigningIDs...)
 		}
 	}
 	return normalizeSigningIDs(merged)
+}
+
+// sameEnrolledIdentity is enrolledinventory.NormalizeIdentity's relation (trim, then lower case), kept here
+// rather than imported so this package stays free of the ledger. TestTheDeviceRelationIsEnrolments holds the
+// two together.
+func sameEnrolledIdentity(a, b string) bool {
+	return strings.ToLower(strings.TrimSpace(a)) == strings.ToLower(strings.TrimSpace(b))
 }

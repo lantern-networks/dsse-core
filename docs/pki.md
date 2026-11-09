@@ -514,11 +514,14 @@ identify a member of this deployment's database trust domain; they do not identi
 which node the primary is. Independently supplied standby DSNs still need operator
 validation; the generated placeholder also requests `verify-full`.
 
-For plans whose consensus traffic crosses machines, etcd's client endpoint requires
-a certificate from the Store CA. Patroni presents a separate client-only certificate
-and key, not the etcd member key. This authenticates TLS peers; it does not enable
-etcd application RBAC. The local single-host legacy store remains on its existing
-HTTP configuration.
+On every generated plan, the one-host deployment included, etcd's client endpoint
+requires a certificate from the Store CA. Patroni presents a separate client-only
+certificate and key, not the etcd member key. This authenticates TLS peers; it does
+not enable etcd application RBAC. A one-host store listened in the clear until
+0.4.1 on the grounds that its container network never leaves the machine; the Edge on
+that host dials outward for every steered device, so the store that decides which
+database is primary now asks for a certificate like every other member. A compose
+file written by hand without these settings still runs in the clear.
 
 An init service, using the same Spilo image as the database, discovers the actual
 `postgres` UID/GID and installs client/server keys with mode 0600 in a mode 0700

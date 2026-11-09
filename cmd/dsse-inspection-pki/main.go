@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/lantern-networks/dsse-core/inspectioncrl"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 type importBundle struct {
@@ -59,31 +61,7 @@ func writeNew(path string, data []byte) error {
 	return f.Sync()
 }
 func atomicWrite(path string, data []byte) error {
-	f, e := os.CreateTemp(filepath.Dir(path), ".crl-*")
-	if e != nil {
-		return e
-	}
-	name := f.Name()
-	defer os.Remove(name)
-	if e = f.Chmod(0600); e != nil {
-		f.Close()
-		return e
-	}
-	if _, e = f.Write(data); e != nil {
-		f.Close()
-		return e
-	}
-	if e = f.Sync(); e != nil {
-		f.Close()
-		return e
-	}
-	if e = f.Close(); e != nil {
-		return e
-	}
-	if e = os.Rename(name, path); e != nil {
-		return e
-	}
-	return syncDirectory(filepath.Dir(path))
+	return durablefile.Write(path, data, 0o600)
 }
 
 func syncDirectory(path string) error {

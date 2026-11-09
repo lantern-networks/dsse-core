@@ -59,6 +59,16 @@ type agentRolloutCache struct {
 	// So the Edge asks for the set. An organization in it is answered from its own plan; one that is not is
 	// held exactly as before, which keeps the property this cache was built on.
 	plans map[string]agentrollout.AgentRolloutPlan
+	// complete is true when the control plane said plans holds EVERY plan the deployment has authored. Then an
+	// organization missing from it has none, which is the default (not halted), and not "never told".
+	//
+	// ★★★ A NEW ORGANIZATION'S UPDATES WERE HELD FOR EVER (2026-11-04, found by publishing a release to a new
+	// organization's Windows device: "rollout frozen: this edge has not been told whether <tenant>'s fleet is
+	// halted, so the fleet is held until it is"). The control plane lists only organizations whose plan somebody
+	// has written, so one nobody had touched was never in the set, and this Edge held it — correctly by the rule
+	// above, and permanently, because nothing would ever put it there. A release published to that organization
+	// reached none of its devices. An older control plane does not send `complete`, and keeps the old hold.
+	complete bool
 	// tenantID is the tenant this cache's plan was pulled FOR. An enforcing Edge pulls one plan, for its own
 	// enforcement tenant, and may serve devices belonging to another tenant when several Tenant CAs are
 	// registered — a form this product supports.
@@ -94,6 +104,7 @@ func (c *agentRolloutCache) Get() (agentrollout.AgentRolloutPlan, bool, string) 
 func (c *agentRolloutCache) setForTenant(tenantID string, p agentrollout.AgentRolloutPlan) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.complete = false
 	c.tenantID = strings.TrimSpace(tenantID)
 	c.plan, c.fetched, c.lastErr = p, true, ""
 	if c.plans == nil {
@@ -105,9 +116,10 @@ func (c *agentRolloutCache) setForTenant(tenantID string, p agentrollout.AgentRo
 }
 
 // setAll replaces what this Edge knows about every organization it serves.
-func (c *agentRolloutCache) setAll(plans map[string]agentrollout.AgentRolloutPlan, own string) {
+func (c *agentRolloutCache) setAll(plans map[string]agentrollout.AgentRolloutPlan, own string, complete ...bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.complete = len(complete) == 1 && complete[0]
 	next := make(map[string]agentrollout.AgentRolloutPlan, len(plans))
 	for k, v := range plans {
 		if key := strings.TrimSpace(k); key != "" {
@@ -137,6 +149,9 @@ func (c *agentRolloutCache) planFor(tenantID string) (agentrollout.AgentRolloutP
 	}
 	if p, ok := c.plans[key]; ok {
 		return p, true
+	}
+	if c.complete {
+		return agentrollout.AgentRolloutPlan{}, true
 	}
 	// setForTenant also puts the older control plane's single-plan answer in
 	// plans. A missing entry in a complete snapshot is unknown, never a reason
@@ -169,31 +184,38 @@ type agentRolloutSource struct {
 // fetchAll asks for EVERY organization's plan. An older control plane has no such route and answers 404, which
 // is not an error: the caller falls back to the singular fetch and this Edge behaves exactly as it did.
 func (s agentRolloutSource) fetchAll(ctx context.Context) (map[string]agentrollout.AgentRolloutPlan, bool, error) {
+	plans, served, _, err := s.fetchAllComplete(ctx)
+	return plans, served, err
+}
+
+// fetchAllComplete also reports whether the control plane said the set is every plan it holds.
+func (s agentRolloutSource) fetchAllComplete(ctx context.Context) (map[string]agentrollout.AgentRolloutPlan, bool, bool, error) {
 	url := strings.TrimRight(s.url, "/") + "/admin/agent-rollouts"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	req.Header.Set("Authorization", "Bearer "+s.token)
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("control plane answered HTTP %d", resp.StatusCode)
+		return nil, false, false, fmt.Errorf("control plane answered HTTP %d", resp.StatusCode)
 	}
 	var body struct {
 		TenantID string                                   `json:"tenant_id"`
 		Tenants  map[string]agentrollout.AgentRolloutPlan `json:"tenants"`
+		Complete bool                                     `json:"complete"`
 	}
 	if derr := json.NewDecoder(io.LimitReader(resp.Body, maxPublishedSetBytes)).Decode(&body); derr != nil {
-		return nil, false, fmt.Errorf("decode the rollout plans: %w", derr)
+		return nil, false, false, fmt.Errorf("decode the rollout plans: %w", derr)
 	}
-	return body.Tenants, true, nil
+	return body.Tenants, true, body.Complete, nil
 }
 
 func (s agentRolloutSource) fetch(ctx context.Context) (agentrollout.AgentRolloutPlan, error) {
@@ -240,9 +262,9 @@ func (s agentRolloutSource) run(ctx context.Context, cache *agentRolloutCache) {
 		// ★ THE WHOLE SET FIRST. This Edge serves every organization on the deployment, and being told about
 		// one of them means holding all the others for ever. An older control plane has no such route and
 		// answers 404, which is not a failure — the singular pull below is then exactly what it always was.
-		if all, served, aerr := s.fetchAll(ctx); aerr == nil && served {
+		if all, served, complete, aerr := s.fetchAllComplete(ctx); aerr == nil && served {
 			prevAll, hadAll, _ := cache.Get()
-			cache.setAll(all, s.tenantID)
+			cache.setAll(all, s.tenantID, complete)
 			own := all[strings.TrimSpace(s.tenantID)]
 			switch {
 			case first:

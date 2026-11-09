@@ -201,8 +201,9 @@ function openInvitationHandover(invitation, opts) {
         ja: (inv.to || "本人") + " に、いつもの連絡手段で以下を渡してください。メールは送信されていません。" }) }),
       el("div", { class: "ui-preview", style: "margin:8px 0;white-space:pre-wrap" , text: text }),
       el("p", { class: "ui-field-hint", text: bl({
-        en: "The link works once and expires " + (inv.expires_at || "") + ". Issue a new one if it is lost.",
-        ja: "リンクは1回限りで、" + (inv.expires_at || "") + " に失効します。紛失した場合は再発行してください。" }) }),
+        // In the reader's time and words (acceptance C, third walk: it read "2026-11-09T03:12:51Z").
+        en: "The link works once and expires " + adminInviteExpiry(inv.expires_at) + ". Issue a new one if it is lost.",
+        ja: "リンクは1回限りで、" + adminInviteExpiry(inv.expires_at) + " に失効します。紛失した場合は再発行してください。" }) }),
     ],
     footer: [copyAll, copyLink, ...footer],
   });
@@ -322,4 +323,10 @@ async function adminDelete(a, host) {
   if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
   uiToast(bl({ en: "Administrator removed.", ja: "管理者を削除しました。" }), "ok");
   renderAdminList(host);
+}
+
+// adminInviteExpiry is an invitation's expiry as the rest of the Console shows a time.
+function adminInviteExpiry(expiresAt) {
+  if (!expiresAt) return "";
+  return (typeof window !== "undefined" && window.dsseFormatTime) ? window.dsseFormatTime(expiresAt) : String(expiresAt);
 }

@@ -126,6 +126,10 @@ func doProvision(be configstore.Backend, configPath, tokenPath, pinFilePath, pin
 				"not say which authority serves it, so there is nothing this machine could trust for it")
 		}
 		portalAnchorPath := filepath.Join(dataDir, "step_up_portal_ca.pem")
+		// Before the rewrite: what an older package that kept no record was trusting from it (trust_added_record.go).
+		if err := captureOlderPackageTrust(portalAnchorPath); err != nil {
+			return fmt.Errorf("read what the previous package trusted for the step-up portal: %w", err)
+		}
 		if err := os.WriteFile(portalAnchorPath, plan.StepUpPortalAnchorPEM, 0o644); err != nil {
 			return fmt.Errorf("write the step-up portal's authority: %w", err)
 		}
@@ -137,6 +141,10 @@ func doProvision(be configstore.Backend, configPath, tokenPath, pinFilePath, pin
 
 	if len(plan.InterceptionRootPEM) > 0 {
 		rootPath := filepath.Join(dataDir, "interception-root.pem")
+		// Before the rewrite: what an older package that kept no record was trusting from it (trust_added_record.go).
+		if err := captureOlderPackageTrust(rootPath); err != nil {
+			return fmt.Errorf("read what the previous package trusted as the interception root: %w", err)
+		}
 		if err := os.WriteFile(rootPath, plan.InterceptionRootPEM, 0o644); err != nil {
 			return fmt.Errorf("write interception root: %w", err)
 		}
@@ -179,6 +187,21 @@ func doProvision(be configstore.Backend, configPath, tokenPath, pinFilePath, pin
 	}
 
 	// The operator key, left where a person will look for it, and put in force where the AGENT reads it.
+	// ★★★ THE DEPLOYMENT'S UPDATE KEYS WERE CARRIED AND NEVER PUT IN FORCE (2026-11-04, found by installing the
+	// published 0.4.0 MSI against a fresh deployment). planProvision read deployment.update_signing_keys from the
+	// verified profile and nothing used them. The release MSI is generic and bakes no --update-pin, so DsseUpdater
+	// ran with none and reported "no trusted update-signing keys are configured, so this device can never update"
+	// for as long as it lived, while the Console showed the device refusing updates.
+	//
+	// Filled only where the package baked none: a deployment that built its own MSI with a pin keeps it. The keys
+	// come from the same verified profile as every other deployment fact, under the operator's own pin.
+	if n, err := putProfileUpdateKeysInForce(plan.UpdateSigningKeys, pin, operatorKey, plan.AgentPolicyPin); err != nil {
+		fmt.Fprintf(os.Stderr, "profileapply: WARNING - the deployment's update-signing keys could not be put in "+
+			"force (%v). Until this is fixed this device cannot install a published update.\n", err)
+	} else if n != "" {
+		fmt.Println("profileapply: " + n)
+	}
+
 	if operatorKey != "" {
 		if n, err := installSigningKey(dataDir, operatorKey); err != nil {
 			fmt.Fprintf(os.Stderr, "profileapply: WARNING - the profile is applied but the key could not be recorded: %v\n", err)

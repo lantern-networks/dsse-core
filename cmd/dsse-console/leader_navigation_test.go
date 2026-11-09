@@ -146,7 +146,7 @@ func TestConsoleNavigationMovesToConfirmedActiveCP(t *testing.T) {
 func TestConsoleNavigationNeverReplaysWritesCredentialsOrAssets(t *testing.T) {
 	f := newConsoleLeaderFixture(t)
 	handler := f.routing(t, "b").navigation(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
-	for _, tc := range []struct{ method, path, accept string }{{"POST", "/console.html", "text/html"}, {"GET", "/?activate=private-token", "text/html"}, {"GET", "/admin/oidc/callback?code=secret", "text/html"}, {"GET", "/admin/session", "application/json"}, {"POST", "/control/admin/tenant", "application/json"}, {"GET", "/app.js", "text/javascript"}, {"GET", "/ready", "text/html"}, {"GET", "/console.html", "application/json"}} {
+	for _, tc := range []struct{ method, path, accept string }{{"POST", "/console.html", "text/html"}, {"GET", "/?activate=private-token", "text/html"}, {"GET", "/?activate", "text/html"}, {"GET", "/admin/oidc/callback?code=secret", "text/html"}, {"GET", "/admin/session", "application/json"}, {"POST", "/control/admin/tenant", "application/json"}, {"GET", "/app.js", "text/javascript"}, {"GET", "/ready", "text/html"}, {"GET", "/console.html", "application/json"}} {
 		r := consoleNavRequest(tc.method, "https://console-b.example"+tc.path)
 		r.Header.Set("Accept", tc.accept)
 		w := httptest.NewRecorder()

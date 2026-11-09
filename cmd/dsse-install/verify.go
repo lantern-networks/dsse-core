@@ -79,6 +79,7 @@ func verifyDeployment(dir, cpAdmin string, edgeAdmins []string, edgeTransport, a
 		return out
 	}
 	add("the deployment's anchor is readable", true, "%s", filepath.Join(dir, "deployment-anchor.pem"))
+	out = append(out, verifyTheWalkCanAskANodeWhatItIs())
 
 	// ★★★ ADMINISTER WHERE LEADERSHIP IS. See verify_writes_go_to_the_leader.go: a block accepted by a standby
 	// never reaches the fleet, and this walk is told a URL and believes it.
@@ -95,6 +96,7 @@ func verifyDeployment(dir, cpAdmin string, edgeAdmins []string, edgeTransport, a
 	if !add("deployment.env carries the admin credential", token != "", "ADMIN_TOKEN") {
 		return out
 	}
+	out = append(out, verifyEachControlPlaneAnswersAtItsOwnListener(client, env)...)
 
 	// 1. The control plane answers.
 	// ★★★ A DEPLOYMENT THAT WAS STARTED SECONDS AGO IS NOT A DEPLOYMENT THAT IS DOWN (2026-08-26, found by
@@ -181,7 +183,12 @@ func verifyDeployment(dir, cpAdmin string, edgeAdmins []string, edgeTransport, a
 	}
 
 	// 3. The Edge answers.
-	if code, _, err := get(client, edgeAdmin+"/healthz", ""); err != nil || code != 200 {
+	//
+	// ★ WAITED FOR LIKE THE CONTROL PLANE (2026-11-04, found by following -order on a fresh single-machine
+	// install). Step 4 of the order restarts the Edge with the control plane, and the front door admits it only
+	// after its health check passes. Run straight after, this check got EOF and the two that depend on it failed
+	// with it, on a deployment that was fine half a minute later. The wait is for an answer, bounded.
+	if code, _, err := waitForAnAnswer(client, edgeAdmin+"/healthz", initialReadinessWait(90*time.Second, noWait)); err != nil || code != 200 {
 		add("the Edge answers", false, "%s/healthz -> %d %v", edgeAdmin, code, err)
 		return out
 	}
@@ -378,7 +385,7 @@ func verifyDeployment(dir, cpAdmin string, edgeAdmins []string, edgeTransport, a
 
 // edgeAppliedConfig asks the Edge's own health for whether it has applied a generation.
 func edgeAppliedConfig(client *http.Client, edgeAdmin string) bool {
-	code, body, err := get(client, edgeAdmin+"/healthz", "")
+	code, body, err := getNodeHealth(client, edgeAdmin+"/healthz")
 	if err != nil || code != 200 {
 		return false
 	}
@@ -652,7 +659,16 @@ func deploymentClient(dir string) (*http.Client, error) {
 	// unable to reach a deployment that was answering.
 	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}}
 	transport.DialContext = dialWithOverrides
-	return &http.Client{Timeout: 30 * time.Second, Transport: transport}, nil
+	// A node tells only its operator what it is (verify_asks_a_node_as_its_operator.go). The credential goes
+	// only where this client goes: to a server that proves this deployment's anchor.
+	nodeDetailBearer, nodeDetailCredentialKind = nodeDetailCredential(dir)
+	// Every call this client makes is to a route of this deployment, none of which redirects; a redirect is
+	// therefore something other than the deployment answering, and following it would carry whatever header the
+	// call set (the break-glass, the fleet token) to wherever it pointed — including plain HTTP on the same
+	// host, which the anchor above never gets to judge. The answer is returned as it came, and the check that
+	// made the call reads it as "not what this deployment says".
+	return &http.Client{Timeout: 30 * time.Second, Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, nil
 }
 
 // dialWithOverrides is the dialler every client the walk builds shares: it sends the connection to the
@@ -930,7 +946,15 @@ func runVerify(dir, cpAdmin, edgeAdmin, edgeTransport, adminToken, consoleURL, c
 		// of another region are not reachable from this host, and a deployment that has silently become two
 		// signing authorities is exactly a difference BETWEEN regions.
 		results = append(results, verifyOneSigningAuthority(client, strings.TrimRight(cpAdmin, "/"), peerToken)...)
-		results = append(results, verifyConsole(client, consoleURL)...)
+		// The Console with its own client: it may present the operator's certificate, which the deployment
+		// client does not trust (the_console_is_checked_the_way_a_browser_reaches_it.go).
+		if strings.TrimSpace(consoleURL) != "" {
+			if console, err := consoleClient(dir); err != nil {
+				results = append(results, verifyResult{name: "the Console answers", ok: false, note: err.Error()})
+			} else {
+				results = append(results, verifyConsole(console, consoleURL)...)
+			}
+		}
 		// ★★★ A DEPLOYMENT OF ONE MACHINE IS NOT ASKED WHETHER IT IS REDUNDANT (2026-09-03) — see
 		// a_shape_cannot_fail_for_being_the_shape.go. It has one control plane, one copy of its state and one
 		// door because that is the shape it was installed in, and reporting that as a failure teaches an
@@ -1047,7 +1071,7 @@ func reportVerificationResults(dir string, results []verifyResult) error {
 // needed a credential could not run at the moment a deployment is being handed over with its break-glass
 // credential already closed.
 func nodeShape(client *http.Client, adminURL string) (role string, holdsDatabase bool, ok bool) {
-	code, body, err := get(client, strings.TrimRight(adminURL, "/")+"/healthz", "")
+	code, body, err := getNodeHealth(client, strings.TrimRight(adminURL, "/")+"/healthz")
 	if err != nil || code != 200 {
 		return "", false, false
 	}
@@ -1110,7 +1134,7 @@ func controlPlaneGeneration(client *http.Client, cpAdmin, breakGlass, supplied s
 
 // edgeAppliedGeneration reads what the Edge is actually serving.
 func edgeAppliedGeneration(client *http.Client, edgeAdmin string) (uint64, string) {
-	code, body, err := get(client, strings.TrimRight(edgeAdmin, "/")+"/healthz", "")
+	code, body, err := getNodeHealth(client, strings.TrimRight(edgeAdmin, "/")+"/healthz")
 	if err != nil || code != 200 {
 		return 0, ""
 	}
@@ -1190,9 +1214,14 @@ func waitForTheFleetViewToForm(client *http.Client, cpAdmin, token string, withi
 // ★ IT WAITS FOR AN ANSWER, NOT FOR HEALTH. A control plane that answers anything other than 200 is reported
 // on the first reading it gives: the wait is for the socket, not for the verdict.
 func waitForTheControlPlaneToAnswer(client *http.Client, cpAdmin string, within time.Duration) (int, []byte, error) {
+	return waitForAnAnswer(client, cpAdmin+"/healthz", within)
+}
+
+// waitForAnAnswer polls url until it answers at all (any HTTP status), or the deadline passes.
+func waitForAnAnswer(client *http.Client, url string, within time.Duration) (int, []byte, error) {
 	deadline := time.Now().Add(within)
 	for {
-		code, body, err := get(client, cpAdmin+"/healthz", "")
+		code, body, err := get(client, url, "")
 		if err == nil {
 			return code, body, nil
 		}

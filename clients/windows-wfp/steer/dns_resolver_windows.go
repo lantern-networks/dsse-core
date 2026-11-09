@@ -163,6 +163,8 @@ func (m *resolverManager) publishSnapshot(entries []resolverEntry) error {
 			return nil
 		}
 	}
+	// durable-write: staged — a FIRST backup is published with os.Link so an existing file is never replaced,
+	// which durablefile.Write cannot express; a later backup replaces the one this process wrote.
 	tmp, err := os.CreateTemp(filepath.Dir(m.backup), ".dsse-dns-backup-*")
 	if err != nil {
 		return fmt.Errorf("prepare DNS backup: %w", err)

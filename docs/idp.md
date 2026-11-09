@@ -209,7 +209,10 @@ An invalid or missing expiry is **Unknown expiry**, never Active. Failed or
 malformed required reads show **Retry** instead of an empty list.
 
 The page lists and revokes approvals; it has no manual creation or editing form.
-**Revoke** asks for confirmation. Cancel sends no revocation request. The API
+**Revoke** asks for confirmation. Cancel sends no revocation request. The list and
+the revocation go to the control plane, which holds the approvals; an Edge that
+pulls its configuration refuses a revocation with 409 and says to use the control
+plane, because it cannot make one authoritative. The API
 checks the exact tenant and grant together before applying the denial. Repeated
 requests while a confirmation or write is pending are suppressed in the page.
 

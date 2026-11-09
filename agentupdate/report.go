@@ -85,6 +85,9 @@ type Report struct {
 	Channel        string `json:"channel,omitempty"`
 	ArtifactSHA256 string `json:"artifact_sha256,omitempty"`
 	Reason         string `json:"reason,omitempty"`
+	// RefusalCleared marks an "installed" report that says a refusal this device reported earlier no longer
+	// applies. See AppendRefusalCleared.
+	RefusalCleared bool   `json:"refusal_cleared,omitempty"`
 	At             string `json:"at"`
 	// DroppedBefore is how many earlier reports this device threw away to stay inside its cap, attached to the
 	// first report that gets out afterwards. A device offline long enough to overflow must not come back with a
@@ -576,6 +579,38 @@ func AppendRefusal(dir string, r Report, fingerprint string) (queued bool, err e
 // something has since progressed: a device that failed, updated, and later hits the same refusal again is
 // reporting a new event, not repeating an old one.
 func ClearRefusal(dir string) { _ = os.Remove(filepath.Join(dir, "last-refusal")) }
+
+// RefusalStands reports whether a refusal has been reported and nothing has since cleared it.
+func RefusalStands(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, "last-refusal"))
+	return err == nil
+}
+
+// AppendRefusalCleared tells the fleet that the refusal it was last sent no longer applies.
+//
+// ★★★ A REFUSAL WAS THE LAST WORD FOREVER (2026-11-04, found by upgrading a Windows device from 0.4.0 to 0.4.1).
+// The new updater ran for two seconds before the installer handed it the deployment's update-signing keys,
+// refused with "no trusted update-signing keys", and was restarted with them; from then on every pass ended in
+// "no manifest published for this device". Nothing is reported on that path — correctly, it is not an event —
+// so the control plane's last record of the device stayed the refusal, and the Devices screen said "refusing
+// the update" for as long as anyone looked, about a device with nothing wrong with it.
+//
+// So a pass that gets past every reason to refuse, while a refusal stands, says so once. It goes as
+// "installed", because the event schema has no other value for "this is what is running and nothing stands in
+// the way", and the control plane then decides the row the ordinary way: up to date, pending, or no release.
+// Report first, marker after, so a failure leaves the refusal standing and the next pass tries again.
+func AppendRefusalCleared(dir string, r Report) (stored Report, queued bool, err error) {
+	if !RefusalStands(dir) {
+		return r, false, nil
+	}
+	r.Status = ReportInstalled
+	r.RefusalCleared = true
+	if err := AppendReport(dir, r); err != nil {
+		return r, false, err
+	}
+	ClearRefusal(dir)
+	return r, true, nil
+}
 
 // ReportFromJournal builds the record for a journal that has just reached a terminal state.
 //

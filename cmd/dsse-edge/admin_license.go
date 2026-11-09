@@ -31,6 +31,9 @@ type adminLicenseDeps struct {
 		CountUntenanted() int
 		Tenants() []string
 	}
+	// connectorsAdmitted counts how many of a tenant's admitted identities are connectors. Optional: without it
+	// the breakdown reads 0 and the total is unchanged.
+	connectorsAdmitted func(tenantID string) int
 	// displayName resolves a tenant's human name. Optional: with no tenant model available the rows fall back to
 	// the identifier, which is worse to read but never wrong.
 	displayName     func(tenantID string) string
@@ -51,6 +54,10 @@ type tenantSeatView struct {
 	DisplayName string `json:"display_name,omitempty"`
 	Allocated   int    `json:"allocated"`
 	Used        int    `json:"used"`
+	// Connectors is how many of Used are connectors. The licence counts agents and a connector is one, so it
+	// holds a seat; the Devices screen does not list it. Without this the page read "in use 2" beside a Devices
+	// screen saying "1 device" and nothing explained the difference (0.4.1 acceptance B rerun).
+	Connectors int `json:"connectors"`
 	// Blocked is true when this tenant cannot enrol another device right now, and Reason says why in the
 	// operator's terms. This is the answer to the support call, precomputed.
 	Blocked bool   `json:"blocked"`
@@ -90,6 +97,9 @@ func (d adminLicenseDeps) tenantViews() []tenantSeatView {
 		}
 		if d.ledger != nil {
 			v.Used = d.ledger.CountAdmitted(id)
+		}
+		if d.connectorsAdmitted != nil {
+			v.Connectors = min(d.connectorsAdmitted(id), v.Used)
 		}
 		if d.licensing != nil {
 			if reason, blocked := d.licensing.RefuseEnrolment(id); blocked {

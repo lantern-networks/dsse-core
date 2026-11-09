@@ -37,7 +37,7 @@ func verifyOneBuild(client *http.Client, doors []string) []verifyResult {
 		if door == "" {
 			continue
 		}
-		code, body, err := get(client, door+"/healthz", "")
+		code, body, err := getNodeHealth(client, door+"/healthz")
 		if err != nil || code != 200 {
 			add(false, "%s did not answer /healthz (%d %v) — a node that cannot be asked cannot be shown to "+
 				"be the same program as the others", door, code, err)

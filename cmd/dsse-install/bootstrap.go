@@ -79,7 +79,12 @@ func bootstrapFirstAdministrator(dir, cpAdmin, email, password string) (*bootstr
 	var readOutput *os.File
 	readSaved := false
 	readPath := ""
-	if plan, planErr := loadInstallPlan(dir, ""); planErr == nil && declaredNodeMapProfile(plan.Profile) {
+	// ★★ EVERY DEPLOYMENT INSTALLED FROM A PLAN, NOT ONLY THE DECLARED SHARED FLEETS (0.4.1 final acceptance A,
+	// 2026-11-09). -activate-auth needs this credential to confirm each Edge applied the feature set, and it was
+	// reserved only for the declared node-map profiles — so the single-region and three-region plans had no way to
+	// switch on revocation reauthentication and ceremony recovery, and a revoked approval could be granted again
+	// from an existing identity-provider sign-in.
+	if _, planErr := loadInstallPlan(dir, ""); planErr == nil {
 		readPath = privateInstallReadTokenDestination(dir)
 		readOutput, err = os.OpenFile(readPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 		if err != nil {

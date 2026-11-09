@@ -98,7 +98,7 @@ jobs:
           POSTGRES_QUEUE_E2E_DSN: postgres://postgres@localhost:5432/postgres?sslmode=disable
           CLICKHOUSE_TEST_ENDPOINT: http://127.0.0.1:58124
           CLICKHOUSE_TEST_USER: default
-          CLICKHOUSE_TEST_PASSWORD: ci_manual_delete
+          CLICKHOUSE_TEST_PASSWORD: ci_manual_delete  # throwaway password of the ephemeral CI ClickHouse service above, not a secret
         run: go test ./cmd/dsse-edge -run '^(TestManualHotLogDelete|TestColdArchiveHealth|TestColdArchiveDeliveryState)' -count=1 -v
       - name: Generated archive alert publisher delivers over HTTPS
         env:

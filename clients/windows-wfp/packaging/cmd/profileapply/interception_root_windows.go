@@ -114,36 +114,24 @@ func doInstallInterceptionRoot(path string) error {
 	return doInstallTrustAnchor(path, "interception root")
 }
 
-// doInstallTrustAnchor lays certificates into the machine trust store and says what they are.
+// doInstallTrustAnchor lays certificates into the machine trust store and says what they are. What is added and
+// what is recorded is decided in installTrustAnchor (trust_anchor_install.go); this is only the store.
 func doInstallTrustAnchor(path, what string) error {
-	incoming, err := readInterceptionRoots(path)
-	if err != nil {
-		return err
-	}
-	store, err := openMachineRootStore()
-	if err != nil {
-		return err
-	}
-	defer windows.CertCloseStore(store, 0)
-
-	existing, err := enumerateStore(store)
-	if err != nil {
-		return err
-	}
-	plan, err := planRootInstall(existing, incoming)
-	if err != nil {
-		return err
-	}
-	for _, r := range plan.AlreadyPresent {
-		fmt.Printf("profileapply: interception root already trusted, nothing to do: %s (%s)\n", r.Subject, r.SHA256)
-	}
-	for _, r := range plan.Add {
-		if aerr := addToStore(store, r.DER); aerr != nil {
-			return fmt.Errorf("%s (%s): %w", r.Subject, r.SHA256, aerr)
+	var store windows.Handle
+	defer func() {
+		if store != 0 {
+			windows.CertCloseStore(store, 0)
 		}
-		fmt.Printf("profileapply: %s INSTALLED into LocalMachine\\Root: %s (%s)\n", what, r.Subject, r.SHA256)
+	}()
+	list := func() ([]parsedRoot, error) {
+		h, err := openMachineRootStore()
+		if err != nil {
+			return nil, err
+		}
+		store = h
+		return enumerateStore(store)
 	}
-	return nil
+	return installTrustAnchor(path, what, list, func(der []byte) error { return addToStore(store, der) })
 }
 
 // removeFromStore deletes one certificate, found in the store by its DER bytes.
@@ -201,6 +189,9 @@ func doRemoveInterceptionRoot(path string) error {
 	ours, err := readOurRoots(path)
 	if err != nil {
 		return err
+	}
+	if ours, err = onlyWhatProvisioningAdded(path, ours); err != nil {
+		return fmt.Errorf("read which certificates provisioning added for %s: %w", path, err)
 	}
 	if len(ours) == 0 {
 		return nil

@@ -158,6 +158,18 @@ func (p *Plan) threeRegionEnvironment(region PlanRegion, machine PlanMachine, en
 	env["DSSE_SUBNET_RANGE"] = fmt.Sprintf("10.%d.1.0/24", octet)
 	env["DSSE_SUBNET_V6"] = fmt.Sprintf("fd00:d55e:%d::/64", octet)
 	env["DSSE_FRONT_DOOR_A"] = fmt.Sprintf("10.%d.0.5", octet)
+	// Every Region's doorway lists every Region's Console as a backend and states the browser's address to
+	// it, so a Console here is reached from the other Regions' control-plane machines as well as from its own
+	// door (re-review RR1). The list is derived from the same plan the backends are.
+	consoleDoors := []string{env["DSSE_FRONT_DOOR_A"]}
+	for _, other := range p.Regions {
+		if strings.EqualFold(other.ID, region.ID) {
+			continue
+		}
+		cp := other.controlPlane()
+		consoleDoors = append(consoleDoors, dedupeSorted(cp.Addresses, cp.reachableAt())...)
+	}
+	env["DSSE_CONSOLE_TRUSTED_FRONT_DOORS"] = strings.Join(dedupeSorted(consoleDoors[1:], consoleDoors[0]), ",")
 	env["DSSE_EDGE_BALANCE"], env["DSSE_STEER_MUX_ONLY"] = "leastconn", "true"
 	env["DSSE_EDGE_CHECK_TLS_NAME"] = p.PlaneNamesFor(region.ID)["agents"]
 	env["DSSE_EDGE_BIND"] = machine.Addresses[0] + ":"
@@ -193,6 +205,18 @@ func (p *Plan) threeRegionEnvironment(region PlanRegion, machine PlanMachine, en
 		localDoor = env["DSSE_FRONT_DOOR_A"]
 	}
 	aliases[p.Deployment] = localDoor
+	// This machine's Edge (and control plane) reach the deployment's names at localDoor. When that door is
+	// stopped they may leave through another Region's (third walk of acceptance C, C-1): every Region's door
+	// routes every Region's admin/authority names to the control plane (thisRegionsOwnPlaneNames), so the
+	// control plane stays reachable. See docs/deployment.md.
+	edgeFallbacks := []string{}
+	for _, other := range p.Regions {
+		if !strings.EqualFold(other.ID, region.ID) {
+			edgeFallbacks = append(edgeFallbacks, net.JoinHostPort(other.controlPlane().reachableAt(), "443"))
+		}
+	}
+	env["DSSE_EDGE_DOOR_FALLBACKS"] = strings.Join(edgeFallbacks, ",")
+	env["DSSE_EDGE_LOCAL_DOORS"] = net.JoinHostPort(localDoor, "443")
 	for _, plane := range []string{"agents", "admin", "authority", "console", "recovery"} {
 		aliases[plane+"."+p.Deployment] = localDoor
 	}
@@ -238,6 +262,17 @@ func (p *Plan) threeRegionEnvironment(region PlanRegion, machine PlanMachine, en
 		env["DSSE_CONSOLE_LOCAL_CP_LEADER_NAME"] = "admin." + p.Deployment
 		sort.Strings(consoles)
 		env["DSSE_CONSOLE_BACKENDS"] = strings.Join(consoles, ",")
+		env["DSSE_CONSOLE_LOCAL_BACKEND"] = fmt.Sprintf("%s:%d", machine.reachableAt(), planConsolePortA)
+		// Every Region's door routes admin.<deployment> to the leader, so the Console may leave through another
+		// Region's door when the one on this machine is stopped (acceptance C, 2026-11-08). The per-node Edge
+		// names stay with this Region's door; sign-in and the control plane do not depend on them.
+		doorFallbacks := []string{}
+		for _, other := range p.Regions {
+			if !strings.EqualFold(other.ID, region.ID) {
+				doorFallbacks = append(doorFallbacks, net.JoinHostPort(other.controlPlane().reachableAt(), "443"))
+			}
+		}
+		env["DSSE_CONSOLE_DOOR_FALLBACKS"] = strings.Join(doorFallbacks, ",")
 		sort.Strings(adminPeers)
 		env["DSSE_CP_PEERS"] = strings.Join(adminPeers, ",")
 		sort.Strings(dataPeers)

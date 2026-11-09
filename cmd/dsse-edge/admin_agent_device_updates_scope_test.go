@@ -58,7 +58,7 @@ func deviceUpdatesResponse(t *testing.T, asTenant string, enrolled *enrolledinve
 	t.Helper()
 	mux := http.NewServeMux()
 	registerAgentDeviceUpdateRoutes(mux, func(_ string, h http.HandlerFunc) http.HandlerFunc { return h },
-		devicestore.NewStore(), enrolled, telemetry, newPublishedAgentUpdateStore(), nil, nil, nil, nil)
+		devicestore.NewStore(), enrolled, telemetry, newPublishedAgentUpdateStore(), nil, nil, nil, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/admin/agent/device-updates", nil)
 	req = req.WithContext(context.WithValue(req.Context(), adminIdentityContextKey{},
 		adminIdentity{PrincipalID: "adm_test", TenantID: asTenant, AuthMethod: "admin_session"}))
@@ -484,7 +484,7 @@ func TestAPullingEdgeReportsTheReleaseItIsActuallyServing(t *testing.T) {
 	// No CP-authored store: this node pulls, which is what an enforcing Edge does.
 	registerAgentDeviceUpdateRoutes(mux, func(_ string, fn http.HandlerFunc) http.HandlerFunc { return fn },
 		devicestore.NewStore(), ledger, agenttelemetry.NewStore(), newPublishedAgentUpdateStore(), facing,
-		nil, nil, nil)
+		nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/agent/device-updates", nil)
 	req = req.WithContext(context.WithValue(req.Context(), adminIdentityContextKey{},
@@ -515,7 +515,7 @@ func TestDeviceUpdateAdminViewDoesNotExposeOtherTenantCanary(t *testing.T) {
 	}}
 	registerAgentDeviceUpdateRoutes(mux, func(_ string, fn http.HandlerFunc) http.HandlerFunc { return fn },
 		devicestore.NewStore(), enrolledinventory.NewLedger(), agenttelemetry.NewStore(), newPublishedAgentUpdateStore(), facing,
-		nil, nil, nil)
+		nil, nil, nil, nil)
 	for _, tc := range []struct{ tenant, version string }{{"Acme", "0.4.1"}, {"acme", "0.4.2"}, {"other", "0.4.0"}} {
 		req := httptest.NewRequest(http.MethodGet, "/admin/agent/device-updates", nil)
 		req = req.WithContext(context.WithValue(req.Context(), adminIdentityContextKey{},

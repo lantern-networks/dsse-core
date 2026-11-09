@@ -516,6 +516,7 @@ async function paDelegations(section) {
   uiState(section, "loading"); const current = freshRender(section);
   let grants, body;
   try {
+    // two-planes-deliberate: /admin/tenant supplies only WHICH organization this is, and every row is checked to belong to it; an organization's identity does not change between the two answers (2026-11-06).
     const [g, tenant] = await Promise.all([paGet("/admin/delegated-grants?limit=1000", _PA_ENF), paGet("/admin/tenant", _PA_ENF)]);
     if (!paObject(tenant) || !paText(tenant.tenant_id)) throw new Error("Invalid tenant response");
     grants = paCountedRows(g,"grants",paGrant,tenant.tenant_id); body = g;
@@ -591,6 +592,7 @@ function paActivityBadge(result, approval=false) {
 async function paActivity(section) {
   uiState(section,"loading");const current=freshRender(section);let events,approvals,eventBody,approvalBody;
   try{
+    // two-planes-deliberate: /admin/tenant supplies only WHICH organization this is, and every row is checked to belong to it; an organization's identity does not change between the answers (2026-11-06).
     const [e,a,tenant]=await Promise.all([paGet("/admin/tool-call-events",_PA_ENF),paGet("/admin/human-approval-events",_PA_ENF),paGet("/admin/tenant",_PA_ENF)]);
     if(!paObject(tenant)||!paText(tenant.tenant_id))throw new Error("Invalid tenant response");
     const time=v=>typeof v==="string"&&Number.isFinite(Date.parse(v));

@@ -143,6 +143,8 @@ func registerTenantInspectionCRLRoute(mux *http.ServeMux, a *tenantInterceptionA
 }
 
 func registerTenantInspectionCRLAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, a *tenantInterceptionAuthority, audit func(*http.Request, string, string, map[string]any)) {
+	// control-plane-only: the interception authority exists only where -tenant-interception-authority-store is
+	// set (the control plane); an Edge registers this route and answers 503 without accepting anything.
 	mux.HandleFunc("POST /admin/tenant-interception-authority/root-crl", adminEndpoint("admin.enrollment.write|admin.tenant.admin", func(w http.ResponseWriter, r *http.Request) {
 		if a == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant interception authority is unavailable"))
@@ -174,6 +176,8 @@ func registerTenantInspectionCRLAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 		}
 		w.WriteHeader(204)
 	}))
+	// control-plane-only: the interception authority exists only where -tenant-interception-authority-store is
+	// set (the control plane); an Edge registers this route and answers 503 without accepting anything.
 	mux.HandleFunc("POST /admin/tenant-interception-authority/revoke-delegation", adminEndpoint("admin.enrollment.write|admin.tenant.admin", func(w http.ResponseWriter, r *http.Request) {
 		if a == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant interception authority is unavailable"))

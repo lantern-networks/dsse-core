@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 )
 
@@ -117,10 +116,9 @@ func TestOneRegionThreeNodesFoundingArtifactsUseAllThreeEdges(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(work, "deployment")
-	previousUmask := syscall.Umask(0o077)
-	defer syscall.Umask(previousUmask)
+	restoreUmask := withPrivateUmask(t)
 	installFromPlan(t, planPath, dir)
-	syscall.Umask(previousUmask)
+	restoreUmask()
 	anchor, err := os.Stat(filepath.Join(dir, "deployment-anchor.pem"))
 	if err != nil || anchor.Mode().Perm() != 0o644 {
 		t.Fatalf("an unprivileged TLS health checker cannot read the public anchor: mode=%v err=%v", anchor, err)
@@ -158,7 +156,7 @@ func TestOneRegionThreeNodesFoundingArtifactsUseAllThreeEdges(t *testing.T) {
 	}
 	front := deploymentFileContents(t, dir, "haproxy-edge.cfg")
 	assertThreeNodeCPBackends(t, front, "10.20.0.1", "10.20.0.2", "10.20.0.3")
-	assertThreeNodeConsoleBackends(t, front)
+	assertThreeNodeConsoleBackends(t, front, "10.20.0.1")
 	checkThreeNodeHAProxySyntax(t, dir)
 	if !strings.Contains(backendBlock(front, "edge_fleet"), "balance leastconn") {
 		t.Fatal("the profile pins a whole NAT site to one Edge")
@@ -234,8 +232,8 @@ func TestOneRegionThreeNodesFoundingArtifactsUseAllThreeEdges(t *testing.T) {
 			}
 		}
 		assertThreeNodeCPBackends(t, stagedFront, m.ReachableAddress, otherIPs...)
-		assertThreeNodeConsoleBackends(t, stagedFront)
-		if backendBlock(stagedFront, "console_plane") != backendBlock(front, "console_plane") {
+		assertThreeNodeConsoleBackends(t, stagedFront, m.ReachableAddress)
+		if localConsoleAsAddress(backendBlock(stagedFront, "console_plane"), m.ReachableAddress) != localConsoleAsAddress(backendBlock(front, "console_plane"), "10.20.0.1") {
 			t.Errorf("%s Console candidate order differs from the founding doorway", m.Name)
 		}
 		assertThreeNodePortalRoutes(t, stagedFront, m.Portal, m.ReachableAddress)
@@ -280,9 +278,20 @@ func assertThreeNodePortalRoutes(t *testing.T, config, localName, localIP string
 	}
 }
 
-func assertThreeNodeConsoleBackends(t *testing.T, config string) {
+// localConsoleAsAddress writes a door's own Console, which it reaches over the container network, back as
+// that machine's address, so every door's candidate list can be compared in the same terms.
+func localConsoleAsAddress(block, own string) string {
+	return strings.ReplaceAll(block, "dsse-console:8443 check check-ssl check-sni console.example.test verify none send-proxy resolvers containers init-addr last,libc,none resolve-prefer ipv4",
+		own+":19544 check check-ssl check-sni console.example.test verify none send-proxy")
+}
+
+func assertThreeNodeConsoleBackends(t *testing.T, config, own string) {
 	t.Helper()
-	console := backendBlock(config, "console_plane")
+	raw := backendBlock(config, "console_plane")
+	if strings.Count(raw, " dsse-console:8443 ") != 1 || strings.Contains(raw, own+":19544") {
+		t.Errorf("the door on %s does not reach its own Console over the container network: %s", own, raw)
+	}
+	console := localConsoleAsAddress(raw, own)
 	if !strings.Contains(console, "balance first") ||
 		!strings.Contains(console, "option httpchk GET /ready") ||
 		!strings.Contains(console, "http-check expect status 200") ||

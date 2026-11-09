@@ -211,6 +211,10 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			"schema_version": "admin_agent_rollouts.v1",
 			"tenant_id":      adminTenantIDFromRequest(r),
 			"tenants":        out,
+			// Every plan this deployment holds is above, so an organization missing from it has none: the
+			// default, not halted. A customer's answer holds only its own and says nothing about the rest.
+			// See agentRolloutCache.complete.
+			"complete": forTheDeployment,
 		})
 	}))
 	mux.HandleFunc("PUT /admin/agent-rollout", adminEndpoint("admin.agents.write", func(w http.ResponseWriter, r *http.Request) {

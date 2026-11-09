@@ -40,7 +40,7 @@ func verifyNodeAdminOwners(client *http.Client, env map[string]string, deploymen
 				return result
 			}
 			seen[host] = true
-			status, body, err := get(client, strings.TrimRight(strings.TrimSpace(raw), "/")+"/healthz", "")
+			status, body, err := getNodeHealth(client, strings.TrimRight(strings.TrimSpace(raw), "/")+"/healthz")
 			var health struct{ Machine, Role, Status string }
 			if err != nil || status != http.StatusOK || json.Unmarshal(body, &health) != nil || health.Status != "ok" || health.Machine != t.Machine || health.Role != t.Role {
 				result.note = fmt.Sprintf("%s did not return healthy owner %s/%s", u.Hostname(), t.Machine, t.Role)

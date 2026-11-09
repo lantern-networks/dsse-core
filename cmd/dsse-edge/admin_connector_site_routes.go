@@ -80,6 +80,10 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 				writeError(w, http.StatusBadRequest, fmt.Errorf("raw CIDR bindings are not accepted: define %q as a Named Network on the Networks page, then bind it by network_id", req.CIDR))
 				return
 			}
+			if action == "add" && addressShapedName(req.FQDN) {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("%q is an address, not a name: define it as a Named Network on the Networks page, then bind it by network_id", req.FQDN))
+				return
+			}
 			set := 0
 			for _, present := range []bool{req.CIDR != "", isFQDN, isNetwork} {
 				if present {
@@ -450,6 +454,10 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			writeError(w, http.StatusBadRequest, fmt.Errorf("raw CIDR bindings are not accepted: define %q as a Named Network on the Networks page, then bind it by network_id", req.CIDR))
 			return
 		}
+		if action == "add" && addressShapedName(req.FQDN) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("%q is an address, not a name: define it as a Named Network on the Networks page, then bind it by network_id", req.FQDN))
+			return
+		}
 		set := 0
 		for _, present := range []bool{req.CIDR != "", req.FQDN != "", req.NetworkID != ""} {
 			if present {
@@ -666,3 +674,21 @@ func namedNetworkVisibleToTenant(o model.VLANObject, ok bool, tenant string) boo
 }
 
 // Keep storage paths and internal error details out of the administrative response.
+
+// addressShapedName reports a "name" that is an address or a range.
+//
+// ★ A RANGE TYPED INTO THE NAME FIELD WAS STORED AS A NAME (2026-11-08, acceptance C). The site's network field
+// takes a host name; "10.47.1.30/32" was typed into it, sent as fqdn, and accepted — listed as a name and
+// delivered to the connector as cidrs=[] fqdns=1. A connector resolves a name, so a range stored that way
+// matches nothing, and the rule that a subnet is a Named Network (documented, and enforced for the cidr field)
+// was bypassed by the field beside it. An address is refused with the same direction as a raw CIDR.
+func addressShapedName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	if strings.ContainsAny(name, "/:") {
+		return true
+	}
+	return net.ParseIP(strings.Trim(name, "[]")) != nil
+}

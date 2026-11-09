@@ -43,13 +43,7 @@ func registerAuditIngestReceiver(mux *http.ServeMux, writer *logs.Writer, token 
 	if token == "" || writer == nil {
 		return
 	}
-	allowed := map[string]bool{}
-	for _, s := range defaultAuditShipStreams {
-		allowed[s] = true
-	}
-	for _, s := range observationReportStreams {
-		allowed[s] = true
-	}
+	allowed := auditIngestAllowedStreams()
 	mux.HandleFunc("POST /audit-ingest", func(w http.ResponseWriter, r *http.Request) {
 		if !auditIngestBearerValid(r, token) {
 			writeError(w, http.StatusUnauthorized, fmt.Errorf("audit-ingest: unauthorized"))
@@ -289,4 +283,17 @@ func recordShippedDeviceState(p *fleetDeviceProjection, stream string, body []by
 		return
 	}
 	p.Fold(row)
+}
+
+// auditIngestAllowedStreams is what the receiver accepts: everything the shipper sends by default, and the
+// observation reports. Derived from the shipper's own list so the two cannot drift apart.
+func auditIngestAllowedStreams() map[string]bool {
+	allowed := map[string]bool{}
+	for _, s := range defaultAuditShipStreams {
+		allowed[s] = true
+	}
+	for _, s := range observationReportStreams {
+		allowed[s] = true
+	}
+	return allowed
 }

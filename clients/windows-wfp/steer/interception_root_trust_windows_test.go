@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -45,9 +46,14 @@ func aRootStoreFingerprint(t *testing.T) string {
 	// certutil -store Root dumps the machine Root store; each cert has a base64 blob we can hash. Simpler:
 	// enumerate with our own scanner is what we are testing, so take an independent path — grab any cert DER
 	// from the store via PowerShell and hash it here.
-	out, err := exec.Command("powershell", "-NoProfile", "-Command",
+	cmd := exec.Command("powershell", "-NoProfile", "-Command",
 		`$c = Get-ChildItem Cert:\LocalMachine\Root | Select-Object -First 1; `+
-			`[System.Convert]::ToBase64String($c.RawData)`).Output()
+			`[System.Convert]::ToBase64String($c.RawData)`)
+	// Run from PowerShell 7, the child Windows PowerShell 5.1 inherited PowerShell 7's module path, could not load
+	// its own certificate provider, had no Cert: drive, and this test skipped (0.4.1 MSI builds, 2026-11-08). The
+	// child is given the environment without that path, so it finds its own modules.
+	cmd.Env = environmentWithout(os.Environ(), "PSModulePath")
+	out, err := cmd.Output()
 	if err != nil {
 		t.Skipf("cannot read the LocalMachine Root store to calibrate the test: %v", err)
 	}
@@ -61,4 +67,17 @@ func aRootStoreFingerprint(t *testing.T) string {
 	}
 	sum := sha256.Sum256(der)
 	return hex.EncodeToString(sum[:])
+}
+
+// environmentWithout is env with every entry named name removed. Windows matches names without regard to case.
+func environmentWithout(env []string, name string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		key, _, _ := strings.Cut(kv, "=")
+		if strings.EqualFold(key, name) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }

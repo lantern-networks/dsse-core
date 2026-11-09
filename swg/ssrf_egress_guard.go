@@ -81,29 +81,53 @@ func CheckEgressDestination(ctx context.Context, host string) error {
 	if !internalBlockEnabled.Load() {
 		return nil
 	}
+	_, err := VetEgressDestination(ctx, host)
+	return err
+}
+
+// LookupIPAddr resolves a destination name for the guard. Production uses the system resolver; a test
+// replaces it to stand in for a resolver whose answers change between two lookups.
+var LookupIPAddr = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return net.DefaultResolver.LookupIPAddr(ctx, host)
+}
+
+// VetEgressDestination resolves host — or parses it, when it is an address literal — and returns the
+// addresses the caller may dial. With the guard enabled every address must be public, or the whole
+// destination is refused.
+//
+// ★★★ THE CALLER DIALS THESE ADDRESSES, NOT THE NAME (2026-11-07, security review S2). The steer dialer used
+// to call CheckEgressDestination and then hand the NAME to net.Dialer, which resolved it a second time. Two
+// lookups are two answers: a resolver the device's user controls can answer a public address to the check
+// and 169.254.169.254 — or the docker network's etcd — to the dial, and the guard has looked at a different
+// address than the one the socket connected to. Returning the vetted addresses makes the check and the
+// connection one event; the Control hook and GuardDialContext stay on the socket as the second line.
+func VetEgressDestination(ctx context.Context, host string) ([]net.IP, error) {
 	host = strings.TrimSpace(host)
 	if host == "" {
-		return fmt.Errorf("ssrf egress guard: empty destination host")
+		return nil, fmt.Errorf("ssrf egress guard: empty destination host")
 	}
+	enabled := internalBlockEnabled.Load()
 	if ip := net.ParseIP(host); ip != nil {
-		if IsBlockedEgressIP(ip) {
-			return fmt.Errorf("ssrf egress guard: egress to internal/link-local/loopback/metadata address %s is blocked", ip)
+		if enabled && IsBlockedEgressIP(ip) {
+			return nil, fmt.Errorf("ssrf egress guard: egress to internal/link-local/loopback/metadata address %s is blocked", ip)
 		}
-		return nil
+		return []net.IP{ip}, nil
 	}
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	addrs, err := LookupIPAddr(ctx, host)
 	if err != nil {
-		return fmt.Errorf("ssrf egress guard: resolve %q: %w", host, err)
+		return nil, fmt.Errorf("ssrf egress guard: resolve %q: %w", host, err)
 	}
 	if len(addrs) == 0 {
-		return fmt.Errorf("ssrf egress guard: %q resolved to no addresses", host)
+		return nil, fmt.Errorf("ssrf egress guard: %q resolved to no addresses", host)
 	}
+	ips := make([]net.IP, 0, len(addrs))
 	for _, a := range addrs {
-		if IsBlockedEgressIP(a.IP) {
-			return fmt.Errorf("ssrf egress guard: %s resolves to internal/link-local/loopback/metadata address %s — blocked", host, a.IP)
+		if enabled && IsBlockedEgressIP(a.IP) {
+			return nil, fmt.Errorf("ssrf egress guard: %s resolves to internal/link-local/loopback/metadata address %s — blocked", host, a.IP)
 		}
+		ips = append(ips, a.IP)
 	}
-	return nil
+	return ips, nil
 }
 
 // cgnRange is RFC6598 100.64.0.0/10 (carrier-grade NAT shared address space). Go's IsPrivate does not cover

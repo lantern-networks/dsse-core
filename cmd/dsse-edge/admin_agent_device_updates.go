@@ -68,7 +68,7 @@ func registerAgentDeviceUpdateRoutes(mux *http.ServeMux, adminEndpoint func(stri
 	deviceStore deviceRuntimeStore, enrolled *enrolledinventory.Ledger, telemetry agenttelemetry.RuntimeStore,
 	published *publishedAgentUpdateStore, deviceFacing *publishedUpdates,
 	plans *agentrollout.AgentRolloutStore, rolloutCache *agentRolloutCache,
-	trustedKeys []string) {
+	trustedKeys []string, registry connectorRegistryStore) {
 	mux.HandleFunc("GET /admin/agent/device-updates", adminEndpoint("admin.agents.read", func(w http.ResponseWriter, r *http.Request) {
 		tenantID := adminTenantIDFromRequest(r)
 		now := time.Now().UTC()
@@ -153,11 +153,22 @@ func registerAgentDeviceUpdateRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		unassigned := 0
 		identities := []string{}
 		seen := map[string]bool{}
+		// ★★ A CONNECTOR WAS COUNTED AS A DEVICE THAT NEVER REPORTED (2026-11-04, acceptance A, third run). One
+		// Windows device and one connector read "1/2 devices have reported an outcome": a connector enrols in
+		// the same ledger, and it is not an agent this lane updates, so it can never report. The Devices list
+		// already withholds connectors (a_connector_is_not_a_device_on_the_devices_screen.go); so does this,
+		// and says how many.
+		connectors := connectorIdentitiesFor(registry, tenantID)
+		withheldConnectors := 0
 		if enrolled != nil {
 			for _, entry := range enrolled.List() {
 				entryTenant := strings.TrimSpace(entry.TenantID)
 				if entryTenant == "" {
 					unassigned++
+					continue
+				}
+				if entryTenant == strings.TrimSpace(tenantID) && isConnectorIdentity(connectors, entry.Identity) {
+					withheldConnectors++
 					continue
 				}
 				if entryTenant != strings.TrimSpace(tenantID) {
@@ -170,13 +181,13 @@ func registerAgentDeviceUpdateRoutes(mux *http.ServeMux, adminEndpoint func(stri
 			}
 		}
 		for id := range byID {
-			if !seen[id] {
+			if !seen[id] && !isConnectorIdentity(connectors, id) {
 				seen[id] = true
 				identities = append(identities, id)
 			}
 		}
 		for id := range latest {
-			if !seen[id] {
+			if !seen[id] && !isConnectorIdentity(connectors, id) {
 				seen[id] = true
 				identities = append(identities, id)
 			}
@@ -222,6 +233,9 @@ func registerAgentDeviceUpdateRoutes(mux *http.ServeMux, adminEndpoint func(stri
 			}
 			if unassigned > 0 {
 				coverage["unassigned"] = unassigned
+			}
+			if withheldConnectors > 0 {
+				coverage["connectors"] = withheldConnectors
 			}
 		}
 

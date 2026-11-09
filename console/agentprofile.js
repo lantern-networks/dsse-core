@@ -119,7 +119,10 @@ function renderAgentProfileForm(host) {
   ]);
   const endpointList = el("div", { class: "ui-checklist" });
   endpointHost.appendChild(endpointList);
-  endpointHost.appendChild(el("span", { class: "ui-field-hint", text: opts.transport_endpoints_note || "" }));
+  // ★ SAID IN THE READER'S LANGUAGE (2026-11-04, found while photographing this screen in Japanese). The server's
+  // note is English and was shown as it came; the three cases it distinguishes are decided by how many addresses
+  // there are, which this screen already has.
+  endpointHost.appendChild(el("span", { class: "ui-field-hint", text: endpointNote((opts.transport_endpoints || []).length) }));
   if ((opts.transport_endpoints_unreachable || []).length) {
     endpointHost.appendChild(el("p", { class: "ui-view-desc", text: bl({
       en: "One or more of this deployment's addresses resolves to the machine itself, so a device would dial "
@@ -327,7 +330,31 @@ function renderAgentProfileForm(host) {
 // "iCloud (incl" — a label that is worse than the untrimmed text, and wrong in a way nobody would report.
 const PROFILE_NOT_SENTENCE_END = ["incl", "excl", "e.g", "i.e", "etc", "vs", "approx", "ca", "inc", "ltd"];
 
+// What each entry of the built-in catalogue IS, in both languages (2026-11-07, three-region acceptance rerun: the
+// list read "Apple Push (APNs)" and the rest in English on a Japanese screen). Keyed by the catalogue's name; an
+// entry this table does not know — one a catalogue feed added — is named from its description as before.
+const PROFILE_BYPASS_NAMES = {
+  apple_push: { en: "Apple push notifications (APNs)", ja: "Apple のプッシュ通知（APNs）" },
+  apple_software_update: { en: "Apple software update / iTunes media", ja: "Apple のソフトウェア・アップデート / iTunes のメディア" },
+  apple_app_store: { en: "Apple App Store / Game Center / iWork", ja: "Apple の App Store / Game Center / iWork" },
+  apple_certificate_validation: { en: "Apple certificate revocation checks (OCSP/CRL)", ja: "Apple の証明書の失効確認（OCSP/CRL）" },
+  apple_code_signing_timestamp: { en: "Apple's code-signing timestamp authority", ja: "Apple のコード署名のタイムスタンプ" },
+  apple_notarization_gatekeeper: { en: "Apple notarization tickets (Gatekeeper)", ja: "Apple の公証チケット（Gatekeeper）" },
+  apple_account_id: { en: "Apple Account / Apple ID sign-in", ja: "Apple アカウント（Apple ID）のサインイン" },
+  apple_icloud: { en: "iCloud (including Private Relay)", ja: "iCloud（プライベートリレーを含む）" },
+  apple_device_management: { en: "Apple device management (ABM/ASM, DEP/MDM/VPP)", ja: "Apple のデバイス管理（ABM/ASM、DEP/MDM/VPP）" },
+  apple_time: { en: "Apple time sync", ja: "Apple の時刻合わせ" },
+  apple_captive_dns: { en: "Apple captive portal detection / DNS", ja: "Apple のキャプティブポータル判定 / DNS" },
+  apple_other_services: { en: "Other Apple services Apple lists for enterprise networks", ja: "Apple が企業ネットワーク向けに挙げるその他のサービス" },
+  windows_update: { en: "Windows Update / delivery optimization", ja: "Windows Update / 配信の最適化" },
+  google_chrome_account_manager: { en: "Chrome account manager (OAuth)", ja: "Chrome のアカウント管理（OAuth）" },
+  github_asset_cdn: { en: "GitHub's asset CDN (githubassets.com)", ja: "GitHub の静的ファイル配信（githubassets.com）" },
+  ca_certificate_validation: { en: "Certificate revocation checks of other authorities (OCSP/CRL)", ja: "Apple 以外の認証局の失効確認（OCSP/CRL）" },
+  fido2_passkey_hybrid_cable: { en: "Passkeys using another device (FIDO2 hybrid)", ja: "別の端末を使うパスキー（FIDO2 ハイブリッド）" },
+};
+
 function profileBypassLabel(entry) {
+  if (PROFILE_BYPASS_NAMES[entry.name]) return bl(PROFILE_BYPASS_NAMES[entry.name]);
   const raw = String(entry.description || entry.name || "").replace(/`/g, "").trim();
   if (!raw) return entry.id;
   const re = /\.\s+(?=[A-Z(])/g;
@@ -653,4 +680,16 @@ function showAgentProfileMade(envelope, group, profileContext = agentProfileCont
       makeTokens.disabled = false;
     }
   });
+}
+
+function endpointNote(n) {
+  if (n === 0) return bl({
+    en: "This deployment has not been told the address its agents reach it on.",
+    ja: "この配備には、エージェントがつなぐアドレスがまだ設定されていません。" });
+  if (n === 1) return bl({
+    en: "This deployment publishes one region, so a device that cannot reach it has nowhere else to start — it keeps whatever it last applied and cannot enrol for the first time.",
+    ja: "この配備のリージョンは1つです。そこに届かない端末には、ほかにつなぐ先がありません。端末は最後に適用した設定を保ち、初めての登録はできません。" });
+  return bl({
+    en: "A device tries these in order until one answers; once an Edge does, its signed region list governs.",
+    ja: "端末は、応答があるまでこれらを順に試します。Edge が応答したあとは、その Edge が渡す署名付きのリージョンの一覧に従います。" });
 }

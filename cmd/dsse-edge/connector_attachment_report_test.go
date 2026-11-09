@@ -153,3 +153,61 @@ func TestAnAttachmentReportAlsoCarriesTheLivenessItObserved(t *testing.T) {
 		t.Errorf("the operator's name was overwritten by a liveness report: %q", got.Name)
 	}
 }
+
+// ★★★ A HEARTBEAT ON A NODE WITHOUT THE TUNNEL IS LIVENESS AND NOTHING ELSE (review of 2026-11-07). On the
+// multi-node layouts the agent door balances by least connections, so a connector's heartbeat lands on whichever
+// node has the fewest connections — tunnel or not. That node carries the heartbeat so last_heartbeat keeps
+// moving, and the authority takes the heartbeat and status only: not the reporter's region as where the
+// connector is, and not its copy of the registration.
+func TestAHeartbeatOnlyReportMovesLivenessAndNothingElse(t *testing.T) {
+	registry := connector.NewRegistry()
+	if _, err := registry.Register(model.ConnectorRegistration{
+		ID: "conn-1", TenantID: "t1", Status: "registered", EdgeRegionID: "region-a", AttachedRegionID: "region-a",
+		PrivateBaseURL: "https://internal.invalid", Name: "Tokyo DC connector", LastHeartbeatAt: "2026-11-07T01:00:00Z",
+		ReachableRoutes: model.ConnectorReachableRoutes{FQDNDomains: []string{"corp.internal"}},
+	}, time.Now()); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	server := connectorReportServer(t, registry)
+
+	// The region-b node received the heartbeat; it holds no tunnel, and its copy is stale.
+	stale := model.ConnectorRegistration{ID: "conn-1", TenantID: "t1", PrivateBaseURL: "https://internal.invalid",
+		Status: "healthy", LastHeartbeatAt: "2026-11-07T01:05:00Z", EdgeRegionID: "region-b"}
+	if code := postConnectorReport(t, server, map[string]any{
+		"registration": stale, "tenant_id": "t1", "liveness_only": true,
+	}); code != http.StatusNoContent {
+		t.Fatalf("status: got %d", code)
+	}
+	got, ok := registry.Get("conn-1")
+	if !ok {
+		t.Fatal("the connector disappeared")
+	}
+	if got.LastHeartbeatAt != "2026-11-07T01:05:00Z" || got.Status != "healthy" {
+		t.Fatalf("the heartbeat was not taken: heartbeat=%q status=%q — the connector reads offline for as long as "+
+			"heartbeats land on a node without its tunnel", got.LastHeartbeatAt, got.Status)
+	}
+	if got.AttachedRegionID != "region-a" {
+		t.Fatalf("a heartbeat-only report moved where the connector is: %q", got.AttachedRegionID)
+	}
+	if got.Name != "Tokyo DC connector" || len(got.ReachableRoutes.FQDNDomains) != 1 || got.EdgeRegionID != "region-a" {
+		t.Fatalf("a heartbeat-only report overwrote the registration: %+v", got)
+	}
+
+	// A connector the authority does not know is not learned from a heartbeat.
+	if code := postConnectorReport(t, server, map[string]any{
+		"registration": model.ConnectorRegistration{ID: "conn-new", TenantID: "t1", PrivateBaseURL: "https://internal.invalid", LastHeartbeatAt: "2026-11-07T01:06:00Z"},
+		"tenant_id":    "t1", "liveness_only": true,
+	}); code != http.StatusNoContent {
+		t.Fatalf("status for an unknown connector: got %d", code)
+	}
+	if _, known := registry.Get("conn-new"); known {
+		t.Fatal("a heartbeat-only report registered a connector the authority did not know")
+	}
+
+	// And it may not reach into another organization.
+	if code := postConnectorReport(t, server, map[string]any{
+		"registration": stale, "tenant_id": "t2", "liveness_only": true,
+	}); code != http.StatusForbidden {
+		t.Fatalf("status for another tenant: got %d", code)
+	}
+}

@@ -119,7 +119,7 @@ func verifyAuthorityStateForProfile(client *http.Client, cpAdmin string, oneRegi
 	add := func(name string, ok bool, format string, args ...any) {
 		out = append(out, verifyResult{name: name, ok: ok, note: fmt.Sprintf(format, args...)})
 	}
-	code, body, err := get(client, strings.TrimRight(cpAdmin, "/")+"/healthz", "")
+	code, body, err := getNodeHealth(client, strings.TrimRight(cpAdmin, "/")+"/healthz")
 	if err != nil || code != 200 {
 		add("the authority's durable state is redundant", false,
 			"could not ask the control plane: %d %v", code, err)

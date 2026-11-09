@@ -184,7 +184,13 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 				siteGen = config.SiteStore.ConfigGeneration()
 			}
 		}
-		return policyStore.ConfigGeneration() + edgeDNSResolver.ConfigGeneration() + config.EnrolledLedger.ConfigGeneration() +
+		// ★ AND THE STEERING EXCLUSIONS (2026-11-08), carried from today — the eighth instance of the lesson
+		// above, and the first one learned on a customer's device rather than on an Edge's log.
+		var steerExclusionGen uint64
+		if config.SteerExclusions != nil {
+			steerExclusionGen = config.SteerExclusions.ConfigGeneration()
+		}
+		return steerExclusionGen + policyStore.ConfigGeneration() + edgeDNSResolver.ConfigGeneration() + config.EnrolledLedger.ConfigGeneration() +
 			vlanBoundary.ConfigGeneration() + connectorGen + connectorRouteGov.ConfigGeneration() + nhiGen + delegatedGrantGen + ruleGen +
 			tenantGen + directoryGen + siteGen + postureGen + deviceCAGen + transportTrustGen + regionGen + licenceGen + config.DLPDistribution.Generation(), configBundleEpoch, nil
 	}
@@ -421,6 +427,15 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			// Third time in one night that asking for a concrete store by type turned a working path off
 			// without a word. The registry interface already has List(); that is what this needs.
 			bundle.Connectors = &connectorCatalogBundle{Connectors: publicConnectorRegistrations(registry.List())}
+		}
+		if config.SteerExclusions != nil {
+			all, err := config.SteerExclusions.SnapshotAllChecked()
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("steering exclusions cannot be read; retry"))
+				return
+			}
+			bundle.SteerExclusions = steerExclusionBundleFor(all, bundleTenants, tenantID,
+				adminCallerIsOperator(r) || configBundleFleetReader(r, config.OperatorTenantID))
 		}
 		// Fold the connector route-governance decisions into the bundle so a pull-model Edge converges on the
 		// CP-configured bindings + hold/adopt state without a shared governance store.

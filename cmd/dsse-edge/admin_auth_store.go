@@ -1041,7 +1041,7 @@ func registerAdminAccountRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			// out loud, so an invite that went to the wrong tenant looked exactly like one that went right.
 			"tenant_id":       inviteTenantID,
 			"activation_link": link,
-			"invitation":      buildAdminInvitation(req.Email, link, now),
+			"invitation":      buildAdminInvitation(req.Email, link, now, organizationZone(inviteTenantID)),
 		})
 	}))
 	// Per-tenant Administrators management . Every handler is

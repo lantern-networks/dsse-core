@@ -341,12 +341,15 @@ func (d ConnectorEgressDialer) OpenTCPConnection(ctx context.Context, route Netw
 	// authored on the SITE, so an HA pair fronts the same names; stopping at the first match hands every flow
 	// to one member and fails outright when that member is the one this Edge cannot reach, while its partner
 	// sits live holding the identical route.
-	candidates := []model.ConnectorRegistration{conn}
-	if d.ListConnectors != nil {
-		if all, cerr := d.ListConnectors(ctx, tenantID, destination, ""); cerr == nil && len(all) > 0 {
-			candidates = all
+	candidatesFor := func(first model.ConnectorRegistration) []model.ConnectorRegistration {
+		if d.ListConnectors != nil {
+			if all, cerr := d.ListConnectors(ctx, tenantID, destination, ""); cerr == nil && len(all) > 0 {
+				return all
+			}
 		}
+		return []model.ConnectorRegistration{first}
 	}
+	candidates := candidatesFor(conn)
 	// ★★★ A CANDIDATE IS TRIED TO THE POINT OF AN OPEN, NOT TO THE POINT OF A SESSION (2026-09-01, measured
 	// on a connector pair after the sibling relay landed).
 	//
@@ -363,34 +366,44 @@ func (d ConnectorEgressDialer) OpenTCPConnection(ctx context.Context, route Netw
 	if err != nil {
 		return nil, fmt.Errorf("tenant residency lookup failed: %w", err)
 	}
+	// ★★★ AND A CONNECTOR IN THE MIDDLE OF MOVING IS WAITED FOR, NOT REFUSED (2026-11-07, measured on 0.4.1
+	// acceptance B). A connector that had failed over to region-b went home to region-a. For eight seconds the
+	// region-b Edge — where the device still was, by design — had no tunnel for it and a catalogue that still said
+	// region-b, and it refused the flow it would have carried one poll later:
+	//
+	//	connector_unreachable host="10.43.1.30" candidates=1 this_region="region-b": connector … fronts
+	//	destination but has no live tunnel on this node, and this node has no link to a sibling …
+	//	connector_attached_region_learned connector=… region=region-a   (the same second)
+	//
+	// One of 109 measurements failed, and every connector that ever goes home does it to whatever arrives in that
+	// window. The node that just LOST the tunnel is the one that knows a move is under way; the tunnel provider
+	// remembers that, and says whether waiting for the deployment's new answer is worth it. See
+	// ConnectorMoveAwaiter. Anything else — a connector this node never held, residency, a refusal it caused
+	// itself — fails exactly as before, at once.
 	var upstream net.Conn
-	for _, candidate := range candidates {
-		s, serr := d.connectorEgressSession(candidate, destination, allowedRegions)
-		if serr != nil {
-			err = serr
-			log.Printf("connector_candidate_unreachable host=%q connector=%q connector_region=%q this_region=%q: %v",
-				destination, candidate.ID, ConnectorRegionForLog(candidate), d.LocalRegion, serr)
-			continue
-		}
-		sessions, viaPeer := peerEdgeCandidates(d.PeerEdges, connectorRegionForDecision(candidate), d.LocalRegion, s)
-		for _, session := range sessions {
-			c, oerr := openConnectorTunnelTCPConn(ctx, session, destination, route.Port, tenantID)
-			if oerr == nil {
-				upstream, conn, err = c, candidate, nil
-				break
-			}
-			err = oerr
-			log.Printf("connector_candidate_would_not_open host=%q connector=%q connector_region=%q this_region=%q: %v — trying another reachable path",
-				destination, candidate.ID, ConnectorRegionForLog(candidate), d.LocalRegion, oerr)
-			// A peer link is shared by other Connectors. A timeout for this
-			// destination must not disconnect unrelated relayed flows.
-			if !viaPeer && errors.Is(oerr, tunnel.ErrTCPOpenTimeout) {
-				_ = session.Close()
-			}
-		}
+	waitedSince := time.Time{}
+	for {
+		upstream, conn, err = d.openThroughFirstReachable(ctx, candidates, conn, destination, route.Port, tenantID, allowedRegions)
 		if upstream != nil {
 			break
 		}
+		if waitedSince.IsZero() {
+			waitedSince = time.Now()
+		}
+		if !awaitAConnectorMove(ctx, d.Tunnels, candidates) {
+			break
+		}
+		again, aerr := lookAgainAfterAMove(ctx, d.ResolveConnector, d.Residency, tenantID, destination)
+		if aerr != nil {
+			err = aerr
+			break
+		}
+		conn, candidates, allowedRegions = again.conn, candidatesFor(again.conn), again.allowedRegions
+	}
+	if upstream != nil && !waitedSince.IsZero() {
+		log.Printf("connector_route_waited_for_move host=%q connector=%q connector_region=%q this_region=%q waited=%s — "+
+			"the connector was moving between Regions; the flow was held instead of refused",
+			destination, conn.ID, ConnectorRegionForLog(conn), d.LocalRegion, time.Since(waitedSince).Round(time.Millisecond))
 	}
 	if upstream != nil {
 		log.Printf("connector_route_chosen host=%q connector=%q connector_region=%q this_region=%q",
@@ -404,6 +417,100 @@ func (d ConnectorEgressDialer) OpenTCPConnection(ctx context.Context, route Netw
 	log.Printf("connector_unreachable host=%q candidates=%d this_region=%q: %v",
 		destination, len(candidates), d.LocalRegion, err)
 	return nil, err
+}
+
+// openThroughFirstReachable tries each candidate to the point of an open and returns the first that carries the
+// flow, with the candidate it used. Otherwise it returns the last error and the connector it was given.
+func (d ConnectorEgressDialer) openThroughFirstReachable(ctx context.Context, candidates []model.ConnectorRegistration,
+	conn model.ConnectorRegistration, destination string, port int, tenantID string, allowedRegions []string) (net.Conn, model.ConnectorRegistration, error) {
+	var err error
+	for _, candidate := range candidates {
+		s, serr := d.connectorEgressSession(candidate, destination, allowedRegions)
+		if serr != nil {
+			err = serr
+			log.Printf("connector_candidate_unreachable host=%q connector=%q connector_region=%q this_region=%q: %v",
+				destination, candidate.ID, ConnectorRegionForLog(candidate), d.LocalRegion, serr)
+			continue
+		}
+		sessions, viaPeer := peerEdgeCandidates(d.PeerEdges, connectorRegionForDecision(candidate), d.LocalRegion, s)
+		for _, session := range sessions {
+			c, oerr := openConnectorTunnelTCPConn(ctx, session, destination, port, tenantID)
+			if oerr == nil {
+				return c, candidate, nil
+			}
+			err = oerr
+			log.Printf("connector_candidate_would_not_open host=%q connector=%q connector_region=%q this_region=%q: %v — trying another reachable path",
+				destination, candidate.ID, ConnectorRegionForLog(candidate), d.LocalRegion, oerr)
+			// A peer link is shared by other Connectors. A timeout for this
+			// destination must not disconnect unrelated relayed flows.
+			if !viaPeer && errors.Is(oerr, tunnel.ErrTCPOpenTimeout) {
+				_ = session.Close()
+			}
+		}
+	}
+	return nil, conn, err
+}
+
+// afterAMove is what a held flow is routed by once something changed: the connector as the deployment now
+// records it, and the organization's residency boundary as it now stands.
+type afterAMove struct {
+	conn           model.ConnectorRegistration
+	allowedRegions []string
+}
+
+// lookAgainAfterAMove re-reads everything the reach decision depends on before a held flow is tried again.
+//
+// ★★★ A FLOW HELD FOR A MOVE WAS OPENED ON WHAT IT KNEW BEFORE THE WAIT (review of 2026-11-07, R1 and R2). The
+// first version looked the connector up again and, when the lookup said "nothing fronts this now" or could not
+// be made, went on with the candidates from before the wait — so a route withdrawn while the flow was held was
+// used the moment the tunnel came back. And the residency boundary was read once, before the wait, so a boundary
+// narrowed in the meantime did not apply to a connection that had not yet been made. A held flow is a NEW
+// connection; it is decided on what is true when it is made. A withdrawn route is a refusal, a lookup that
+// cannot be made is a refusal, and a boundary that cannot be read is a refusal — never a reason to keep going.
+func lookAgainAfterAMove(ctx context.Context, resolve ConnectorResolveFunc, residency ResidencyResolver, tenantID, destination string) (afterAMove, error) {
+	conn, ok, err := resolve(ctx, tenantID, destination, "")
+	if err != nil {
+		return afterAMove{}, fmt.Errorf("the connector route could not be looked up again after the wait: %w", err)
+	}
+	if !ok {
+		return afterAMove{}, fmt.Errorf("no connector fronts %s any more; the route was withdrawn while the flow was held", destination)
+	}
+	allowed, err := residency.allowedRegions(tenantID)
+	if err != nil {
+		return afterAMove{}, fmt.Errorf("tenant residency lookup failed after the wait: %w", err)
+	}
+	return afterAMove{conn: conn, allowedRegions: allowed}, nil
+}
+
+// ConnectorMoveAwaiter is what a tunnel provider adds when it remembers which connectors just LEFT this node.
+//
+// Only the node that was terminating a connector's tunnel sees it end, so only it knows that "no tunnel here"
+// is, for the next few seconds, a connector on its way somewhere else rather than a connector that is gone. The
+// rest of the deployment learns where it went when its new node reports and the next configuration poll
+// carries that — and in between, refusing is wrong.
+//
+// AwaitConnectorMove returns false at once for a connector this node has not just lost. For one it has, it
+// waits until something that can change the reach decision happens (the connector's tunnel comes back here,
+// or this node hears from the control plane) and returns true, or until the wait is over and returns false.
+// The wait is bounded by the provider, never by the number of flows asking.
+type ConnectorMoveAwaiter interface {
+	AwaitConnectorMove(ctx context.Context, connectorID string) bool
+}
+
+// awaitAConnectorMove asks the tunnel provider about every connector this flow could not reach. A provider
+// that does not remember departures — every one but the Edge's own — answers nothing, and the flow fails as
+// it always did.
+func awaitAConnectorMove(ctx context.Context, tunnels connectorTunnelProvider, candidates []model.ConnectorRegistration) bool {
+	awaiter, ok := tunnels.(ConnectorMoveAwaiter)
+	if !ok {
+		return false
+	}
+	for _, candidate := range candidates {
+		if awaiter.AwaitConnectorMove(ctx, candidate.ID) {
+			return true
+		}
+	}
+	return false
 }
 
 // openConnectorTunnelTCPConn opens a raw TCP stream to host:port THROUGH a connector tunnel and adapts it to an
@@ -509,12 +616,15 @@ func ConnectorEgressDialContextWithCandidates(base func(ctx context.Context, net
 		// ★ EVERY MEMBER OF THE SITE IS TRIED, most specific first. The one this Edge can reach is not
 		// knowable to the route layer, and an HA pair exists precisely so that one of them being unreachable
 		// is not an outage.
-		candidates := []model.ConnectorRegistration{conn}
-		if listCandidates != nil {
-			if all, cerr := listCandidates(ctx, flowTenant, host, ""); cerr == nil && len(all) > 0 {
-				candidates = all
+		candidatesFor := func(first model.ConnectorRegistration) []model.ConnectorRegistration {
+			if listCandidates != nil {
+				if all, cerr := listCandidates(ctx, flowTenant, host, ""); cerr == nil && len(all) > 0 {
+					return all
+				}
 			}
+			return []model.ConnectorRegistration{first}
 		}
+		candidates := candidatesFor(conn)
 		var lastErr error
 		port, err := strconv.Atoi(portStr)
 		if err != nil {
@@ -524,26 +634,49 @@ func ConnectorEgressDialContextWithCandidates(base func(ctx context.Context, net
 		if err != nil {
 			return nil, fmt.Errorf("tenant residency lookup failed: %w", err)
 		}
-		for _, candidate := range candidates {
-			s, serr := connectorEgressSessionFor(candidate, host, localRegion, allowedRegions, meshEligible, tunnels, peerEdges)
-			if serr == nil {
-				sessions, _ := peerEdgeCandidates(peerEdges, connectorRegionForDecision(candidate), localRegion, s)
-				for _, session := range sessions {
-					upstream, oerr := openConnectorTunnelTCPConn(ctx, session, host, port, flowTenant)
-					if oerr == nil {
-						log.Printf("connector_route_chosen host=%q connector=%q connector_region=%q this_region=%q",
-							host, candidate.ID, ConnectorRegionForLog(candidate), localRegion)
-						return upstream, nil
+		// ★ THE SAME WAIT AS THE BYPASS PATH, for the same reason: a connector that has just left this node is
+		// on its way somewhere, and a decrypted flow to what it fronts is held until the deployment says where.
+		// See ConnectorEgressDialer.OpenTCPConnection.
+		waitedSince := time.Time{}
+		for {
+			for _, candidate := range candidates {
+				s, serr := connectorEgressSessionFor(candidate, host, localRegion, allowedRegions, meshEligible, tunnels, peerEdges)
+				if serr == nil {
+					sessions, _ := peerEdgeCandidates(peerEdges, connectorRegionForDecision(candidate), localRegion, s)
+					for _, session := range sessions {
+						upstream, oerr := openConnectorTunnelTCPConn(ctx, session, host, port, flowTenant)
+						if oerr == nil {
+							if !waitedSince.IsZero() {
+								log.Printf("connector_route_waited_for_move host=%q connector=%q connector_region=%q this_region=%q waited=%s — "+
+									"the connector was moving between Regions; the flow was held instead of refused",
+									host, candidate.ID, ConnectorRegionForLog(candidate), localRegion, time.Since(waitedSince).Round(time.Millisecond))
+							}
+							log.Printf("connector_route_chosen host=%q connector=%q connector_region=%q this_region=%q",
+								host, candidate.ID, ConnectorRegionForLog(candidate), localRegion)
+							return upstream, nil
+						}
+						lastErr = oerr
 					}
-					lastErr = oerr
+					continue
 				}
-				continue
+				lastErr = serr
+				if len(candidates) > 1 {
+					log.Printf("connector_candidate_unreachable host=%q connector=%q connector_region=%q: %v — "+
+						"trying the next connector that fronts this name", host, candidate.ID, ConnectorRegionForLog(candidate), serr)
+				}
 			}
-			lastErr = serr
-			if len(candidates) > 1 {
-				log.Printf("connector_candidate_unreachable host=%q connector=%q connector_region=%q: %v — "+
-					"trying the next connector that fronts this name", host, candidate.ID, ConnectorRegionForLog(candidate), serr)
+			if waitedSince.IsZero() {
+				waitedSince = time.Now()
 			}
+			if !awaitAConnectorMove(ctx, tunnels, candidates) {
+				break
+			}
+			again, aerr := lookAgainAfterAMove(ctx, resolveConnector, residency, flowTenant, host)
+			if aerr != nil {
+				lastErr = aerr
+				break
+			}
+			conn, candidates, allowedRegions = again.conn, candidatesFor(again.conn), again.allowedRegions
 		}
 		err = lastErr
 		if err != nil {

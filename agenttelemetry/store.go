@@ -239,18 +239,30 @@ func (store *Store) StatusSummary(_ context.Context, tenantID string) (map[strin
 
 // UpdateSummaryFromEvents aggregates update events into a rollout summary (counts + success rate over
 // terminal events). Exported so a durable store can reuse the identical aggregation.
+//
+// ★★ A REFUSAL THAT CLEARED IS NOT AN UPDATE THAT WAS INSTALLED (2026-11-05). When the reason for
+// a refusal goes away, the updater reports it once, as `installed` with metadata refusal_cleared=true — the
+// schema has no status for "the refusal no longer applies", and `installed` is what puts the device back in step
+// on the Devices screen. Counted as an install, one refusal and its clearing read as a 50% success rate with no
+// install having run. It is counted on its own, outside the success accounting.
 func UpdateSummaryFromEvents(events []model.AgentUpdateEvent) map[string]any {
 	statusCounts := map[string]int{}
 	total := 0
 	terminal := 0
 	installed := 0
+	refusalCleared := 0
 	for _, event := range events {
 		status := strings.TrimSpace(event.UpdateStatus)
 		if status == "" {
 			status = "unknown"
 		}
-		statusCounts[status]++
 		total++
+		if status == "installed" && UpdateEventClearsARefusal(event) {
+			refusalCleared++
+			statusCounts["refusal_cleared"]++
+			continue
+		}
+		statusCounts[status]++
 		switch status {
 		case "installed":
 			terminal++
@@ -269,7 +281,15 @@ func UpdateSummaryFromEvents(events []model.AgentUpdateEvent) map[string]any {
 		"terminal_events":     terminal,
 		"installed_events":    installed,
 		"update_success_rate": successRate,
+		// Corrections of a refusal, not installs. See above.
+		"refusal_cleared_events": refusalCleared,
 	}
+}
+
+// UpdateEventClearsARefusal reports whether an update event says only that a refusal no longer applies.
+func UpdateEventClearsARefusal(event model.AgentUpdateEvent) bool {
+	cleared, _ := event.Metadata["refusal_cleared"].(bool)
+	return cleared
 }
 
 // StatusSummaryFromEvents aggregates status events into a health summary (crash-free + steering success

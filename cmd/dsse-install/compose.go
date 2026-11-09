@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -240,10 +241,12 @@ func composeFileTo(dir, path string, shape machineShape) error {
 		}
 	}
 	cpPorts := "expose: [\"9443\"]"
-	if declaredNodeMapProfile(readDeploymentEnv(dir)["DSSE_TOPOLOGY_PROFILE"]) {
+	if composeEnv := readDeploymentEnv(dir); declaredNodeMapProfile(composeEnv["DSSE_TOPOLOGY_PROFILE"]) || composeEnv["DSSE_CP_A_BIND"] != "" {
 		// The three doorway instances probe each Node's own CP. Publish these
 		// listeners only on that Node's private address; other profiles keep the
 		// existing container-only admin listener.
+		// ★ A multi-region plan's control planes are reached the same way by the other regions' doors
+		// (2026-11-06): DSSE_CP_A_BIND is written for them, and a single-machine deployment writes none.
 		cpPorts = `ports:
       - "${DSSE_CP_A_BIND:?set DSSE_CP_A_BIND to the Node private address}${DSSE_CP_A_ADMIN_PORT:-19543}:9443"
       - "${DSSE_CP_A_BIND:?set DSSE_CP_A_BIND to the Node private address}${DSSE_CP_A_DATA_PORT:-19545}:8443"`
@@ -704,12 +707,10 @@ const composeConsensusStore = `  # ★★★ THE CONNECTION TO IT IS ENCRYPTED, 
       ETCD_INITIAL_CLUSTER_TOKEN: dsse-database
       ETCD_LISTEN_PEER_URLS: ${DSSE_ETCD_LISTEN_PEER_URLS:-http://0.0.0.0:2380}
       ETCD_LISTEN_CLIENT_URLS: ${DSSE_ETCD_LISTEN_CLIENT_URLS:-http://0.0.0.0:2379}
-      # ★★★ TLS, AND WHY IT IS EMPTY BY DEFAULT. etcd reads an empty file setting as "no TLS",
-      # which is the right answer for a deployment on one host: these members talk over a container network
-      # that never leaves the machine, and a certificate there protects nothing while being one more thing to
-      # rotate. The moment the store has a member in another region they talk across whatever is between the
-      # two, and what crosses is which database is primary — so the plan fills these in exactly when it fills
-      # in members elsewhere. See the_store_has_its_own_authority.go.
+      # ★★★ TLS. etcd reads an empty file setting as "no TLS". The plan fills these in for EVERY state-holding
+      # member, the one-host deployment included: the Edge on that same host dials outward on behalf of every
+      # steered device, and the store that decides which database is primary must not be reachable without a
+      # certificate. The empty default remains only for a compose file somebody writes by hand.
       #
       # ★ PEER AND CLIENT ARE SEPARATE SETTINGS AND BOTH MATTER. Peer is members to each other; client is
       # Patroni to the store. Securing one and leaving the other is a door locked on one side.
@@ -921,7 +922,7 @@ const composeDatabaseDoor = `  # ★★★ THIS DOOR IS HOW A CLIENT REACHES THE
   # clients are lib/pq, which supports ONE host and reads a comma-separated list as a single hostname to
   # resolve. So the door stays, and the reason it stays is written here.
   postgres:
-    image: ${DSSE_HAPROXY_IMAGE:-haproxy:3.4.7-alpine3.24@sha256:251da69821897ec8c4819f12b1babbc4b71f562943addc9b9eb14bb6ece40dc6}
+    image: ${DSSE_HAPROXY_IMAGE:-haproxy:3.4.7-alpine3.24@sha256:2caaf8b1a1ef67f3f1ea9b721f2821675d3ba4500fb518e23884fecb93e8dbaa}
     entrypoint: ["/bin/sh", "/usr/local/bin/dsse-haproxy-resources"]
     # ★ A REGION THAT REBOOTS MUST COME BACK. Without a policy Docker starts nothing when the daemon does, and
     # "on-failure" declines a container that was stopped cleanly — which is every container on a planned
@@ -1202,7 +1203,7 @@ func composeControlPlaneOwnedWith(adminUpstream, edgeUpstream string) string {
     # Console rather than the change that caused it.
     depends_on:
       dsse-control-plane-a: { condition: service_started }
-    environment:
+` + consoleUpstreamNames(adminUpstream, edgeUpstream) + `    environment:
       LISTEN: "0.0.0.0:8443"
       # ★★★ THE FIRST SCREEN AN ADMINISTRATOR SEES MUST NOT BE A CERTIFICATE WARNING (the
       # operator: "the certificate error every time you enter the Admin Console — shouldn't that be solved
@@ -1244,9 +1245,14 @@ func composeControlPlaneOwnedWith(adminUpstream, edgeUpstream string) string {
       CONTROL_API_UPSTREAM: ${DSSE_CONTROL_API_UPSTREAM:-` + adminUpstream + `}
       AUTH_API_UPSTREAM: ${DSSE_AUTH_API_UPSTREAM:-` + adminUpstream + `}
       ADMIN_SESSION_VALIDATE_CA: /deployment/deployment-anchor.pem
+      # The doorway states each browser's address in a PROXY protocol header; the Console believes it only
+      # from these addresses, which is what lets it bound sign-in attempts per browser rather than per door.
+      TRUSTED_FRONT_DOORS: ${DSSE_CONSOLE_TRUSTED_FRONT_DOORS:-10.77.0.5}
       DSSE_CONSOLE_LOCAL_CP_LEADER_URL: ${DSSE_CONSOLE_LOCAL_CP_LEADER_URL:-}
       DSSE_CONSOLE_LOCAL_CP_LEADER_NAME: ${DSSE_CONSOLE_LOCAL_CP_LEADER_NAME:-}
       DSSE_CONSOLE_LEADER_ROUTING: ${DSSE_CONSOLE_LEADER_ROUTING:-}
+      # The other doors the Console may leave through when the one on this machine does not answer.
+      DSSE_CONSOLE_DOOR_FALLBACKS: ${DSSE_CONSOLE_DOOR_FALLBACKS:-}
     volumes:
       # ★★★ THE CONSOLE READS THREE FILES, and it was given the whole deployment directory to serve a web
       # interface — read-only, which does nothing about the fact that the deployment's root CA private key was
@@ -1348,6 +1354,9 @@ const composeStandbyControlPlane = `  # ★ A WARM CONTROL PLANE, AND NO STATE. 
     image: ${DSSE_IMAGE:?set DSSE_IMAGE to the DSSE image this deployment runs}
     environment:
       DSSE_EDGE_BINARY: ${DSSE_BINARY:-/usr/local/bin/dsse-edge}
+      # This machine's door, and the other machines', for when this one is stopped (frontdoor.Dialer).
+      DSSE_EDGE_DOOR_FALLBACKS: ${DSSE_EDGE_DOOR_FALLBACKS:-}
+      DSSE_EDGE_LOCAL_DOORS: ${DSSE_EDGE_LOCAL_DOORS:-}
       # ★★ NO DEFAULT ON PURPOSE. This must name the DEPLOYMENT's database, across regions. A fallback to a
       # local host would either fail confusingly or, if something answered, make this region a second
       # deployment.
@@ -1439,7 +1448,7 @@ func composeRegionDoorwayWith(edgeDependsOnCP string) string {
     # containers were generated with no restart policy at all, so "temporarily unable" and "permanently
     # broken" had the same outcome. The control planes had this line; the Edges did not.
     restart: unless-stopped
-    image: ${DSSE_HAPROXY_IMAGE:-haproxy:3.4.7-alpine3.24@sha256:251da69821897ec8c4819f12b1babbc4b71f562943addc9b9eb14bb6ece40dc6}
+    image: ${DSSE_HAPROXY_IMAGE:-haproxy:3.4.7-alpine3.24@sha256:2caaf8b1a1ef67f3f1ea9b721f2821675d3ba4500fb518e23884fecb93e8dbaa}
     entrypoint: ["/bin/sh", "/usr/local/bin/dsse-haproxy-resources"]
     # ★★★ THE FRONT DOOR COULD NOT START ON AN ORDINARY HOST (measured the first time this
     # deployment ran with one component per machine):
@@ -1576,6 +1585,11 @@ func composeEdgeFleetWith(edgeDependsOnCP string, adminDefault, dataDefault stri
     environment:
       DSSE_EDGE_BINARY: ${DSSE_BINARY:-/usr/local/bin/dsse-edge}
       DSSE_STEER_MUX_ONLY: ${DSSE_STEER_MUX_ONLY:-false}
+      # ★★ THE DOOR THIS EDGE REACHES THE CONTROL PLANE THROUGH, AND THE OTHERS (acceptance C, third walk). The
+      # names below resolve to one door; with it stopped this Edge lost its sessions, configuration and
+      # revocations for as long as the door was down, although the control plane was up behind the others.
+      DSSE_EDGE_DOOR_FALLBACKS: ${DSSE_EDGE_DOOR_FALLBACKS:-}
+      DSSE_EDGE_LOCAL_DOORS: ${DSSE_EDGE_LOCAL_DOORS:-}
       # ★★★ THE DEPLOYMENT'S CONTROL PLANE, WHICH IS NOT ALWAYS IN THIS REGION. Where state lives, this
       # resolves to the local front door; in a region that holds none it names the deployment's, across
       # regions. An Edge takes configuration from whichever node currently holds leadership, and there is one
@@ -1831,4 +1845,51 @@ func adminUpstreamFor(dir string, shape machineShape) string {
 		return "https://" + p.Admin
 	}
 	return "https://dsse-control-plane-a:9443"
+}
+
+// consoleUpstreamNames tells the Console's container where the names in its own upstreams are: at the doorway
+// on this machine.
+//
+// ★★★ THE CONSOLE DIALLED NAMES NOTHING TOLD IT ABOUT (2026-11-04, found by installing
+// docs/plans/single-region.json on a fresh machine and signing in from a browser). Its upstreams are
+// admin.<deployment> and <node>.admin.<deployment>; the container resolves them through the host, and the
+// host had been given the names the installer printed — the region's names, which are what every other
+// client dials. So every sign-in came back
+//
+//	http: proxy error: dial tcp: lookup admin.<deployment> on 127.0.0.11:53: no such host
+//
+// as a 502, which the sign-in page reported as "Invalid credentials" for a password that was correct. The
+// plans with a declared node map already give the Console the doorway's address for these names
+// (plan_name_resolution.go replaces this block with that map); the one-machine and three-region plans did not.
+//
+// ★ THE DOORWAY ON THIS MACHINE IS ALWAYS A RIGHT ANSWER FOR THESE NAMES, which is why a hosts entry is safe
+// here when it is not for the nodes' own aliases. The doorway is on every machine that runs a Console, it
+// routes admin.<deployment> to whichever control plane holds leadership (including in another region), and it
+// routes each per-node admin name it publishes. Its address is the one the Edges already trust it on, from the
+// same variable. A container name (a deployment that answers on an address) needs nothing.
+func consoleUpstreamNames(upstreams ...string) string {
+	names := []string{}
+	seen := map[string]bool{}
+	for _, upstream := range upstreams {
+		host := strings.TrimSpace(upstream)
+		host = strings.TrimPrefix(host, "https://")
+		if i := strings.IndexAny(host, ":/"); i >= 0 {
+			host = host[:i]
+		}
+		host = strings.ToLower(host)
+		if host == "" || !strings.Contains(host, ".") || net.ParseIP(host) != nil || seen[host] {
+			continue
+		}
+		seen[host] = true
+		names = append(names, host)
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	out := "    # The names in this Console's upstreams, at the doorway on this machine (see consoleUpstreamNames).\n" +
+		"    extra_hosts:\n"
+	for _, name := range names {
+		out += "      - \"" + name + ":${DSSE_FRONT_DOOR_A:-10.77.0.5}\"\n"
+	}
+	return out
 }

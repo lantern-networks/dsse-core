@@ -256,6 +256,7 @@ func Tick(ctx context.Context, d TickDeps, now time.Time) (TickResult, error) {
 	m, err := d.Source.Fetch(ctx, now)
 	if errors.Is(err, ErrNoManifest) {
 		res.Outcome = agentupdate.Outcome{Action: agentupdate.ActionNone, Reason: "no manifest published for this device"}
+		res.Reports = clearStandingRefusal(res.Reports, d.JournalPath, j, running, res.Outcome.Reason, now, dry)
 		return res, nil
 	}
 	if err != nil {
@@ -316,6 +317,7 @@ func Tick(ctx context.Context, d TickDeps, now time.Time) (TickResult, error) {
 	if aerr := m.Applicable(running, d.Config.Platform, d.Config.Arch); errors.Is(aerr, agentupdate.ErrNotAnUpgrade) {
 		res.Outcome = agentupdate.Outcome{Action: agentupdate.ActionNone,
 			Reason: fmt.Sprintf("this device is running %s and %s is not newer: nothing to do", running, m.Version)}
+		res.Reports = clearStandingRefusal(res.Reports, d.JournalPath, j, running, res.Outcome.Reason, now, dry)
 		return res, nil
 	}
 
@@ -401,6 +403,25 @@ func Tick(ctx context.Context, d TickDeps, now time.Time) (TickResult, error) {
 	}
 	res.Outcome = out
 	return res, nil
+}
+
+// clearStandingRefusal tells the fleet, once, that a refusal it was sent no longer applies. Called only where a
+// pass got past every reason to refuse: the keys are in force and the manifest, if any, verified. See
+// agentupdate.AppendRefusalCleared.
+func clearStandingRefusal(reports []agentupdate.Report, journalPath string, j *agentupdate.Journal,
+	running, why string, now time.Time, dry bool) []agentupdate.Report {
+	// A pass that could not read what is running cannot say what the row should become.
+	if dry || strings.TrimSpace(running) == "" {
+		return reports
+	}
+	r := agentupdate.ReportOutcome(j, agentupdate.ReportInstalled, running,
+		"the update refusal reported earlier no longer applies: "+why, now)
+	r.TargetVersion, r.FromVersion = "", ""
+	stored, queued, err := agentupdate.AppendRefusalCleared(agentupdate.ReportsDir(journalPath), r)
+	if err != nil || !queued {
+		return reports
+	}
+	return append(reports, stored)
 }
 
 // appendRefusal queues a standing refusal at most once per distinct reason.

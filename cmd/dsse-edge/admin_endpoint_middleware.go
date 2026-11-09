@@ -268,6 +268,7 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 					"elevation_required": map[string]any{
 						"tenant_id": envelope.Target,
 						"why":       envelope.Why,
+						"act":       envelope.Act,
 					},
 				})
 				return

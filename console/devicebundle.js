@@ -95,6 +95,8 @@ async function dbFetchInstaller(platform, arch, tenantSelection) {
 
 // dbReadme is what the person opening the archive reads. It names the one act they perform and the one file
 // they delete afterwards.
+// ★ ASCII ONLY (2026-11-04, found on Windows). The file is written as UTF-8 without a byte-order mark, and Windows
+// PowerShell 5.1 and other ANSI readers show any non-ASCII character as mojibake ("—" became "窶・").
 function dbReadme(hasInstaller, installerName) {
   const lines = [
     "This folder is one device's setup for this deployment.",
@@ -116,7 +118,7 @@ function dbReadme(hasInstaller, installerName) {
     "folder it is opened from. Nothing has to be typed, and nothing has to be copied into a system folder.",
     "",
     "enrolment_token.txt is a credential. It works for ONE machine, ONCE. Delete this folder when the",
-    "machine is up; if the token is lost before it is used, approve the device again — it cannot be looked up.",
+    "machine is up; if the token is lost before it is used, approve the device again; it cannot be looked up.",
     "",
     "On macOS the system asks once to approve the network extension, in System Settings > General >",
     "Login Items & Extensions > Network Extensions. That prompt is Apple's and does not appear on a Mac",

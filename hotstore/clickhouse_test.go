@@ -67,7 +67,7 @@ func TestClickHouseBuildWhereTimeAndText(t *testing.T) {
 	from := time.Date(2026, 7, 16, 1, 0, 0, 0, time.UTC)
 	to := time.Date(2026, 7, 16, 3, 0, 0, 0, time.UTC)
 	where, params := s.buildWhere(SearchQuery{TenantID: "acme", Text: "postman", From: &from, To: &to})
-	if !strings.Contains(where, "positionCaseInsensitive(raw, {txt:String}) > 0") {
+	if !strings.Contains(where, "positionCaseInsensitiveUTF8(raw, {txt:String}) > 0") {
 		t.Fatalf("text filter missing: %q", where)
 	}
 	if !strings.Contains(where, "ts >= parseDateTime64BestEffort({fromts:String})") || !strings.Contains(where, "ts <= parseDateTime64BestEffort({tots:String})") {

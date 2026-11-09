@@ -133,7 +133,7 @@ async function renderOperatorList(host, content) {
                           : a.status === "pending_activation" ? bl({ en: "Not activated", ja: "未有効化" })
                           : bl({ en: "Suspended", ja: "停止中" }),
                           a.status === "active" ? "ok" : a.status === "pending_activation" ? "warn" : "off")),
-      el("td", { class: "ui-view-desc", text: a.last_login_at || bl({ en: "never signed in", ja: "サインインなし" }) }),
+      el("td", { class: "ui-view-desc", text: a.last_login_at ? (typeof window.dsseFormatTime === "function" ? window.dsseFormatTime(a.last_login_at) : a.last_login_at) : bl({ en: "never signed in", ja: "サインインなし" }) }),
       el("td", { class: "ui-row-actions" }, actions),
     ]);
   });

@@ -46,7 +46,7 @@ async function renderInternalCAsView(content) {
   ]);
   content.appendChild(el("div",{class:"ui-view-head"},[
     el("div",{},[el("h2",{class:"ui-view-title",text:bl({en:"Internal site certificates",ja:"社内サイトの証明書"})}),
-      el("p",{class:"ui-view-desc",text:bl({en:"Authorities trusted for your organization's internal sites. Changes are saved on this server; other servers must receive the update.",ja:"自組織の社内サイトで信頼する証明機関です。変更はこのサーバーで保存され、他のサーバーには更新の配布が必要です。"})})]),reloadButton,
+      el("p",{class:"ui-view-desc",text:bl({en:"Authorities trusted for your organization's internal sites. Every gateway receives a change on its own, usually within half a minute.",ja:"自組織の社内サイトで信頼する証明機関です。変更は、すべてのゲートウェイに自動で届きます（ふつうは30秒以内）。"})})]),reloadButton,
   ]));
   content.append(list,status,form);
   function lock() {
@@ -70,7 +70,7 @@ async function renderInternalCAsView(content) {
         el("thead",{},el("tr",{},[bl({en:"Name",ja:"名前"}),bl({en:"Issued to",ja:"証明機関"}),bl({en:"Valid until",ja:"有効期限"}),bl({en:"Actions",ja:"操作"})].map(text=>el("th",{text})))),
         el("tbody",{},rows.map(a=>el("tr",{},[
           el("td",{text:a.name || a.id}),el("td",{text:a.subject || "—"}),
-          el("td",{text:a.expired ? bl({en:"Expired — not trusted",ja:"期限切れ・信頼対象外"}) : (Number.isFinite(Date.parse(a.not_after)) ? a.not_after : bl({en:"Unknown expiry",ja:"期限不明"}))}),
+          el("td",{text:a.expired ? bl({en:"Expired — not trusted",ja:"期限切れ・信頼対象外"}) : (Number.isFinite(Date.parse(a.not_after)) ? (typeof window.dsseFormatTime === "function" ? window.dsseFormatTime(a.not_after) : a.not_after) : bl({en:"Unknown expiry",ja:"期限不明"}))}),
           el("td",{},el("button",{class:"ui-btn ui-btn-sm ui-btn-danger",text:bl({en:"Remove",ja:"削除"}),onClick:()=>remove(a)})),
         ]))),
       ]));
@@ -99,7 +99,7 @@ async function renderInternalCAsView(content) {
     if(pending || !loaded || !current())return;
     pending=true;lock();let attempted=false;
     try {
-      if(!await uiConfirm({title:bl({en:"Remove this authority?",ja:"この証明機関を削除しますか？"}),body:(a.name || a.id)+" — "+bl({en:"Internal sites using this authority may stop opening. Other servers must receive the update.",ja:"この証明機関を使う社内サイトが開けなくなる場合があります。他のサーバーには更新の配布が必要です。"}),confirmLabel:bl({en:"Remove",ja:"削除"}),danger:true}))return;
+      if(!await uiConfirm({title:bl({en:"Remove this authority?",ja:"この証明機関を削除しますか？"}),body:(a.name || a.id)+" — "+bl({en:"Internal sites using this authority may stop opening on every gateway, usually within half a minute.",ja:"この証明機関を使う社内サイトが、すべてのゲートウェイで開けなくなる場合があります（ふつうは30秒以内に反映）。"}),confirmLabel:bl({en:"Remove",ja:"削除"}),danger:true}))return;
       if(!current())return;attempted=true;message("");
       let r;try{r=await apiFetch("DELETE","/admin/internal-cas/"+encodeURIComponent(a.id)+"?tenant_id="+encodeURIComponent(a.tenant_id))}catch(_){throw new Error(internalCAUnconfirmed())}
       internalCAOutcome(r,"delete",a);

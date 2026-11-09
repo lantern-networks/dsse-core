@@ -28,6 +28,16 @@ func applyConnectorRuntimeFacts(payload configBundlePayload, t configApplyTarget
 		return
 	}
 	for _, conn := range payload.Connectors.Connectors {
+		// The version, uptime and tunnel facts ride every poll too, through the observation-time check, so a
+		// generation that does not move does not leave this node's copy behind (fifth review of the C3 fixes).
+		// Older ones are refused there, so a stale poll cannot undo a heartbeat this node took itself.
+		if runtime := connectorRuntimeFieldsOf(conn.Metadata); len(runtime) > 0 {
+			if _, known := t.connectors.Get(conn.ID); known {
+				if _, err := t.connectors.RecordRuntime(conn.TenantID, conn.ID, runtime); err != nil {
+					log.Printf("config-bundle sync: connector %q runtime facts from the control plane not taken: %v", conn.ID, err)
+				}
+			}
+		}
 		if conn.AttachedRegionID == "" {
 			// ★ SILENCE IS NOT A REPORT. An authority that has never been told where a connector is attached
 			// sends an empty field, and clearing on that would erase what this node already knows every time
@@ -37,13 +47,14 @@ func applyConnectorRuntimeFacts(payload configBundlePayload, t configApplyTarget
 		if _, known := t.connectors.Get(conn.ID); !known {
 			continue
 		}
-		moved, err := t.connectors.RecordAttachedRegion(conn.ID, conn.AttachedRegionID)
+		moved, err := t.connectors.RecordAttachedRegion(conn.TenantID, conn.ID, conn.AttachedRegionID)
 		if err != nil {
 			log.Printf("config-bundle sync: could not record where connector %s is attached (%s): %v",
 				conn.ID, conn.AttachedRegionID, err)
 			continue
 		}
 		if moved {
+			connectorDepartures.learned(conn.ID)
 			log.Printf("connector_attached_region_learned connector=%s region=%s — the authority says this "+
 				"connector is answering there now, so flows for what it fronts are routed there from here",
 				conn.ID, conn.AttachedRegionID)

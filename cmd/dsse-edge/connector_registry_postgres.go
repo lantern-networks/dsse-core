@@ -51,6 +51,11 @@ func (store postgresConnectorRegistryStore) Register(conn model.ConnectorRegistr
 		}
 		preserveConnectorRuntimeCredentialMetadata(existing.Metadata, normalized.Metadata)
 		preserveConnectorRegistrationLifecycle(existing, &normalized)
+		// Inside the transaction that holds the row (review C3-RRR2): the runtime facts as stored now.
+		if normalized.Metadata == nil {
+			normalized.Metadata = map[string]any{}
+		}
+		connector.PreserveHeldRuntime(existing.Metadata, normalized.Metadata)
 		catalogChanged = postgresConnectorCatalogChanged(existing, normalized)
 	}
 	statement, err := buildPostgresConnectorRegistryUpsertStatement(normalized, now)
@@ -568,16 +573,29 @@ func connectorRegistrationWithHeartbeat(conn model.ConnectorRegistration, heartb
 	if conn.Metadata == nil {
 		conn.Metadata = map[string]any{}
 	}
+	metadata := make(map[string]any, len(conn.Metadata)+4)
+	for k, v := range conn.Metadata {
+		metadata[k] = v
+	}
+	conn.Metadata = metadata
 	for key, value := range heartbeat.Metadata {
 		switch key {
 		case "runtime_secret_hash", "runtime_secret_rotated_at", "runtime_secret_rotated_by":
 			continue
 		default:
+			if connector.RuntimeKeys[key] {
+				continue
+			}
 			conn.Metadata[key] = value
 		}
 	}
 	conn.Metadata["policy_bundle_id"] = heartbeat.PolicyBundleID
 	conn.Metadata["policy_bundle_version"] = heartbeat.PolicyBundleVersion
+	// The typed version and uptime, which this backend did not take at all (fifth review), through the same
+	// observation-time check as the in-memory registry.
+	for k, v := range connector.NewerRuntimeFields(conn.Metadata, connector.HeartbeatRuntime(heartbeat, now)) {
+		conn.Metadata[k] = v
+	}
 	return normalizeConnectorRegistrationForStorage(conn)
 }
 
@@ -816,15 +834,91 @@ func (store postgresConnectorRegistryStore) RecordLiveness(id, status, heartbeat
 	return true, nil
 }
 
+// RecordRuntime merges connector.RuntimeKeys into the stored metadata, in the column and in the payload every
+// reader uses, in one statement. Like liveness it is written directly: Register keeps the existing values on
+// purpose, and the catalog's version must not move for a connector's uptime.
+func (store postgresConnectorRegistryStore) RecordRuntime(tenantID, id string, fields map[string]any) (bool, error) {
+	if store.DB == nil {
+		return false, fmt.Errorf("postgres connector registry db is not configured")
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), postgresConnectorRegistryTimeout)
+	defer cancel()
+	tx, err := store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin connector runtime update: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	conn, ok, err := queryPostgresConnectorRegistryByID(ctx, tx, id, true)
+	if err != nil || !ok {
+		return false, err
+	}
+	// Owner checked on the locked row (review C3-R6-1).
+	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(conn.TenantID) != strings.TrimSpace(tenantID) {
+		return false, fmt.Errorf("%w: connector %s", connector.ErrNotThisTenantsConnector, id)
+	}
+	if conn.Metadata == nil {
+		conn.Metadata = map[string]any{}
+	}
+	// The row lock above makes this check and the write one step: an old report replayed after a newer one is
+	// refused rather than written over it (review C3-R5).
+	fields = connector.NewerRuntimeFields(conn.Metadata, fields)
+	if len(fields) == 0 {
+		return false, nil
+	}
+	changed := false
+	for key, value := range fields {
+		if !connector.RuntimeKeys[key] || value == nil {
+			continue
+		}
+		if fmt.Sprint(conn.Metadata[key]) != fmt.Sprint(value) {
+			conn.Metadata[key] = value
+			changed = true
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+	metadata, err := json.Marshal(conn.Metadata)
+	if err != nil {
+		return false, fmt.Errorf("marshal connector runtime metadata: %w", err)
+	}
+	payload, err := json.Marshal(conn)
+	if err != nil {
+		return false, fmt.Errorf("marshal connector runtime payload: %w", err)
+	}
+	res, err := tx.ExecContext(ctx,
+		"UPDATE connector_registrations SET metadata = $3, payload = $4 WHERE connector_id = $1 AND tenant_id = $2",
+		id, conn.TenantID, string(metadata), payload)
+	if err != nil {
+		return false, fmt.Errorf("record connector runtime: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return false, fmt.Errorf("connector %s changed during runtime update", id)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit connector runtime update: %w", err)
+	}
+	committed = true
+	return true, nil
+}
+
 // RecordAttachedRegion notes where this connector's tunnel is currently terminating. See
 // connector.Registry.RecordAttachedRegion — the two stores must agree about this, because a deployment that
 // changes backend must not quietly lose the one fact that keeps a failed-over connector reachable.
 //
-// ★ IT MUST NOT MOVE THE CATALOG VERSION. It writes through Register, whose upsert moves updated_at only when
-// a class-1 column differs — attached_region_id is not one, it rides in the payload — so a connector flapping
-// between regions cannot drive the deployment's aggregate generation. Verified by
-// TestRecordingTheAttachedRegionDoesNotMoveTheCatalogVersion.
-func (store postgresConnectorRegistryStore) RecordAttachedRegion(id, region string) (bool, error) {
+// ★ IT MUST NOT MOVE THE CATALOG VERSION. attached_region_id rides in the payload, and the update below
+// touches neither updated_at nor the generation, so a connector flapping between regions cannot drive the
+// deployment's aggregate generation. Checked in TestPostgresConnectorRegistryStoreE2E.
+func (store postgresConnectorRegistryStore) RecordAttachedRegion(tenantID, id, region string) (bool, error) {
 	if store.DB == nil {
 		return false, fmt.Errorf("postgres connector registry db is not configured")
 	}
@@ -834,16 +928,50 @@ func (store postgresConnectorRegistryStore) RecordAttachedRegion(id, region stri
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), postgresConnectorRegistryTimeout)
 	defer cancel()
-	conn, ok, err := store.getByID(ctx, id, false)
+	// ★ ONE TRANSACTION, AND ONLY AN UPDATE (seventh review of the C3 fixes). This read the row, checked it,
+	// and wrote it back through Register in a second transaction — an upsert. A connector removed in between
+	// was re-created by the late write: a registration the operator had deleted came back, owned by the same
+	// organization, because a tunnel report about it arrived after the removal. The row is now locked, its
+	// owner checked, and only an existing row is updated; a row that is gone stays gone.
+	tx, err := store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin connector attachment update: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	conn, ok, err := queryPostgresConnectorRegistryByID(ctx, tx, id, true)
 	if err != nil || !ok {
 		return false, err
+	}
+	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(conn.TenantID) != strings.TrimSpace(tenantID) {
+		return false, fmt.Errorf("%w: connector %s", connector.ErrNotThisTenantsConnector, id)
 	}
 	if strings.EqualFold(strings.TrimSpace(conn.AttachedRegionID), region) {
 		return false, nil
 	}
 	conn.AttachedRegionID = region
-	if _, err := store.Register(conn, time.Now().UTC()); err != nil {
-		return false, err
+	payload, err := json.Marshal(conn)
+	if err != nil {
+		return false, fmt.Errorf("marshal connector attachment payload: %w", err)
 	}
+	// Runtime state: neither updated_at nor the catalogue generation moves (attached_region_id rides in the
+	// payload, as it always has), so a connector moving between regions does not make every Edge re-pull.
+	res, err := tx.ExecContext(ctx,
+		"UPDATE connector_registrations SET payload = $3 WHERE connector_id = $1 AND tenant_id = $2",
+		id, conn.TenantID, payload)
+	if err != nil {
+		return false, fmt.Errorf("record connector attachment: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return false, fmt.Errorf("connector %s changed during attachment update", id)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit connector attachment update: %w", err)
+	}
+	committed = true
 	return true, nil
 }

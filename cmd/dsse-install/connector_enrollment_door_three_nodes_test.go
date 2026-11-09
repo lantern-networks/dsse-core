@@ -97,3 +97,54 @@ func TestSingleRegionMultiEdgeKeepsPublishedAgentDoorDefault(t *testing.T) {
 		t.Fatalf("other topology Connector URL = %q, %v", got, err)
 	}
 }
+
+// Found 2026-11-04 by installing docs/plans/single-region.json from the published 0.4.0 images: the default
+// agents.<deployment> was not in the region map, so every Connector enrolment command was refused with 409.
+func TestSingleMachineConnectorEnrollmentDefaultsToItsRegionDoor(t *testing.T) {
+	plan, err := LoadPlan("../../docs/plans/single-region.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	regionMap := plan.RegionEndpoints()
+	door := strings.SplitN(strings.SplitN(regionMap, ";", 2)[0], "=", 2)[1]
+	values := map[string]string{
+		"DSSE_REGION_ENDPOINTS": regionMap,
+		"DSSE_AGENT_PLANE_NAME": "agents." + plan.Deployment, // what the generator writes; not a listed door
+		"DSSE_EDGE_REGION":      plan.Regions[0].ID,
+		"DSSE_REGION_PORT":      "443",
+	}
+	got, err := connectorURLFromLaunch(t, values)
+	if err != nil || got != door {
+		t.Fatalf("single-machine default Connector URL = %q, %v; want its region door %q", got, err, door)
+	}
+
+	// An operator's explicit choice is passed through unchanged; the control plane decides whether it is permitted.
+	values["DSSE_CONNECTOR_EDGE_URL"] = "https://connectors.example.test"
+	got, err = connectorURLFromLaunch(t, values)
+	if err != nil || got != "https://connectors.example.test" {
+		t.Fatalf("explicit Connector URL = %q, %v; want it unchanged", got, err)
+	}
+}
+
+func TestCombinedThreeRegionsConnectorEnrollmentPrefersOwnRegionDoor(t *testing.T) {
+	values := map[string]string{
+		"DSSE_REGION_ENDPOINTS": "a=https://agents.a.example.test;b=https://agents.b.example.test;c=https://agents.c.example.test",
+		"DSSE_AGENT_PLANE_NAME": "agents.example.test",
+		"DSSE_EDGE_REGION":      "b",
+		"DSSE_REGION_PORT":      "443",
+	}
+	got, err := connectorURLFromLaunch(t, values)
+	if err != nil || got != "https://agents.b.example.test" {
+		t.Fatalf("combined three-region default Connector URL = %q, %v; want this region's door", got, err)
+	}
+	delete(values, "DSSE_EDGE_REGION")
+	got, err = connectorURLFromLaunch(t, values)
+	if err != nil || got != "https://agents.a.example.test" {
+		t.Fatalf("without a region the default should be the first listed door, got %q, %v", got, err)
+	}
+	delete(values, "DSSE_REGION_ENDPOINTS")
+	got, err = connectorURLFromLaunch(t, values)
+	if err != nil || got != "https://agents.example.test" {
+		t.Fatalf("without a region map the legacy default should remain, got %q, %v", got, err)
+	}
+}

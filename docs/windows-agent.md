@@ -107,6 +107,15 @@ unsupported and are not broadened into exclusions for every interface.
 The optional WinDivert backend does not apply IPv6 destination exclusions; use
 WFP when those exclusions are required.
 
+A program that opens dual-stack sockets (PowerShell, other .NET programs) reaches an
+IPv4 destination as `::ffff:a.b.c.d`, so each IPv4 destination exclusion is also given
+to the driver in that form. The driver holds 32 destination exclusions in all: the
+exclusions as written come first, and the extra forms take what room is left. When
+they do not all fit, the log says how many were left out
+(`destination exclusion(s) have no IPv4-mapped IPv6 rule`), and a dual-stack program
+connecting to those destinations is steered; keep the list short enough that the line
+does not appear.
+
 A newly created deployment may offer only the last three files: the operator must
 [publish a signed package](agent-updates.md) or provide it separately. Do not assume
 that the archive contains an installer until you check it.
@@ -141,6 +150,8 @@ One token is for one device; do not duplicate it across a fleet.
 Devices dial the regional URLs in the profile. Configure DNS, or for an isolated lab,
 the Windows hosts file at `C:\Windows\System32\drivers\etc\hosts`, using the addresses
 provided by the deployment operator. Include the recovery names the profile actually names.
+Windows reads at most nine host names on one line of the hosts file and ignores the rest
+without an error, so split a longer list across several lines with the same address.
 
 In the standard multi-organization setup, every organization uses the deployment's
 published regional transport and recovery hostnames. Tenant identity comes from the
@@ -207,6 +218,21 @@ region. A single-region profile may disable region failover; absence of a select
 message alone is not a fault. The signed region map defines allowed regions;
 `region_priority` only orders that set. Lower rank is preferred, and unnamed regions rank last.
 
+### Before the agent is steering
+
+From the moment the `DsseSteer` service starts until the agent has reached its Edge and
+armed the redirect policy, connections leave the device unsteered: no policy applies
+to them and nothing is inspected. Measured at between about five and sixteen seconds
+after the first start following installation, and the same window opens after every
+service restart and every reboot. A test of a denied destination run inside that window succeeds; check
+`steer_capture backend=wfp armed=true` in the log first.
+
+The device's network is deliberately not blocked before the agent runs. If the agent
+could not start, such a block would leave the device with no network at all, and DSSE
+does not take a device offline on its own — taking a device off the network is an
+administrator's explicit act. A deployment that needs coverage from the first packet
+has to provide it outside DSSE until this changes.
+
 ## Two trust paths
 
 The OS certificate store and application-specific CA bundles are separate trust paths.
@@ -219,6 +245,16 @@ combined CA bundle for every such program. Browser success can coexist with comm
 certificate errors. Configure those programs to use a maintained public CA bundle plus
 the intended organization's interception root, or a supported system-trust mode. Keep
 TLS verification enabled. Recheck after certificate changes and agent upgrades.
+
+**Known limitation: revocation checking under inspection.** The certificates the Edge issues
+for an inspected site carry no revocation information (no CRL distribution point and no
+OCSP responder). A client that requires an online revocation check therefore fails on an
+inspected site even when it trusts the organization's interception root: for example
+`curl.exe` with Schannel reports `CRYPT_E_NO_REVOCATION_CHECK (0x80092012)`, and .NET
+validation that demands revocation reports `RevocationStatusUnknown`. Browsers and
+`Invoke-WebRequest` work. Leave such a program's destination uninspected with an Internet
+Access rule, or use the program's documented option that does not require an online
+revocation result; do not turn off certificate verification.
 
 If environment variables such as `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, or `NODE_EXTRA_CA_CERTS`
 are used, update them in the process's actual launch environment. Already-running processes
@@ -319,7 +355,15 @@ failure and retry the same uninstall. Rollback does not re-trust removed certifi
 Do not manually start services in that partial state.
 
 Certificates are matched against the retained DSSE PEM artifacts by fingerprint;
-certificates without such evidence and enrolment material can remain. Successful MSI
+certificates without such evidence and enrolment material can remain. From 0.4.1, provisioning
+records which certificates it actually added, and removal takes back only those: a certificate
+that was already trusted, such as the deployment anchor an administrator imported to reach the
+Console, stays trusted, and the post-uninstall check reports it as kept. A device upgraded
+from 0.4.0, which kept no such record, is different: the upgrade records the certificates
+0.4.0 was trusting as provisioning's own, so the uninstall removes them as 0.4.0 would have,
+including the organization's interception root. A deployment anchor the administrator also
+imported by hand cannot be told apart on such a device and is removed with them; import it
+again if the Console is still needed. Successful MSI
 exit alone is not proof that all deployment material is gone. The updated rollback
 sequence still needs Windows cancellation, crash, reboot, and upgrade fault tests,
 including its intended final disabled/STOPPED state. Native MSI rollback may restart

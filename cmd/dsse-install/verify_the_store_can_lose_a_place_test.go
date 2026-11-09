@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,13 @@ import (
 // parsing are all exercised, not just its arithmetic.
 func storeUnder(t *testing.T, dir, membersJSON string) string {
 	t.Helper()
+	// These fixtures stand for a deployment of several machines — that is what a store spread over places is —
+	// and the check asks the declared shape before it asks the store (the one-machine shape is exempt). So the
+	// directory says so, the way a minted multi-machine deployment does.
+	if err := os.WriteFile(filepath.Join(dir, "deployment.env"),
+		[]byte("DSSE_CP_PEERS='https://cp-b.example.test:19543'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now().UTC()
 	sa, err := mintStoreAuthority("Example", now, 5)
 	if err != nil {

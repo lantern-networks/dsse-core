@@ -45,7 +45,7 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		// poll and is then erased with no trace — the Console showed the rule created, and it was gone fifteen
 		// seconds later. Refusing with a 409 that names where to write instead is the difference between a
 		// visible error and a silent loss (docs/config_persistence_and_rollback.md P-3).
-		if configWriteRejectedWhenSourced(w, config.SteerExclusionSourceURL, "steer exclusions") {
+		if configWriteRejectedWhenSourced(w, steerExclusionAuthority(config), "steer exclusions") {
 			return
 		}
 		if config.SteerExclusions == nil {
@@ -82,7 +82,7 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		// poll and is then erased with no trace — the Console showed the rule created, and it was gone fifteen
 		// seconds later. Refusing with a 409 that names where to write instead is the difference between a
 		// visible error and a silent loss (docs/config_persistence_and_rollback.md P-3).
-		if configWriteRejectedWhenSourced(w, config.SteerExclusionSourceURL, "steer exclusions") {
+		if configWriteRejectedWhenSourced(w, steerExclusionAuthority(config), "steer exclusions") {
 			return
 		}
 		if config.SteerExclusions == nil {
@@ -126,7 +126,7 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 			return
 		}
 		// Same reason as the create/delete routes: a rollback applied here is erased by the next CP poll.
-		if configWriteRejectedWhenSourced(w, config.SteerExclusionSourceURL, "steer exclusions") {
+		if configWriteRejectedWhenSourced(w, steerExclusionAuthority(config), "steer exclusions") {
 			return
 		}
 		if config.SteerExclusions == nil || config.ConfigVersions == nil {

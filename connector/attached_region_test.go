@@ -20,7 +20,7 @@ func TestRecordingWhereAConnectorIsAttachedDoesNotMoveTheCatalogVersion(t *testi
 	}
 	before := r.ConfigGeneration()
 
-	moved, err := r.RecordAttachedRegion("conn-1", "region-a")
+	moved, err := r.RecordAttachedRegion("t1", "conn-1", "region-a")
 	if err != nil {
 		t.Fatalf("record: %v", err)
 	}
@@ -44,22 +44,22 @@ func TestRecordingWhereAConnectorIsAttachedDoesNotMoveTheCatalogVersion(t *testi
 
 	// Reporting the same region again is not a change, so a fleet of nodes all holding this connector does not
 	// write on every heartbeat.
-	if moved, _ := r.RecordAttachedRegion("conn-1", "region-a"); moved {
+	if moved, _ := r.RecordAttachedRegion("t1", "conn-1", "region-a"); moved {
 		t.Fatal("the same region reported again is not a change")
 	}
-	if moved, _ := r.RecordAttachedRegion("conn-1", "REGION-A"); moved {
+	if moved, _ := r.RecordAttachedRegion("t1", "conn-1", "REGION-A"); moved {
 		t.Fatal("region names must compare case-insensitively, as they do everywhere else")
 	}
 
 	// Nothing to say is not an erasure: an empty report must leave the last known answer alone.
-	if moved, _ := r.RecordAttachedRegion("conn-1", "  "); moved {
+	if moved, _ := r.RecordAttachedRegion("t1", "conn-1", "  "); moved {
 		t.Fatal("an empty region is not a report")
 	}
 	if conn, _ := r.Get("conn-1"); conn.AttachedRegionID != "region-a" {
 		t.Fatalf("an empty report erased what was known: %q", conn.AttachedRegionID)
 	}
 
-	if _, err := r.RecordAttachedRegion("conn-unknown", "region-a"); err == nil {
+	if _, err := r.RecordAttachedRegion("t1", "conn-unknown", "region-a"); err == nil {
 		t.Fatal("a connector this registry does not have must be an error, not a silent success")
 	}
 }
@@ -76,7 +76,7 @@ func TestReRegisteringDoesNotEraseWhereAConnectorWasLastSeen(t *testing.T) {
 	if _, err := r.Register(base, now); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if _, err := r.RecordAttachedRegion("conn-1", "region-a"); err != nil {
+	if _, err := r.RecordAttachedRegion("t1", "conn-1", "region-a"); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 

@@ -767,10 +767,41 @@ the corresponding identifier. Enter one app identifier per line. Matching rules
 are combined; deleting one rule does not remove an exclusion supplied by another
 matching rule or by an agent's built-in loop-prevention rules.
 
-The list reads the control plane. Enforcing Edges receive the authored set on
-subsequent polls. Check device observations separately: an authored rule and a
-successful save do not prove that an endpoint has applied it. If observations
-cannot be read, the Applied column shows **not known**.
+The list reads the control plane. Every Edge receives the authored set for every
+organization in its configuration bundle, on its next poll (10 seconds by default,
+`-config-source-poll`), and signs it for the devices that steer through it; a device
+picks it up on its next exclusion refresh, about once a minute. Removing a rule
+reaches the Edges the same way. An Edge that pulls its configuration refuses an
+exclusion written to it directly (409) and names the control plane, because its
+next poll would erase the write. Check device observations separately: an
+authored rule and a successful save do not prove that an endpoint has applied it.
+If observations cannot be read, the Applied column shows **not known**.
+
+Each line is an app identifier, matched by the agent on each device:
+
+| Form | macOS | Windows |
+|---|---|---|
+| `subject:<organization>` | signing certificate's organization | signing certificate's organization |
+| `thumbprint:<sha-256>` | signing certificate | signing certificate |
+| `team-id:<team>`, `signing-id:<id>` | yes | ignored |
+| `publisher:<name>`, `signed:<name>` | ignored | yes |
+| anything else | code-signing identifier, such as `com.example.app` | part of the program's path, compared without regard to case |
+
+On Windows, a path is matched as **part of** the connecting program's path,
+without regard to case. `C:\Program Files\Git\usr\bin\ssh.exe` and its tail
+`\git\usr\bin\ssh.exe` are both accepted. Windows identifies a connecting
+program by its volume path, which carries no drive letter, so the drive letter is
+dropped and the rule matches that path on every volume — and, being a part, any
+longer path that contains it (for example a copy under another folder that ends
+the same way). It is not an exact identity of one program.
+
+The signature forms are no narrower in that sense: `subject:` matches every program
+signed with a certificate of that organization, `thumbprint:` every program signed
+with that certificate, and `publisher:` every program whose signer's name contains
+the text (Windows). Each excludes everything its signer signs, not one program. On Windows no form names
+exactly one program; choose the narrowest that fits, and remember that an exclusion
+takes that traffic out of inspection. A device ignores a form its platform cannot
+use, and the Applied column says so rather than counting it as applied.
 
 When storage is configured, an unconfirmed save returns HTTP 500 for creation,
 editing, deletion, and version rollback. That request keeps the previous local
@@ -884,7 +915,8 @@ If only signing information is unavailable, the verified catalogue and its exist
 download controls remain visible; signing availability and minimum versions read
 **Unknown**. Retry before opening the publication form. A confirmed absence of a
 signing key is different: the form can accept a manifest signed elsewhere.
-**Minimum version to sign** is a signing restriction, not a device rollback limit.
+**Lowest version the next release can have** is a signing restriction, not a device rollback limit
+and not the manifest's `min_from_version` (the oldest agent that may install the release).
 
 When publishing an externally signed release, the manifest supplies the target OS,
 architecture and version. The form's filename guesses or manually entered values

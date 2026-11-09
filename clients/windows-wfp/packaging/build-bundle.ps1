@@ -10,7 +10,7 @@
   reports Valid, and the engine is what Burn extracts to %TEMP% and elevates.
 
   Needs the WiX Burn extension:
-    wix extension add -g WixToolset.BootstrapperApplications.wixext/7.0.0
+    wix extension add -g WixToolset.BootstrapperApplications.wixext/7.0.1
 #>
 [CmdletBinding()]
 param(
@@ -53,8 +53,8 @@ if (-not (Test-Path $msi)) { throw "MSI not found: $msi — run build-msi.ps1 fi
 $wix = Join-Path $env:USERPROFILE ".dotnet\tools\wix.exe"
 if (-not (Test-Path $wix)) { $wix = "wix" }
 $wixVersion = (& $wix --version).Trim()
-if ($LASTEXITCODE -or $wixVersion -notmatch '^7\.0\.0(?:\+.*)?$') {
-  throw "WiX 7.0.0 is required (found: $wixVersion)"
+if ($LASTEXITCODE -or $wixVersion -notmatch '^7\.0\.1(?:\+.*)?$') {
+  throw "WiX 7.0.1 is required (found: $wixVersion)"
 }
 $env:DOTNET_ROOT = Join-Path $env:USERPROFILE ".dotnet"
 
@@ -64,7 +64,7 @@ Write-Host "== wix build (Burn bundle) -> $setup =="
 Push-Location $pkg
 try {
   & $wix build -acceptEula wix7 DsseBundle.wxs `
-      -ext WixToolset.BootstrapperApplications.wixext/7.0.0 `
+      -ext WixToolset.BootstrapperApplications.wixext/7.0.1 `
       -b $outDir -b $pkg @defs -o $setup
   if ($LASTEXITCODE) { throw "wix build (bundle) failed ($LASTEXITCODE)" }
 } finally { Pop-Location }

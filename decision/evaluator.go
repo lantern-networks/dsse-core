@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
 	"os"
 	"sort"
@@ -354,6 +355,30 @@ func AccessLogFromDecision(dec model.AccessDecision) model.AccessLog {
 		generationID = snapshot.ID
 	}
 	metadata := stripConfigGenerationKeys(copyMetadata(dec.Metadata))
+	// ★ NAME THE DESTINATION BY ITS NAME WHEN THE EDGE KNOWS IT (2026-11-04, found on a fresh single-machine
+	// install). A steered flow arrives connect-by-IP; the evaluator matched an FQDN rule using the name recovered
+	// from the device's DNS or the ClientHello, but the row recorded the IP literal. The denial of example.org
+	// was logged as 2606:4700:…, so searching the log for the name the rule was written with found nothing.
+	// The address is kept beside it.
+	destination := dec.Destination
+	if destination != nil && net.ParseIP(strings.TrimSpace(*destination)) != nil {
+		name := ""
+		if dec.FQDN != nil {
+			name = strings.TrimSpace(*dec.FQDN)
+		}
+		if name == "" && dec.SNI != nil {
+			name = strings.TrimSpace(*dec.SNI)
+		}
+		if name != "" && net.ParseIP(name) == nil {
+			if metadata == nil {
+				metadata = map[string]any{}
+			}
+			if _, ok := metadata["destination_ip"]; !ok {
+				metadata["destination_ip"] = strings.TrimSpace(*destination)
+			}
+			destination = &name
+		}
+	}
 	return model.AccessLog{
 		ConfigGenerationID:     generationID,
 		ID:                     randomModelID("alog_", time.Now().UTC()),
@@ -374,7 +399,7 @@ func AccessLogFromDecision(dec model.AccessDecision) model.AccessLog {
 		DeviceID:               dec.DeviceID,
 		ApplicationID:          &dec.ApplicationID,
 		SourceIP:               dec.SourceIP,
-		Destination:            dec.Destination,
+		Destination:            destination,
 		RequestMethod:          dec.RequestMethod,
 		RequestPath:            dec.RequestPath,
 		ServiceFamily:          dec.ServiceFamily,
@@ -798,10 +823,12 @@ func reasonForPolicyDecision(decisionValue, actorType string) string {
 	case "deny":
 		return "Request matched an active deny policy."
 	default:
+		// "lab" was this sentence's word from the days the product ran only in a lab; it reached the
+		// administrator's log screen of a real deployment (2026-11-06).
 		if actorType == "delegated_agent" || actorType == "nhi" {
-			return "Delegated agent request matched the active lab policy."
+			return "Delegated agent request matched an active allow policy."
 		}
-		return "Request matched the active lab policy."
+		return "Request matched an active allow policy."
 	}
 }
 

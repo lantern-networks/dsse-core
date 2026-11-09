@@ -151,6 +151,9 @@ async function loadTenantSettings(host, content) {
     // would show a mix — this page in the new zone, everything else in the old one — until a reload, which
     // reads as the setting not having worked.
     if (typeof ensureSignedIn === "function") { await ensureSignedIn(); }
+    // ensureSignedIn adopts the signed-in administrator's own zone; an operator inside an organization reads
+    // that organization's (review of 2026-11-07).
+    if (typeof adoptOperatedOrganizationClock === "function") { await adoptOperatedOrganizationClock(); }
     renderTenantSettingsView(content);
   });
 

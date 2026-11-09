@@ -64,8 +64,15 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 			// exactly is the operator who reads that warning after the credential has already scrolled past.
 			// A warning that arrives with the thing it warns about is not a warning. The pipe is now part of
 			// the step, so following the order captures by default and the warning is a confirmation.
-			Do: fmt.Sprintf("dsse-install -bootstrap-admin -dir %s -control-plane https://%s -admin-email <address> 2>&1 | tee admin-credentials.txt",
-				dir, p.PlaneNamesFor(founding.ID)["admin"]),
+			//
+			// ★★ AND THE CAPTURE IS PRIVATE, IN EVERY PROFILE (acceptance C, 2026-11-07). The pipe form wrote the
+			// administrator's password, TOTP secret, recovery codes and API token to the terminal and to a file
+			// in whatever directory the operator stood in, created with the shell's umask (0644 on most hosts),
+			// and tee's exit status hid a failed bootstrap. The three-node and multi-edge profiles had already
+			// moved to the private form below; the single-machine and three-Region profiles were left on the
+			// pipe. One form now: owner-only, refuses to overwrite, the token in its own file under authority/.
+			Do: fmt.Sprintf("(umask 077; set -C; dsse-install -bootstrap-admin -dir %s -control-plane https://%s -admin-email <address> -admin-token-file %s > %s 2>&1)",
+				dir, p.PlaneNamesFor(founding.ID)["admin"], privateTokenDestination(dir), filepath.Join(dir, "admin-credentials.txt")),
 			// ★ AND IT SAYS HOW TO KNOW THE PLANE IS ANSWERING (same walk, one step earlier). "The control
 			// plane answering" was already the stated need, and this still failed on the first attempt —
 			// `Post https://admin.…/admin/admins/invite: EOF`, run nine seconds after `up -d` returned. The
@@ -107,7 +114,6 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 			steps[1].Needs += "; local-only audit retention is selected: provision persistent hot-store capacity and backups"
 		}
 		steps[1].Why = "The helper refuses to start services when local preflight fails. compose_started means containers started, not quorum, database synchronization or authentication readiness."
-		steps[2].Do = fmt.Sprintf("(umask 077; set -C; dsse-install -bootstrap-admin -dir %s -control-plane https://%s -admin-email <address> -admin-token-file %s > %s 2>&1)", dir, p.PlaneNamesFor(founding.ID)["admin"], privateTokenDestination(dir), filepath.Join(dir, "admin-credentials.txt"))
 		steps[2].Why += " Retain the private credentials output even on failure; the operator token is saved only on the issuer, never in a carry. An existing token file is not overwritten."
 	}
 	if p.dedicatedMultiEdge() {
@@ -263,18 +269,32 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 		})
 	}
 	steps = append(steps, deferredEdges...)
+	// ★★ EVERY PLAN, NOT ONLY THE DECLARED SHARED FLEETS (0.4.1 final acceptance A, 2026-11-09). Without this step
+	// the single-region and three-region layouts ran with revocation reauthentication and ceremony recovery
+	// off: revoking an approval said that an existing identity-provider sign-in may authorize a new one.
+	activateNeeds := "every planned CP and Edge started and reporting (they report every 15 seconds); the Edges' admin routes reachable from this machine"
 	if declaredNodeMapProfile(p.Profile) {
-		steps = append(steps, PlanStep{Machine: minting.Name,
-			Do:    fmt.Sprintf("dsse-install -activate-auth -dir %s -admin-token-file %s", dir, privateTokenDestination(dir)),
-			Needs: "all declared CPs and Edges running the reviewed build, three voters and strict database synchronization ready; private owned Edge admin routes reachable from the issuer",
-			Why:   "New shared-fleet authentication stays unavailable until the existing authority confirms all members and every declared Edge applies the complete enabled feature set. A timeout is not success: correct the named member and rerun; existing enabled features are retained. Device-user session binding requires separate assignment preparation."})
+		activateNeeds = "all declared CPs and Edges running the reviewed build, three voters and strict database synchronization ready; private owned Edge admin routes reachable from the issuer"
 	}
+	steps = append(steps, PlanStep{Machine: minting.Name,
+		Do:    fmt.Sprintf("dsse-install -activate-auth -dir %s -admin-token-file %s", dir, privateTokenDestination(dir)),
+		Needs: activateNeeds,
+		Why: "Revocation reauthentication, ceremony recovery, grant evidence and single-request grants stay off until the authority " +
+			"confirms every planned member and every Edge applies the complete feature set. Until then, revoking an " +
+			"approval does not require a fresh sign-in. A timeout is not success: correct the named member and rerun; " +
+			"existing enabled features are retained. Device-user session binding requires separate assignment preparation."})
 	steps = append(steps, PlanStep{
 		Machine: minting.Name,
-		Do: fmt.Sprintf("dsse-install -verify -dir %s -control-plane https://%s -edge %s -edge-admin %s -control-plane-peers %s -admin-token <token>",
+		// ★★★ AND THE CONSOLE (2026-11-04). This line had no -console, so the check that signs in through the
+		// Console with a deliberately wrong password never ran: a fresh single-machine install read 46 of 46
+		// green while every real sign-in came back 502 from the Console's upstream. The administrator's first act
+		// is that sign-in; the verification that follows the order must ask it.
+		// The operator token is read from its owner-only file, never put in argv where every local user and the
+		// shell history can read it (acceptance C, 2026-11-07: only the declared-node profiles did this).
+		Do: fmt.Sprintf("dsse-install -verify -dir %s -control-plane https://%s -edge %s -edge-admin %s -control-plane-peers %s -console https://%s -admin-token-file %s",
 			dir, p.PlaneNamesFor(founding.ID)["admin"],
 			strings.Join(p.verifyEdges(), ","), strings.Join(p.verifyEdgeAdmins(), ","),
-			strings.Join(p.verifyControlPlanes(), ",")),
+			strings.Join(p.verifyControlPlanes(), ","), p.PlaneNamesFor(founding.ID)["console"], privateTokenDestination(dir)),
 		// ★★★ AND WHERE IT IS RUN FROM DECIDES TWO OF ITS ANSWERS. Two checks ask what a DEVICE would get —
 		// whether the region presents the name it announces, and whether the name an expired agent comes back
 		// on leads anywhere — so they resolve those names the ordinary way. Run from a shell whose resolver
@@ -284,7 +304,7 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 		// no zone for the deployment yet therefore ends in two failures nobody can act on, which is the
 		// procedure failing rather than the deployment.
 		Needs: "every machine above, started, and a resolver that answers this deployment's names where you " +
-			"run this. Two of these checks ask what a DEVICE would get, so they resolve the names the " +
+			"run this." + verifyPortalTrustNeed(p, minting) + " Two of these checks ask what a DEVICE would get, so they resolve the names the " +
 			"ordinary way. Where there is no zone for them yet, run it from inside the deployment's own " +
 			"network — the image carries this installer:\n" +
 			"      docker run --rm --network <project>_default -v \"$PWD:/deployment\" \\\n" +
@@ -294,9 +314,6 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 			"every Edge hand devices the same region map, does every node run the same build — and a " +
 			"deployment answering those from one node looks complete and is not.",
 	})
-	if declaredNodeMapProfile(p.Profile) {
-		steps[len(steps)-1].Do = strings.Replace(steps[len(steps)-1].Do, "-admin-token <token>", "-admin-token-file "+privateTokenDestination(dir), 1)
-	}
 	if len(p.DeploymentCRLOrigins) > 0 {
 		status := PlanStep{
 			Machine: minting.Name,
@@ -393,6 +410,28 @@ func (p *Plan) verifyEdges() []string {
 
 func (p *Plan) verifyEdgeAdmins() []string {
 	out := []string{}
+	for _, e := range p.edgeAdminRoutes() {
+		out = append(out, e.URL)
+	}
+	return out
+}
+
+// planEdgeAdminRoute is one Edge's admin route as this deployment names it: the machine that runs it, and the
+// NAME@ADDRESS a walk dials from the founding machine.
+type planEdgeAdminRoute struct {
+	Machine string
+	URL     string
+}
+
+// edgeAdminRoutes is the one rule for naming an Edge's admin route, used by -verify and -activate-auth alike.
+//
+// ★★ ONE RULE, BECAUSE TWO DISAGREED (0.4.1 final acceptance A, 2026-11-09). -activate-auth built its Edge URLs
+// from nodeAdminTargets, which always puts the machine's name in the label; the single-region and three-region
+// layouts name the route <region>-edge-a, which is what -verify dialled and what the door serves. On the shapes
+// that had the step before (the declared node maps) the two rules agree, so nothing showed it; on one machine
+// activation asked region-a-node-a-edge-a.admin.<deployment>, was answered 404, and never confirmed the Edge.
+func (p *Plan) edgeAdminRoutes() []planEdgeAdminRoute {
+	out := []planEdgeAdminRoute{}
 	for _, r := range p.Regions {
 		for _, m := range r.Machines {
 			if !m.Holds.has("edges") {
@@ -409,7 +448,8 @@ func (p *Plan) verifyEdgeAdmins() []string {
 				if p.dedicatedMultiEdge() {
 					owner = r.controlPlane()
 				}
-				out = append(out, "https://"+label+".admin."+p.Deployment+"@"+p.fromFounding(owner, r, 0))
+				out = append(out, planEdgeAdminRoute{Machine: strings.TrimSpace(m.Name),
+					URL: "https://" + label + ".admin." + p.Deployment + "@" + p.fromFounding(owner, r, 0)})
 			}
 		}
 	}
@@ -534,4 +574,21 @@ func (p *Plan) storeMemberPeerURLFor(r PlanRegion, m PlanMachine) string {
 		return storeMemberPeerURLForMachine(m)
 	}
 	return p.storeMemberPeerURL(r)
+}
+
+// verifyPortalTrustNeed says, on the -verify step, what a machine without an Edge needs to check the Portals.
+//
+// ★ A FRESH LAYOUT-D INSTALL FAILED ITS OWN -verify ON THE PORTALS, FOLLOWING THE ORDER EXACTLY (0.4.1 acceptance
+// D, 2026-11-08). The check dials every region's Portal through every entrance and verifies the certificate. It
+// runs where the deployment was minted, which in this layout is a control-plane machine; only Edge machines
+// import the Portal certificate, so that machine does not trust a private Portal CA and reported 0 of 9 pairs.
+// The installer already takes the CA for exactly this case (-verify -portal-ca), and said so only in the failure
+// message. The step that runs the check is where it has to be said.
+func verifyPortalTrustNeed(p *Plan, verifier PlanMachine) string {
+	if !declaredNodeMapProfile(p.Profile) || verifier.Holds.has("edges") {
+		return ""
+	}
+	return " ★ This machine holds no Edge, so it has no Portal certificate of its own: when the Portals' " +
+		"certificates come from a CA this machine does not already trust, add -portal-ca <that CA's certificate> " +
+		"(the CA certificate only, never a Portal key). Without it the Portal check measures 0 pairs and fails."
 }

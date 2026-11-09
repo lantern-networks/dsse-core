@@ -187,6 +187,8 @@ func registerAuthRolloutRoutes(mux *http.ServeMux, admin func(string, http.Handl
 		}
 		writeJSON(w, 200, s)
 	}))
+	// control-plane-only: registered only where this process is the authority (no -config-source-url);
+	// registerAuthRolloutRoutes returns before registering anything on an Edge, whose runtime has no authority.
 	mux.HandleFunc("PUT /admin/auth-rollout", admin("admin.platform.write", func(w http.ResponseWriter, r *http.Request) {
 		ctx := captureCPWriteLease(r.Context())
 		var body struct {
@@ -203,6 +205,8 @@ func registerAuthRolloutRoutes(mux *http.ServeMux, admin func(string, http.Handl
 		}
 		writeJSON(w, 200, map[string]bool{"saved": true})
 	}))
+	// control-plane-only: registered only where this process is the authority (no -config-source-url);
+	// registerAuthRolloutRoutes returns before registering anything on an Edge, whose runtime has no authority.
 	mux.HandleFunc("POST /admin/auth-rollout/activate", admin("admin.platform.write", func(w http.ResponseWriter, r *http.Request) {
 		ctx := captureCPWriteLease(r.Context())
 		var body struct {
@@ -233,6 +237,15 @@ func registerAuthRolloutRoutes(mux *http.ServeMux, admin func(string, http.Handl
 			return
 		}
 		sum := sha256.Sum256(r.TLS.PeerCertificates[0].Raw)
+		// ★ A CERTIFICATE THE CENSUS DOES NOT NAME IS TURNED AWAY HERE, before the write lease and the write
+		// transaction (2026-11-07, security review S7). The agent plane verifies device certificates too, so
+		// without this any enrolled laptop could make the authority open a write transaction on every request.
+		// This is a READ of the census (one SELECT when the authority is in PostgreSQL), the same census Record
+		// checks, pulled forward: it stops the write, not the round trip.
+		if !runtime.certificateIsACensusMember(hex.EncodeToString(sum[:]), time.Now()) {
+			writeError(w, 403, fmt.Errorf("the presented certificate is not a member of the deployment census"))
+			return
+		}
 		var body authrollout.Report
 		if decodeAuthRollout(w, r, &body) != nil {
 			writeError(w, 400, fmt.Errorf("invalid capability report"))
@@ -247,6 +260,25 @@ func registerAuthRolloutRoutes(mux *http.ServeMux, admin func(string, http.Handl
 		_ = store.Activate(ctx, body.Generation, []string{authrollout.EvidenceFeature, authrollout.SingleRequestFeature}, time.Now())
 		writeJSON(w, 200, map[string]bool{"recorded": true})
 	})
+}
+
+// certificateIsACensusMember answers whether a client certificate hash names a live member of the current
+// census, from the authority's own state. Read-only: a census that cannot be read answers false, and the
+// report is refused rather than recorded against nobody.
+func (r *authRolloutRuntime) certificateIsACensusMember(certificateSHA256 string, now time.Time) bool {
+	if r == nil || r.authority == nil {
+		return false
+	}
+	state, err := r.authority.Read()
+	if err != nil || state.Schema == 0 {
+		return false
+	}
+	for _, n := range state.Manifest.Members {
+		if !n.Retired && n.CertificateSHA256 == certificateSHA256 {
+			return true
+		}
+	}
+	return false
 }
 
 // An upgraded binary outside the expected fleet is not allowed to use a census

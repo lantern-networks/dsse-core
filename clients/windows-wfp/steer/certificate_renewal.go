@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -436,28 +437,61 @@ func startCertificateRenewal(tc *transportConfig, identityDir, recoveryHostPort 
 		log.Printf("certificate_renewal disabled (no (T) transport or no directory to keep a renewed identity in)")
 		return
 	}
-	if strings.TrimSpace(recoveryHostPort) == "" && currentRecoveryEndpoint(recoveryHostPort, liveRecovery) == "" &&
-		tc.currentRecoverySNI() == "" {
-		// Worth saying out loud. Without a recovery endpoint a device that is switched off across its own
-		// expiry cannot get back on its own, and that only becomes visible when somebody returns from leave.
-		//
-		// An ANNOUNCED recovery name counts as configured: once the deployment folds that path onto the
-		// transport port it stops publishing an endpoint at all, and warning about a missing endpoint on a
-		// device that has a perfectly good way in would train an operator to ignore this line.
-		log.Printf("certificate_renewal recovery endpoint NOT configured and no recovery name announced — if " +
-			"this device stays off past its certificate's expiry it will need manual re-enrolment " +
-			"(--enroll-renew-recovery-url)")
+	// ★ JUDGED WHEN THE ANSWER CAN EXIST, NOT AT START-UP (2026-11-04, found on a fresh install). The recovery name
+	// arrives in the deployment's signed trust bundle, which is adopted a moment AFTER this line runs. Judged here,
+	// every new device said "NOT configured … will need manual re-enrolment" while the Edge recorded that it held
+	// the name. The warning is now given only if the name is still missing once the bundle has had time to arrive,
+	// and its arrival is said out loud.
+	recoveryKnown := func() bool {
+		return strings.TrimSpace(recoveryHostPort) != "" || currentRecoveryEndpoint(recoveryHostPort, liveRecovery) != "" ||
+			tc.currentRecoverySNI() != ""
 	}
+	if !recoveryKnown() {
+		log.Printf("certificate_renewal recovery not known yet — waiting for the deployment's trust bundle to " +
+			"announce it; a later line says which, or warns if it never arrives")
+	}
+	startedAt := time.Now()
+	recoveryAnnounced, recoveryWarned := false, false
+	// Called from the renewal loop and from the grace timer below, so the two flags are guarded.
+	var recoveryMu sync.Mutex
+	checkRecovery := func() {
+		recoveryMu.Lock()
+		defer recoveryMu.Unlock()
+		switch {
+		case recoveryKnown():
+			if !recoveryAnnounced {
+				recoveryAnnounced = true
+				log.Printf("certificate_renewal recovery is known (name=%q endpoint=%q) — an expired certificate "+
+					"can be renewed without re-enrolment", tc.currentRecoverySNI(), currentRecoveryEndpoint(recoveryHostPort, liveRecovery))
+			}
+		case !recoveryWarned && time.Since(startedAt) >= recoveryAnnouncementGrace:
+			recoveryWarned = true
+			// Worth saying out loud. Without a recovery endpoint a device that is switched off across its own
+			// expiry cannot get back on its own, and that only becomes visible when somebody returns from leave.
+			log.Printf("certificate_renewal recovery endpoint NOT configured and no recovery name announced — if " +
+				"this device stays off past its certificate's expiry it will need manual re-enrolment " +
+				"(--enroll-renew-recovery-url)")
+		}
+	}
+	// ★ ITS OWN TIMER (2026-11-04). The renewal loop's next pass after the first is set by the
+	// certificate's lifetime — six hours for an ordinary sixty-day identity — so a recovery name that never arrived
+	// was reported hours after the grace period it was judged against. The grace period now has its own check.
+	time.AfterFunc(recoveryAnnouncementGrace+time.Second, checkRecovery)
 	var wake <-chan struct{}
 	if len(notifications) != 0 {
 		wake = notifications[0]
 	}
 	go runCertificateRenewalLoop(context.Background(), 30*time.Second, wake, func() time.Duration {
+		checkRecovery()
 		return runRenewalCheck(tc, identityDir, currentRecoveryEndpoint(recoveryHostPort, liveRecovery), currentRenewCutoff(renewCutoff))
 	})
 	log.Printf("certificate_renewal scheduler started (interval derived from the certificate's own lifetime, max %s)",
 		maxRenewalCheckInterval)
 }
+
+// recoveryAnnouncementGrace is how long a new agent waits for the trust bundle to announce a recovery name before
+// warning that it has none. The bundle is normally adopted within seconds of start-up.
+const recoveryAnnouncementGrace = 2 * time.Minute
 
 // currentRenewCutoff reads the operator's stale-before declaration in force right now (zero = none). Fail-safe
 // by construction: the pointer is only ever set to a value that PASSED the shared signature check, so a missing

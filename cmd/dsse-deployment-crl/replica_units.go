@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/lantern-networks/dsse-core/deploymentcrl"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // writeReplicaServiceUnits prepares a dedicated, keyless Linux publication
@@ -243,25 +245,5 @@ func systemdLiteral(s string) string {
 func shellLiteral(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 
 func atomicUnitFile(path string, body []byte, mode os.FileMode) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".dsse-crl-replica-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if err := f.Chmod(mode); err != nil {
-		f.Close()
-		return err
-	}
-	if _, err := f.Write(body); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(f.Name(), path)
+	return durablefile.Write(path, body, mode)
 }

@@ -34,7 +34,7 @@ func verifyLogPath(client *http.Client, edgeAdmin, cpAdmin, token string) []veri
 	out := []verifyResult{}
 
 	// The sending end. /healthz reports it because the condition used to exist only in the node's own log.
-	code, raw, err := get(client, edgeAdmin+"/healthz", "")
+	code, raw, err := getNodeHealth(client, edgeAdmin+"/healthz")
 	switch {
 	case err != nil || code != 200:
 		out = append(out, verifyResult{name: "what this Edge records is reaching the authority",

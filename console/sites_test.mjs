@@ -659,3 +659,77 @@ test('connector removal discards late ACK after tenant change',async()=>{
  const first=x.f.context.removeConnector('c','Old',x.f.host);await started;x.f.context.operateTenant='other';finish();await first;
  assert.equal(x.calls.length,1);assert.equal(x.toasts.length,0);
 });
+// Found 2026-11-04: a site whose region was written the way the old placeholder suggested was refused with
+// 400 "region is invalid", and the editor said the save "may already have been applied" without the reason.
+test('a refused site save says it was not saved and why', async () => {
+  const f = siteEditorFixture(siteRequest); const calls = [];
+  f.context.apiFetch = async (method) => {calls.push(method); return {ok: false, status: 400, body: {error: 'region is invalid'}};};
+  await f.submit();
+  assert.deepEqual(calls, ['POST']); assert.equal(f.closed, 0); assert.equal(f.fields.name.input.disabled, false);
+  const alert = f.modal.body.at(-1);
+  assert.equal(alert.textContent, 'Not saved: region is invalid'); assert.doesNotMatch(alert.textContent, /may already have been applied/);
+  assert.equal(f.fields.region.spec.placeholder, 'region-a');
+});
+
+// Found 2026-11-08 on acceptance C: "10.47.1.30/32" typed as a host name was stored as one.
+test('an address typed into the host-name field is turned back in the reader\'s language', () => {
+  const src = readFileSync(new URL('./sites.js', import.meta.url), 'utf8');
+  const a = src.indexOf('function siteAddressShapedName'), b = src.indexOf('async function siteNetworkAction');
+  const ctx = vm.createContext({bl: (v) => v.ja});
+  vm.runInContext(src.slice(a, b) + '\nglobalThis.__f = {siteAddressShapedName, siteAddressNotAName};', ctx);
+  for (const v of ['10.47.1.30/32', '10.47.1.30', 'fd00::1', 'app.corp:8080']) assert.equal(ctx.__f.siteAddressShapedName(v), true, v);
+  for (const v of ['wiki.corp', 'a1.b2', 'host-1.example.test']) assert.equal(ctx.__f.siteAddressShapedName(v), false, v);
+  assert.match(ctx.__f.siteAddressNotAName('10.47.1.30/32'), /ネットワークのページ/);
+  const onClick = src.slice(src.indexOf('placeholder: bl({ en: "or a hostname'), src.indexOf('const saveError = el("div"'));
+  assert.ok(onClick.indexOf('siteAddressShapedName(v)') >= 0 && onClick.indexOf('siteAddressShapedName(v)') < onClick.indexOf('siteNetworkAction('), 'the add button sends before it checks');
+});
+// Acceptance C, third walk: the removal answered 503, and pressing Remove again did not even ask. Retrying is held
+// until the list is reloaded — the first request may have removed it — but the press says why.
+test('a second Remove after an unconfirmed removal says why instead of doing nothing', async () => {
+  const x=connectorManagementFixture();let confirms=0;x.f.context.uiConfirm=async()=>{confirms++;return true};
+  x.f.context.apiFetch=async(method,path,body)=>{x.calls.push({method,path,body});return {ok:false,status:503,body:{error:'x'}}};
+  await x.f.context.removeConnector('c','Old',x.f.host);
+  assert.equal(confirms,1);assert.equal(x.toasts.length,1);
+  await x.f.context.removeConnector('c','Old',x.f.host);
+  assert.equal(confirms,1,'no second confirmation for a removal that may already have happened');
+  assert.equal(x.calls.filter(c=>c.method==='DELETE').length,1);
+  assert.equal(x.toasts.length,2,'the second press says why nothing happens');assert.equal(x.toasts[1][1],'err');assert.match(x.toasts[1][0],/Reload/);
+});
+// The operator during acceptance C's third walk: an Osaka site must be able to put Osaka first.
+test('the site editor orders the organization\'s entrances and saves only an order someone chose', async () => {
+  const make = (tag, props = {}, children = []) => {
+    const node = {tag, ...props, style: {}, children: [], innerHTML: '', disabled: false,
+      appendChild(c) {this.children.push(c); return c;}};
+    Object.defineProperty(node, 'innerHTML', {set() {node.children = [];}, get() {return '';}});
+    (Array.isArray(children) ? children : [children]).forEach(c => c && node.children.push(c));
+    return node;
+  };
+  const run = async (existing, arrange) => {
+    const f = siteEditorFixture(existing);
+    f.context.el = make;
+    const writes = [];
+    f.context.apiFetch = async (method, path, body) => {
+      if (method === 'GET' && path === '/admin/agent-profile/options') return {ok: true, status: 200, body: {transport_endpoints: ['tokyo=https://agents.tokyo.example', 'osaka=https://agents.osaka.example', 'fukuoka=https://agents.fukuoka.example']}};
+      writes.push({method, path, body}); return {ok: false, status: 503};
+    };
+    f.context.openSiteForm(f.host, existing);
+    await new Promise(r => setImmediate(r));
+    const editor = f.modal.body.find(n => n && n.children && JSON.stringify(n.children[0] || {}).includes('Entrances its connectors use'));
+    assert.ok(editor, 'the order editor is shown when there is more than one entrance');
+    const rows = editor.children[1].children;
+    if (arrange) arrange(rows);
+    await f.modal.footer.at(-1).onclick();
+    return {rows: editor.children[1].children.map(r => r.children[0].text), body: writes.find(w => w.method === 'POST').body};
+  };
+  // Untouched, no saved order: the site's region is shown first, and nothing is frozen into the site.
+  let r = await run({site_id: 'osaka-branch', region: 'osaka'});
+  assert.equal(JSON.stringify(r.rows), JSON.stringify(['1. osaka', '2. tokyo', '3. fukuoka']));
+  assert.equal(r.body.door_order, undefined);
+  // Moved: fukuoka up above tokyo.
+  r = await run({site_id: 'osaka-branch', region: 'osaka'}, rows => rows[2].children[2].onClick());
+  assert.equal(JSON.stringify(r.body.door_order), JSON.stringify(['osaka', 'fukuoka', 'tokyo']));
+  // A saved order is shown and sent back unchanged when nothing is moved.
+  r = await run({site_id: 'osaka-branch', region: 'tokyo', door_order: ['fukuoka', 'osaka']});
+  assert.equal(JSON.stringify(r.rows), JSON.stringify(['1. fukuoka', '2. osaka', '3. tokyo']));
+  assert.equal(JSON.stringify(r.body.door_order), JSON.stringify(['fukuoka', 'osaka']));
+});

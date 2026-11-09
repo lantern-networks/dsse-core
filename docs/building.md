@@ -146,7 +146,7 @@ the main module; see [CONTRIBUTING.md](../CONTRIBUTING.md) for checks.
 
 ## Windows packages
 
-Build on Windows with Go, a .NET SDK, WiX 7.0.0, and the Windows SDK signing tools. Driver
+Build on Windows with Go, a .NET SDK, WiX 7.0.1, and the Windows SDK signing tools. Driver
 source builds also need the WDK. See the [packaging guide](../clients/windows-wfp/packaging/README.md)
 for the actual commands and [Windows installation](windows-agent.md) for provisioning.
 

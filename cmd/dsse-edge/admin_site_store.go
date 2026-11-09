@@ -48,6 +48,10 @@ type adminSiteModel struct {
 	RoutingNamespace       string `json:"routing_namespace,omitempty"`
 	DeploymentType         string `json:"deployment_type,omitempty"`
 	HAPolicy               string `json:"ha_policy,omitempty"`
+	// DoorOrder is the order in which this site's connectors use the deployment's entrances, as region IDs,
+	// first preferred. Empty means the site's own region first, then the deployment's order. See
+	// a_site_chooses_the_order_of_its_doors.go.
+	DoorOrder []string `json:"door_order,omitempty"`
 	// BootstrapSecretHash is the sha256:<hex> hash of the last-issued enrollment bootstrap secret. Persisted so a
 	// future register path can verify it (additive; not wired into register yet — lab keeps -connector-secret).
 	// Never returned in an admin Site response: HTTP uses the adminSite projection which omits it.
@@ -314,6 +318,11 @@ func normalizeAdminSiteModel(site adminSiteModel, now time.Time) (adminSiteModel
 	if err := normalizeAdminTenantOptionalToken(&site.HAPolicy, "ha_policy"); err != nil {
 		return adminSiteModel{}, err
 	}
+	order, err := normalizeSiteDoorOrder(site.DoorOrder)
+	if err != nil {
+		return adminSiteModel{}, err
+	}
+	site.DoorOrder = order
 	if site.ExpectedConnectorCount < 0 {
 		return adminSiteModel{}, fmt.Errorf("expected_connector_count must be non-negative")
 	}
@@ -525,8 +534,11 @@ func adminSiteEnrollmentCommand(token, stateDir string) string {
 	if stateDir == "" {
 		stateDir = "/var/lib/dsse-connector"
 	}
+	// ★ WITH sudo (2026-11-04, found by following this screen on a fresh machine). The installer writes a system
+	// service and a state directory under /var/lib, so it runs as root; docs/connector.md always said sudo and the
+	// screen did not, so the line as printed failed with a permission error.
 	lines := []string{
-		"dsse-connector-install \\",
+		"sudo dsse-connector-install \\",
 		"  --token " + token + " \\",
 		"  --state-dir " + stateDir,
 	}
@@ -545,7 +557,7 @@ func adminSiteEnrollmentVerifyCommand(stateDir string) string {
 	if stateDir == "" {
 		stateDir = "/var/lib/dsse-connector"
 	}
-	return "dsse-connector-install --verify --state-dir " + stateDir
+	return "sudo dsse-connector-install --verify --state-dir " + stateDir
 }
 
 // adminSiteEnrollmentCommandIssue mints a fresh bootstrap secret for a Site, persists ONLY its hash (rotating any
@@ -581,6 +593,9 @@ func adminSiteEnrollmentCommandIssue(ctx context.Context, store adminSiteStore, 
 		return adminSiteEnrollmentCommandResponse{}, false, fmt.Errorf("generate bootstrap secret: %w", err)
 	}
 	issuedAt := now.UTC().Format(time.RFC3339)
+	// The doors in the order this site gives them, so a connector's first tunnel goes where the administrator
+	// put it rather than wherever the deployment listed first. Its profile poll then keeps it current.
+	params.EdgeEndpoints = orderDoorListForSite(params.EdgeEndpoints, site.DoorOrder, site.Region)
 	site.BootstrapSecretHash = connectorRuntimeSecretHash(secret)
 	site.BootstrapSecretRotatedAt = &issuedAt
 	if _, err := store.Upsert(ctx, site, now); err != nil {

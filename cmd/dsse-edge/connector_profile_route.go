@@ -43,7 +43,14 @@ type connectorProfile struct {
 // CONNECTOR takes: the tenant was in hand and the region list was asked for without it, so a customer pinned
 // to one region was handed doors in the other.
 func connectorProfileFor(tenantID, site, fallbackEdgeURL string, regions func(tenantID string) []regionEndpoint) connectorProfile {
-	endpoints := agentProfileEndpoints(fallbackEdgeURL, tenantID, regions)
+	return connectorProfileForSite(tenantID, site, fallbackEdgeURL, regions, nil, "")
+}
+
+// connectorProfileForSite is the answer in the order the site's administrator chose (see
+// a_site_chooses_the_order_of_its_doors.go). The set of doors is the organization's; only the order is the site's.
+func connectorProfileForSite(tenantID, site, fallbackEdgeURL string, regions func(tenantID string) []regionEndpoint,
+	order []string, siteRegion string) connectorProfile {
+	endpoints := orderDoorsForSite(agentProfileEndpoints(fallbackEdgeURL, tenantID, regions), order, siteRegion)
 	return connectorProfile{
 		SchemaVersion: "connector_profile.v1",
 		TenantID:      strings.TrimSpace(tenantID),
@@ -70,8 +77,11 @@ func connectorProfileNote(endpoints []string) string {
 	}
 }
 
+// connectorSiteDoors names a connector's site and the order that site gives its doors.
+type connectorSiteDoors func(ctx context.Context, tenantID, connectorID string) (site string, order []string, siteRegion string)
+
 func registerConnectorProfileRoute(mux *http.ServeMux, authorize func(http.ResponseWriter, *http.Request, string) (string, bool),
-	fallbackEdgeURL string, regions func(context.Context, string) ([]regionEndpoint, error), siteOf func(connectorID string) string) {
+	fallbackEdgeURL string, regions func(context.Context, string) ([]regionEndpoint, error), siteOf connectorSiteDoors) {
 	mux.HandleFunc("GET /connectors/{connector_id}/profile", func(w http.ResponseWriter, r *http.Request) {
 		cid := r.PathValue("connector_id")
 		tenantID, ok := authorize(w, r, cid)
@@ -82,9 +92,9 @@ func registerConnectorProfileRoute(mux *http.ServeMux, authorize func(http.Respo
 			writeError(w, http.StatusForbidden, fmt.Errorf("connector tenant cannot be verified"))
 			return
 		}
-		site := ""
+		site, order, siteRegion := "", []string(nil), ""
 		if siteOf != nil {
-			site = siteOf(cid)
+			site, order, siteRegion = siteOf(r.Context(), tenantID, cid)
 		}
 		var resolved func(string) []regionEndpoint
 		if regions != nil {
@@ -95,6 +105,6 @@ func registerConnectorProfileRoute(mux *http.ServeMux, authorize func(http.Respo
 			}
 			resolved = func(string) []regionEndpoint { return endpoints }
 		}
-		writeJSON(w, http.StatusOK, connectorProfileFor(tenantID, site, fallbackEdgeURL, resolved))
+		writeJSON(w, http.StatusOK, connectorProfileForSite(tenantID, site, fallbackEdgeURL, resolved, order, siteRegion))
 	})
 }

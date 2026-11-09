@@ -51,7 +51,7 @@ func newSessionIntrospector(url, caFile string) (*sessionIntrospector, error) {
 	}
 	return &sessionIntrospector{
 		url:    strings.TrimSpace(url),
-		client: &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: tlsCfg}},
+		client: &http.Client{Timeout: 5 * time.Second, Transport: edgeTransport(tlsCfg)},
 	}, nil
 }
 

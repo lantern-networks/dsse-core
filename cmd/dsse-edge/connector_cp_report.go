@@ -53,6 +53,16 @@ type connectorReport struct {
 	// fact that keeps a failed-over connector reachable existed only where it was already known. Same family
 	// as the enrolment report next door: what the fleet learns, it learns by telling the authority.
 	AttachedRegionID string `json:"attached_region_id,omitempty"`
+	// LivenessOnly makes this a report of the connector's heartbeat and status, and nothing else: the node that
+	// received the heartbeat does not hold the connector's tunnel, so it has no say over where the connector
+	// is, and its copy of the registration is not the authority's to take back.
+	//
+	// ★★★ LIVENESS AND LOCATION ARE TWO FACTS, AND A HEARTBEAT CARRIES ONLY ONE (review of 2026-11-07). The
+	// node holding the tunnel reports both. A heartbeat can land on another node of the region — the agent
+	// door balances by least connections on the multi-node layouts, and a heartbeat is not a tunnel — and
+	// that node must not say where the connector is; but if it says nothing, the authority's last_heartbeat
+	// stops moving for as long as heartbeats land there, and the connector reads offline on every screen.
+	LivenessOnly bool `json:"liveness_only,omitempty"`
 }
 
 // connectorCPReport is the process-wide reporter, set at start-up when this Edge can reach the control

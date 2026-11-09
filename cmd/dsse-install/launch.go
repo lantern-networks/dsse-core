@@ -213,10 +213,50 @@ if [ "${DSSE_TOPOLOGY_PROFILE:-}" = "one-region-three-nodes" ] || [ "${DSSE_TOPO
     fi
   done
   [ "$connector_owned" = true ] || { echo 'Connector enrollment URL is outside the three owned doors' >&2; exit 1; }
-elif [ "${DSSE_REGION_PORT:-443}" = "443" ]; then
-  DSSE_CONNECTOR_EDGE_URL="${DSSE_CONNECTOR_EDGE_URL:-https://${DSSE_AGENT_PLANE_NAME:-$EDGE_HOST}}"
 else
-  DSSE_CONNECTOR_EDGE_URL="${DSSE_CONNECTOR_EDGE_URL:-https://${DSSE_AGENT_PLANE_NAME:-$EDGE_HOST}:${DSSE_REGION_PORT}}"
+  # ★★★ THE DEFAULT MUST BE A DOOR THE REGION MAP LISTS. The control plane accepts a Connector's first URL only
+  # when it is one of the tenant's permitted doors, which come from DSSE_REGION_ENDPOINTS. The single-machine and
+  # combined three-region plans name agents.<deployment> as the agent plane, while their region map lists
+  # agents.<region>.<deployment>; a default taken from the agent plane would have every enrolment command refused
+  # with 409 "edge_url is not in this tenant's permitted Edge endpoints".
+  # An explicit DSSE_CONNECTOR_EDGE_URL is still used as given; the control plane checks it.
+  connector_explicit="${DSSE_CONNECTOR_EDGE_URL:-}"
+  if [ "${DSSE_REGION_PORT:-443}" = "443" ]; then
+    DSSE_CONNECTOR_EDGE_URL="${DSSE_CONNECTOR_EDGE_URL:-https://${DSSE_AGENT_PLANE_NAME:-$EDGE_HOST}}"
+  else
+    DSSE_CONNECTOR_EDGE_URL="${DSSE_CONNECTOR_EDGE_URL:-https://${DSSE_AGENT_PLANE_NAME:-$EDGE_HOST}:${DSSE_REGION_PORT}}"
+  fi
+  if [ -z "$connector_explicit" ] && [ -n "${DSSE_REGION_ENDPOINTS:-}" ]; then
+    connector_listed=false
+    connector_own=''
+    connector_first=''
+    connector_remaining="$DSSE_REGION_ENDPOINTS"
+    while [ -n "$connector_remaining" ]; do
+      connector_entry="${connector_remaining%%;*}"
+      if [ "$connector_entry" = "$connector_remaining" ]; then
+        connector_remaining=''
+      else
+        connector_remaining="${connector_remaining#*;}"
+      fi
+      case "$connector_entry" in
+        *=https://?*) ;;
+        *) continue ;;
+      esac
+      connector_url="${connector_entry#*=}"
+      if [ -z "$connector_first" ]; then
+        connector_first="$connector_url"
+      fi
+      if [ -z "$connector_own" ] && [ "${connector_entry%%=*}" = "${DSSE_EDGE_REGION:-}" ]; then
+        connector_own="$connector_url"
+      fi
+      if [ "$connector_url" = "$DSSE_CONNECTOR_EDGE_URL" ]; then
+        connector_listed=true
+      fi
+    done
+    if [ "$connector_listed" = false ] && [ -n "${connector_own:-$connector_first}" ]; then
+      DSSE_CONNECTOR_EDGE_URL="${connector_own:-$connector_first}"
+    fi
+  fi
 fi
 
 # ★★★ THE BREAK-GLASS CREDENTIAL IS ARMED ONLY UNTIL THIS DEPLOYMENT HAS AN ADMINISTRATOR.
@@ -309,6 +349,22 @@ fi
 STEPUP_PORTAL_ORIGINS=""
 if [ -n "${DSSE_STEPUP_PORTAL_ORIGINS:-}" ]; then
   STEPUP_PORTAL_ORIGINS="-step-up-portal-origins=$DSSE_STEPUP_PORTAL_ORIGINS"
+elif [ -n "${DSSE_REGION_ENDPOINTS:-}" ]; then
+  # ★★★ THE PROFILES THIS NODE ISSUES MUST NAME THE PAGES THE EDGES SEND DEVICES TO. The Console asks THIS node
+  # for device profiles, and a profile's step-up portal origins are what the agent checks the Edge's sign-in URL
+  # against. Each Edge serves that page on its region's door (-clientless-base-url, derived from this same map).
+  # A profile that names no origin makes the agent refuse every sign-in URL as invalid_or_expired_portal_request,
+  # and a connection that requires the user's sign-in waits two minutes and closes without a browser opening.
+  # Every region's door, because a device that fails over is sent to the door of the region it is now in.
+  derived="$(printf '%s' "$DSSE_REGION_ENDPOINTS" | tr ';' '\n' | sed -n 's/^[^=]*=//p' | tr '\n' ',' | sed 's/,$//')"
+  [ -n "$derived" ] && STEPUP_PORTAL_ORIGINS="-step-up-portal-origins=$derived"
+elif [ -n "${DSSE_AGENT_PLANE_NAME:-${EDGE_HOST:-}}" ]; then
+  # No region map: the Edge serves the page on the deployment-wide agent name, so that is the one to name.
+  if [ "${DSSE_REGION_PORT:-443}" = "443" ]; then
+    STEPUP_PORTAL_ORIGINS="-step-up-portal-origins=https://${DSSE_AGENT_PLANE_NAME:-$EDGE_HOST}"
+  else
+    STEPUP_PORTAL_ORIGINS="-step-up-portal-origins=https://${DSSE_AGENT_PLANE_NAME:-$EDGE_HOST}:${DSSE_REGION_PORT}"
+  fi
 fi
 
 CONSOLE_ORIGIN=""
@@ -363,10 +419,12 @@ AUTH_ROLLOUT=""
 if [ -f "$here/auth-rollout-census.json" ]; then
   AUTH_ROLLOUT="-auth-rollout-census=$here/auth-rollout-census.json -auth-rollout-ca=$here/deployment-anchor.pem"
   AUTH_ROLLOUT="$AUTH_ROLLOUT -auth-rollout-client-cert=$here/auth-rollout-cp.crt -auth-rollout-client-key=$here/auth-rollout-cp.key"
-  AUTH_ROLLOUT="$AUTH_ROLLOUT -auth-rollout-report-url=${DSSE_AUTHORITY_ORIGIN:?set DSSE_AUTHORITY_ORIGIN}/fleet-capabilities/report"
+  # The plan names this machine's region authority (DSSE_AUTH_ROLLOUT_REPORT_ORIGIN), a name it lists and the
+  # region's door routes to the leader; deployments made before it fall back to the deployment-wide authority.
+  AUTH_ROLLOUT="$AUTH_ROLLOUT -auth-rollout-report-url=${DSSE_AUTH_ROLLOUT_REPORT_ORIGIN:-${DSSE_AUTHORITY_ORIGIN:?set DSSE_AUTHORITY_ORIGIN}}/fleet-capabilities/report"
 fi
 
-# ★★★ SECRETS GO THROUGH THE ENVIRONMENT, NEVER THE COMMAND LINE (2026-10-29). Every local user on the host
+# ★★★ SECRETS GO THROUGH THE ENVIRONMENT, NEVER THE COMMAND LINE. Every local user on the host
 # can read a process's arguments (ps, /proc/<pid>/cmdline); only its owner and root can read its environment.
 # The program is given the variable NAMES and removes the variables once it has read them. A binary older than
 # -secret-env does not list it in -help and still gets the old arguments, so nodes upgraded one at a time keep
@@ -1053,7 +1111,7 @@ if [ -f "$here/auth-rollout-census.json" ]; then
   AUTH_ROLLOUT="$AUTH_ROLLOUT -auth-rollout-report-url=$DSSE_CONTROL_PLANE_DATA/fleet-capabilities/report"
 fi
 
-# ★★★ SECRETS GO THROUGH THE ENVIRONMENT, NEVER THE COMMAND LINE (2026-10-29). Every local user on the host
+# ★★★ SECRETS GO THROUGH THE ENVIRONMENT, NEVER THE COMMAND LINE. Every local user on the host
 # can read a process's arguments (ps, /proc/<pid>/cmdline); only its owner and root can read its environment.
 # The program is given the variable NAMES and removes the variables once it has read them. A binary older than
 # -secret-env does not list it in -help and still gets the old arguments, so nodes upgraded one at a time keep
@@ -1061,7 +1119,7 @@ fi
 STEPUP_BINDING_SECRET="${STEPUP_BINDING_SECRET:-$CONNECTOR_SECRET}"
 export ADMIN_TOKEN CONNECTOR_SECRET WORKLOAD_SECRET STEPUP_BINDING_SECRET AUDIT_INGEST_TOKEN
 if "$DSSE_EDGE_BINARY" -help 2>&1 | grep -q -- '-secret-env'; then
-  SECRET_ENV=admin-token=ADMIN_TOKEN,connector-secret=CONNECTOR_SECRET,workload-attestation-secret=WORKLOAD_SECRET,step-up-binding-secret=STEPUP_BINDING_SECRET,audit-ingest-token=AUDIT_INGEST_TOKEN
+  SECRET_ENV=admin-token=ADMIN_TOKEN,connector-secret=CONNECTOR_SECRET,workload-attestation-secret=WORKLOAD_SECRET,step-up-binding-secret=STEPUP_BINDING_SECRET,audit-ingest-token=AUDIT_INGEST_TOKEN  # flag=VARIABLE names; the values stay in the environment
   if [ -n "$FLEET_TOKEN" ]; then
     export EDGE_CP_TOKEN
     SECRET_ENV="$SECRET_ENV,steer-exclusion-source-token=EDGE_CP_TOKEN"

@@ -138,11 +138,33 @@ func (s *ClickHouseStore) buildWhere(query SearchQuery) (string, map[string]stri
 	i := 0
 	for k, v := range query.Filters {
 		vk := fmt.Sprintf("f%d", i)
+		kk := fmt.Sprintf("k%d", i)
 		params[vk] = v
-		if col, ok := clickHouseKnownColumns[k]; ok {
+		switch col, known := clickHouseKnownColumns[k]; {
+		case isSubstringFilterField(k):
+			// ★★ THE SAME MATCH THE OTHER TWO STORES MAKE (2026-11-04, acceptance A, third run). The Logs screen's
+			// "Destination" box sent destination=10.40.1.30 and got nothing back for rows it was showing: this
+			// store compared it, EXACTLY, with a column that only a DLP finding fills (dlp_destination), so no
+			// access decision could ever match. The Postgres and JSONL stores match these human-typed fields as
+			// a case-insensitive part of the record's own field (isSubstringFilterField), and so does this now.
+			//
+			// ★ THE UTF-8 FUNCTION (the same day). positionCaseInsensitive folds ASCII only, so
+			// "josé" did not find "JOSÉ" here while the JSONL store, lowering with Go's Unicode rules, found it.
+			if known && k != "destination" {
+				// The column is the record's own top-level field, copied at ingest.
+				conds = append(conds, fmt.Sprintf("positionCaseInsensitiveUTF8(%s, {%s:String}) > 0", col, vk))
+				break
+			}
+			params[kk] = k
+			cond := fmt.Sprintf("positionCaseInsensitiveUTF8(JSONExtractString(raw, {%s:String}), {%s:String}) > 0", kk, vk)
+			if k == "destination" {
+				// A DLP finding carries its destination in metadata, which is what the column holds.
+				cond = fmt.Sprintf("(%s OR positionCaseInsensitiveUTF8(destination, {%s:String}) > 0)", cond, vk)
+			}
+			conds = append(conds, cond)
+		case known:
 			conds = append(conds, fmt.Sprintf("%s = {%s:String}", col, vk))
-		} else {
-			kk := fmt.Sprintf("k%d", i)
+		default:
 			params[kk] = k
 			conds = append(conds, fmt.Sprintf("JSONExtractString(raw, {%s:String}) = {%s:String}", kk, vk))
 		}
@@ -150,7 +172,8 @@ func (s *ClickHouseStore) buildWhere(query SearchQuery) (string, map[string]stri
 	}
 	if t := strings.TrimSpace(query.Text); t != "" {
 		params["txt"] = t
-		conds = append(conds, "positionCaseInsensitive(raw, {txt:String}) > 0")
+		// UTF-8 case folding, as the Postgres (lower/LIKE) and JSONL (strings.ToLower) stores do.
+		conds = append(conds, "positionCaseInsensitiveUTF8(raw, {txt:String}) > 0")
 	}
 	if query.From != nil {
 		params["fromts"] = clickHouseQueryBound(query.From)

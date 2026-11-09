@@ -287,7 +287,10 @@ func TestHealthzSaysWhetherObservationReportsAreDelivered(t *testing.T) {
 	h := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, Registry: connector.NewRegistry(), AdminAuth: newAdminAuthStore()})
 	body := func() map[string]any {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+		// What a node is goes to the operator only; in a lab with no administrators any credential is the lab's.
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		req.Header.Set("Authorization", "Bearer lab")
+		h.ServeHTTP(rec, req)
 		var out map[string]any
 		json.Unmarshal(rec.Body.Bytes(), &out)
 		return out

@@ -77,14 +77,19 @@ func (s *loginChallengeStore) Consume(token string, now time.Time) (loginChallen
 	return c, true
 }
 
-// activationLink builds the URL emailed to a newly invited admin (the Console activation page consumes the
-// token from the query string).
+// activationLink builds the URL emailed to a newly invited admin. The token rides in the FRAGMENT: a browser
+// never sends the fragment in the request, so the token reaches no access log, proxy log or front door on
+// the way to the Console page, and the Console reads it from location.hash and sends it to the API in a POST
+// body (security review S6, review R4).
 func activationLink(consoleOrigin, rawToken string) string {
 	origin := strings.TrimRight(strings.TrimSpace(consoleOrigin), "/")
 	if origin == "" {
 		origin = "https://console.local"
 	}
-	return origin + "/?activate=" + rawToken
+	// The bare "activate" query is a MARKER, not the token: it tells a standby Console that this is an
+	// activation link, which belongs to the origin it was issued for, so the standby does not send the browser
+	// to the leader with a Location that drops the fragment and the token with it (re-review RR5).
+	return origin + "/?activate#activate=" + rawToken
 }
 
 // sendActivationEmail writes the activation message to the lab email sink (a file) and logs it. Production
@@ -123,9 +128,18 @@ type adminInvitationMessage struct {
 // A per-organization language, alongside Timezone on the tenant model, is the thing that would let this pick
 // one. Until that exists this must not silently keep addressing half its readers in a language they may not
 // read.
-func buildAdminInvitation(email, link string, now time.Time) adminInvitationMessage {
+//
+// ★ THE EXPIRY IS IN THE ORGANIZATION'S CLOCK, NAMED (acceptance C, third and fourth walks, 2026-11-08). It read
+// "2026-11-09T10:28:19Z" — the wire format, in UTC, pasted to a person in an organization set to Asia/Tokyo, who
+// would have to know what the Z means and convert it to know when the link stops working. The person being invited
+// joins THIS organization, so its zone is the clock they will read every other time in; the zone's name is
+// printed with it, so nobody has to guess which clock it is. expires_at keeps the instant for programs.
+func buildAdminInvitation(email, link string, now time.Time, zone *time.Location) adminInvitationMessage {
+	if zone == nil {
+		zone = time.UTC
+	}
 	expires := now.UTC().Add(activationTTL)
-	stamp := expires.Format(time.RFC3339)
+	stamp := expires.In(zone).Format("2006-01-02 15:04 MST")
 	hours := int(activationTTL.Hours())
 	body := strings.Join([]string{
 		"Lantern DSSE の管理者に招待されました。",

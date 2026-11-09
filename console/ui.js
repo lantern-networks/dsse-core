@@ -130,6 +130,13 @@ function uiField(spec) {
     input = el("input", { class: "ui-input", id, type: spec.type || "text", placeholder: spec.placeholder || "" });
     input.value = spec.value || "";
   }
+  // ★ THE BROWSER FILLED THE ADMINISTRATOR'S OWN SIGN-IN INTO A PROVIDER'S CLIENT ID AND SECRET (2026-11-08,
+  // acceptance C). A password-type field with a text field before it is a sign-in form to a password manager,
+  // and these are never that: every password-type field here is a secret that belongs to something else. Saying
+  // so ("new-password") stops the saved sign-in from being offered, and the text fields are not to be filled.
+  if (spec.type !== "select" && spec.type !== "checkbox") {
+    input.setAttribute("autocomplete", spec.autocomplete || (spec.type === "password" ? "new-password" : "off"));
+  }
   const errMsg = el("div", { class: "ui-field-error-msg" });
   const labelEls = [spec.label || spec.name];
   if (spec.required) labelEls.push(el("span", { class: "ui-field-req", text: "*" }));
@@ -178,6 +185,41 @@ function byDeviceIdentity(rows, field) {
 }
 
 function uiBadge(text, kind) { return el("span", { class: "ui-badge ui-badge-" + (kind || "off"), text }); }
+
+// A connector's state, as the Edge writes it ("healthy", "registered"), in the reader's language (2026-11-06: both
+// showed in English on a Japanese screen). Shared, because the connector screens and the log both show it and a
+// second table would drift (2026-11-07: the log's state column still read "healthy"). An unknown code is shown
+// as it came.
+const UI_CONNECTOR_STATUS_LABELS = {
+  healthy: { en: "Healthy", ja: "正常" },
+  registered: { en: "Registered", ja: "登録済み" },
+  connected: { en: "Connected", ja: "接続中" },
+  online: { en: "Online", ja: "オンライン" },
+  active: { en: "Active", ja: "有効" },
+  disconnected: { en: "Disconnected", ja: "切断" },
+  offline: { en: "Offline", ja: "オフライン" },
+  degraded: { en: "Degraded", ja: "一部不調" },
+  unhealthy: { en: "Unhealthy", ja: "不調" },
+  revoked: { en: "Revoked", ja: "失効" },
+  unknown: { en: "Unknown", ja: "不明" },
+};
+function uiConnectorStatusLabel(status) {
+  const s = String(status || "unknown");
+  return UI_CONNECTOR_STATUS_LABELS[s] ? bl(UI_CONNECTOR_STATUS_LABELS[s]) : s;
+}
+
+// uiSeatsInUse says how many seats an organization uses, and how many of them are connectors. The licence counts
+// agents and a connector is one, so it holds a seat, while the Devices screen does not list it — "2" beside
+// "1 device" with nothing between them read as a miscount (0.4.1 acceptance B rerun). Both screens that show the
+// count use this, so they cannot say it two ways.
+function uiSeatsInUse(used, connectors) {
+  const n = Number(used) || 0;
+  const c = Math.min(Number(connectors) || 0, n);
+  if (!c) return String(n);
+  const d = n - c;
+  return bl({ en: n + " (" + d + (d === 1 ? " device, " : " devices, ") + c + (c === 1 ? " connector)" : " connectors)"),
+              ja: n + "（端末 " + d + "・コネクタ " + c + "）" });
+}
 
 // uiModal({title, body, footer}) -> { el, close }. A bare modal shell for forms (the confirm/preview variant is
 // uiConfirm). body/footer are arrays of nodes. Esc and backdrop-click close it.

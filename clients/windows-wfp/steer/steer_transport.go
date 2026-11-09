@@ -286,6 +286,7 @@ type activeEndpoint struct {
 	host       string   // host:port to dial when dialAddrs is empty (IP literal, or pre-resolution fallback)
 	serverName string   // SNI verified against the pinned transport CA for THIS region's Edge
 	dialAddrs  []string // out-of-band-resolved "ip:port" pins (round-robined); empty => dial host directly
+	region     string   // the region the endpoint list says this endpoint serves; empty before the first selection
 }
 
 // edgeDialCounter spreads successive dials across multiple pinned Edge IPs (hostname-based Edge HA).

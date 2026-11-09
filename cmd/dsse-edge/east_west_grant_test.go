@@ -41,7 +41,7 @@ func TestIssueEastWestGrantFromChallengeReleasesAndCompletes(t *testing.T) {
 		TenantID: tenant, UserID: "u9", DeviceID: "dev1", Destination: "dc-01", ServiceFamily: "rdp",
 	}), now)
 
-	resp, err := eastwest.CompleteCeremony(store, challenges, challenge.ID, tenant, "u9", now)
+	resp, err := eastwest.CompleteCeremony(store, challenges, challenge.ID, eastwest.CeremonyProof{TenantID: tenant, SubjectUserID: "u9"}, now)
 	if err != nil {
 		t.Fatalf("issue grant: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestIssueEastWestGrantFromChallengeReleasesAndCompletes(t *testing.T) {
 	}
 
 	// The challenge is consumed (completed) -> issuing again fails, and it is no longer pending.
-	if _, err := eastwest.CompleteCeremony(store, challenges, challenge.ID, tenant, "u9", now); err == nil {
+	if _, err := eastwest.CompleteCeremony(store, challenges, challenge.ID, eastwest.CeremonyProof{TenantID: tenant, SubjectUserID: "u9"}, now); err == nil {
 		t.Fatal("re-issuing against a completed challenge must fail")
 	}
 	if got := challenges.ListPending(tenant, now); len(got) != 0 {

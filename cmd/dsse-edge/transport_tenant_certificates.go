@@ -685,9 +685,7 @@ var unservedServerNames = struct {
 
 func noteUnservedServerName(name string) {
 	name = strings.ToLower(strings.TrimSpace(name))
-	// No name at all is the ordinary case for probes and for deployments that serve one certificate to
-	// everybody. Only a name that was ASKED FOR and is not served says something happened.
-	if name == "" {
+	if !unservedServerNameSaysSomething(name, transportTenantCertificates.Names()) {
 		return
 	}
 	now := time.Now()
@@ -1239,4 +1237,18 @@ func effectiveDeadlineOrCertificateEnd(cert *tls.Certificate, given []time.Time)
 		return cert.Leaf.NotAfter.UTC()
 	}
 	return time.Time{}
+}
+
+// unservedServerNameSaysSomething decides whether a name asked for and not served by an organization's own
+// certificate is worth a line.
+//
+// No name at all is the ordinary case for probes. And a node that serves NO organization's own transport name
+// is a deployment where every device dials the deployment-wide names and trusts the deployment's anchor: the
+// shared certificate is the right answer to every name, and the line was noise. Measured on a three-region
+// acceptance (2026-11-06): every Edge logged "a device asked for agents.region-b…, which this node does not
+// serve … Names this node serves: []" for every device, on a deployment with nothing wrong. The line is for a
+// deployment that DOES issue organization transport certificates, where a device asking for another name is the
+// mis-provisioned box it was written for.
+func unservedServerNameSaysSomething(name string, served []string) bool {
+	return strings.TrimSpace(name) != "" && len(served) > 0
 }

@@ -1,17 +1,24 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/logs"
+	"github.com/lantern-networks/dsse-core/runtimequota"
 )
 
 // First-party admin authentication surface — activation (password/TOTP), login,
@@ -20,6 +27,7 @@ import (
 func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, adminAuth adminAuthRuntimeStore, adminDownloadTokens *adminDownloadTokenStore, exportObjectStore adminExportObjectStore, tenantModelStore adminTenantModelRuntimeStore, devMode bool) {
 	if config.LocalCredentials != nil {
 		firstPartyChallenges := newLoginChallengeStore()
+		throttled := adminSignInThrottle(writer, evaluator)
 
 		// Authentication routes bypass the configuration-change middleware. Record each
 		// activation attempt independently, including malformed bodies and repeated enrollment.
@@ -41,20 +49,27 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, time.Now())
 		}
 
-		mux.HandleFunc("GET /admin/activate", func(w http.ResponseWriter, r *http.Request) {
-			email, err := config.LocalCredentials.ActivationEmail(r.URL.Query().Get("token"), time.Now())
+		// ★ THE TOKEN TRAVELS IN THE BODY, NOT THE URL (2026-11-07, security review S6). An activation token is
+		// a credential that creates an administrator's password. As a query string it was written into every
+		// access log and proxy log between the browser and this node. The Console link still carries it (that
+		// is how the person receives it), but it reaches the API as a POST body like the three steps after it.
+		// control-plane-only: an Edge does not register the first-party account surface at all (measured: 404)
+		mux.HandleFunc("POST /admin/activate", throttled(func(w http.ResponseWriter, r *http.Request) {
+			var req activationTokenRequest
+			if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body"))
+				return
+			}
+			email, err := config.LocalCredentials.ActivationEmail(req.Token, time.Now())
 			if err != nil {
 				writeCredentialError(w, http.StatusNotFound, err)
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"email": email})
-		})
+		}))
 		// control-plane-only: an Edge does not register the first-party account surface at all (measured: 404)
-		mux.HandleFunc("POST /admin/activate/password", func(w http.ResponseWriter, r *http.Request) {
-			var req struct {
-				Token       string `json:"token"`
-				NewPassword string `json:"new_password"`
-			}
+		mux.HandleFunc("POST /admin/activate/password", throttled(func(w http.ResponseWriter, r *http.Request) {
+			var req activationPasswordRequest
 			var tenant, target string
 			rec := &adminAuditStatusRecorder{ResponseWriter: w}
 			w = rec
@@ -70,12 +85,10 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"status": "password_set"})
-		})
+		}))
 		// control-plane-only: an Edge does not register the first-party account surface at all (measured: 404)
-		mux.HandleFunc("POST /admin/activate/totp/begin", func(w http.ResponseWriter, r *http.Request) {
-			var req struct {
-				Token string `json:"token"`
-			}
+		mux.HandleFunc("POST /admin/activate/totp/begin", throttled(func(w http.ResponseWriter, r *http.Request) {
+			var req activationTokenRequest
 			var tenant, target string
 			rec := &adminAuditStatusRecorder{ResponseWriter: w}
 			w = rec
@@ -92,13 +105,10 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"secret": secret, "otpauth_uri": uri})
-		})
+		}))
 		// control-plane-only: an Edge does not register the first-party account surface at all (measured: 404)
-		mux.HandleFunc("POST /admin/activate/totp/complete", func(w http.ResponseWriter, r *http.Request) {
-			var req struct {
-				Token string `json:"token"`
-				Code  string `json:"code"`
-			}
+		mux.HandleFunc("POST /admin/activate/totp/complete", throttled(func(w http.ResponseWriter, r *http.Request) {
+			var req activationCodeRequest
 			var tenant, target string
 			rec := &adminAuditStatusRecorder{ResponseWriter: w}
 			w = rec
@@ -115,14 +125,11 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"status": credentialStatusActive, "recovery_codes": recovery})
-		})
+		}))
 
 		// control-plane-only: an Edge does not register sign-in at all (measured: 404) — accounts are the control plane's
-		mux.HandleFunc("POST /admin/login/password", func(w http.ResponseWriter, r *http.Request) {
-			var req struct {
-				Email    string `json:"email"`
-				Password string `json:"password"`
-			}
+		mux.HandleFunc("POST /admin/login/password", throttled(func(w http.ResponseWriter, r *http.Request) {
+			var req passwordLoginRequest
 			if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body"))
 				return
@@ -144,13 +151,10 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"challenge_token": challenge, "totp_required": true})
-		})
+		}))
 		// control-plane-only: an Edge does not register sign-in at all (measured: 404) — accounts are the control plane's
-		mux.HandleFunc("POST /admin/login/totp", func(w http.ResponseWriter, r *http.Request) {
-			var req struct {
-				ChallengeToken string `json:"challenge_token"`
-				Code           string `json:"code"`
-			}
+		mux.HandleFunc("POST /admin/login/totp", throttled(func(w http.ResponseWriter, r *http.Request) {
+			var req totpLoginRequest
 			if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body"))
 				return
@@ -210,7 +214,7 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminLoginAuditLog("admin_login_succeeded", &principal, &session, evaluator, r, ""), time.Now())
 			http.SetCookie(w, adminSessionCookie(session))
 			writeJSON(w, http.StatusCreated, signInAnswer(principal, session, config.AdminConsoleOrigin, r))
-		})
+		}))
 	}
 
 	mux.HandleFunc("GET /admin/session", adminEndpoint("admin.state.read", func(w http.ResponseWriter, r *http.Request) {
@@ -489,4 +493,162 @@ func writeCredentialError(w http.ResponseWriter, fallback int, err error) {
 		return
 	}
 	writeError(w, fallback, err)
+}
+
+// adminSignInThrottle bounds how fast the first-party sign-in and activation routes may be tried.
+//
+// ★ A LOCK PER ACCOUNT IS A LEVER FOR WHOEVER KNOWS THE ADDRESS (2026-11-07, security review S12). The
+// credential store locks an account after a few wrong passwords, which stops guessing and also lets anyone
+// who knows an administrator's email keep that administrator locked out for as long as they care to type.
+// This is the other half: the SOURCE is bounded too, and answered 429 before the account is touched.
+//
+// ★★ AND THE SOURCE THIS NODE SEES IS USUALLY THE CONSOLE (review R2). Administrators sign in through the
+// Admin Console, which proxies these routes here, so every browser behind one Console arrives from one
+// address — a bound keyed on that address alone would let one person's mistakes lock every colleague out.
+// So the tight bound is keyed on (source, account): one flood against one account from one source is
+// stopped while the next person, from the same Console, is judged on their own. A looser bound per source
+// alone remains as the backstop against a flood spread over many accounts; it is sized so an office's
+// Console never meets it. The bound keyed on the person's OWN browser address lives in the Console, which
+// is the door the browser knocks on and the one place that address is known.
+//
+// DSSE_ADMIN_SIGNIN_REQUESTS_PER_SECOND / _BURST size the (source, account) bound (default 5 / 20);
+// DSSE_ADMIN_SIGNIN_SOURCE_REQUESTS_PER_SECOND / _BURST the per-source backstop (default 50 / 200); 0 turns
+// the respective bound off (the account lock stays).
+func adminSignInThrottle(writer *logs.Writer, evaluator decision.Evaluator) func(http.HandlerFunc) http.HandlerFunc {
+	perAccount := signInBucketFromEnvironment("DSSE_ADMIN_SIGNIN_REQUESTS_PER_SECOND", "DSSE_ADMIN_SIGNIN_BURST", 5, 20)
+	perSource := signInBucketFromEnvironment("DSSE_ADMIN_SIGNIN_SOURCE_REQUESTS_PER_SECOND", "DSSE_ADMIN_SIGNIN_SOURCE_BURST", 50, 200)
+	return func(h http.HandlerFunc) http.HandlerFunc {
+		if perAccount == nil && perSource == nil {
+			return h
+		}
+		return func(w http.ResponseWriter, r *http.Request) {
+			source := clientIPForRateLimit(r)
+			refused := !perSource.allow(source)
+			if !refused {
+				account := signInAccountKey(r)
+				refused = !perAccount.allow(source + "|" + account)
+			}
+			if refused {
+				// The source and the route, never the credential. A burst from one address is worth seeing.
+				log.Printf("admin_signin_rate_limited source=%q path=%s", source, r.URL.Path)
+				_ = appendAdminAudit(r.Context(), writer, nil, adminAuthFailureAuditLog("admin_signin_rate_limited", evaluator, source, r.UserAgent(), "too_many_attempts_from_source"), time.Now())
+				w.Header().Set("Retry-After", "1")
+				writeError(w, http.StatusTooManyRequests, fmt.Errorf("too many sign-in attempts from this address"))
+				return
+			}
+			h(w, r)
+		}
+	}
+}
+
+func signInBucketFromEnvironment(rateKey, burstKey string, defaultRate, defaultBurst float64) *tokenBucketLimiter {
+	rps, burst := defaultRate, defaultBurst
+	if strings.TrimSpace(os.Getenv(rateKey)) != "" {
+		rps = runtimequota.Rate(rateKey)
+		burst = rps
+	}
+	if strings.TrimSpace(os.Getenv(burstKey)) != "" {
+		burst = runtimequota.Rate(burstKey)
+	}
+	if burst < 1 {
+		burst = 1
+	}
+	if rps <= 0 {
+		return nil
+	}
+	return newTokenBucketLimiter(rps, burst)
+}
+
+// The request bodies of the first-party sign-in and activation routes. They are declared once and read by
+// BOTH the handler and the bound keyed on them, with the same decoder, so the two cannot disagree about which
+// account, challenge or invitation a body names.
+//
+// ★★★ TWO READERS OF ONE BODY MUST BE ONE READER (2026-11-07, third review RRR1). The bound read the body into
+// a map and took the exact key; the handler read it into a struct, where encoding/json matches field names
+// case-insensitively and the last match wins. A body of {"token":"decoy","Token":"real"} was therefore
+// bounded as "decoy" — a fresh bucket per request — and served as "real". The subject of a bound has to be
+// the subject the handler acts on, so the bound now decodes the handler's own type with the handler's own
+// decoder and nothing else.
+type activationTokenRequest struct {
+	Token string `json:"token"`
+}
+
+type activationPasswordRequest struct {
+	Token       string `json:"token"`
+	NewPassword string `json:"new_password"`
+}
+
+type activationCodeRequest struct {
+	Token string `json:"token"`
+	Code  string `json:"code"`
+}
+
+type passwordLoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type totpLoginRequest struct {
+	ChallengeToken string `json:"challenge_token"`
+	Code           string `json:"code"`
+}
+
+// signInSubject is what a sign-in body is about, read exactly as the route's handler reads it: the account
+// of a password attempt, the challenge of a second-factor attempt, the invitation token of an activation
+// step. Empty when the body names nothing the handler would act on.
+func signInSubject(path string, raw []byte) (kind, subject string) {
+	switch path {
+	case "/admin/login/password":
+		var req passwordLoginRequest
+		if json.Unmarshal(raw, &req) == nil {
+			return "account", strings.ToLower(strings.TrimSpace(req.Email))
+		}
+	case "/admin/login/totp":
+		var req totpLoginRequest
+		if json.Unmarshal(raw, &req) == nil {
+			return "challenge", strings.TrimSpace(req.ChallengeToken)
+		}
+	case "/admin/activate", "/admin/activate/totp/begin":
+		var req activationTokenRequest
+		if json.Unmarshal(raw, &req) == nil {
+			return "token", strings.TrimSpace(req.Token)
+		}
+	case "/admin/activate/password":
+		var req activationPasswordRequest
+		if json.Unmarshal(raw, &req) == nil {
+			return "token", strings.TrimSpace(req.Token)
+		}
+	case "/admin/activate/totp/complete":
+		var req activationCodeRequest
+		if json.Unmarshal(raw, &req) == nil {
+			return "token", strings.TrimSpace(req.Token)
+		}
+	}
+	return "", ""
+}
+
+// signInAccountKey names what a sign-in attempt is about, so the tight bound is keyed on (source, that).
+// Each of those is one person's, so one person's flood spends one person's bucket (re-review RR3). A body
+// that names nothing falls under the route, where the per-source backstop is what bounds it. The body is
+// read and put back for the handler, which decodes it again the same way.
+func signInAccountKey(r *http.Request) string {
+	if r.Body == nil {
+		return r.URL.Path
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxEdgeRuntimeJSONBodyBytes+1))
+	_ = r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	if err != nil {
+		return r.URL.Path
+	}
+	kind, subject := signInSubject(r.URL.Path, raw)
+	if subject == "" {
+		return r.URL.Path
+	}
+	if kind == "account" {
+		return "account:" + subject
+	}
+	// A token is a secret; the key holds its digest, never the token.
+	sum := sha256.Sum256([]byte(subject))
+	return kind + ":" + hex.EncodeToString(sum[:8])
 }

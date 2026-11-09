@@ -56,6 +56,11 @@ type adminConnector struct {
 	// terminated it. It differs from EdgeRegionID after a region failover, and the difference is the whole
 	// point: it is the region the deployment routes flows to.
 	AttachedRegionID string `json:"attached_region_id,omitempty"`
+	// TunnelRegion is where an Edge last said it holds this connector's tunnel, and TunnelReportedAt when. Read
+	// on the control plane, which holds no tunnels (a_connectors_detail_comes_from_what_the_edges_report.go).
+	TunnelRegion     string `json:"tunnel_region,omitempty"`
+	TunnelReportedAt string `json:"tunnel_reported_at,omitempty"`
+	tunnelReported   *bool
 	// ★ THE FACTS, NOT THE SENTENCE. The Console says what the difference MEANS, in the reader's language;
 	// composing that sentence here as well would be the same statement in two places, and the two would drift.
 }
@@ -135,6 +140,12 @@ func applyConnectorTunnelStatus(dto *adminConnector, tunnelStatus connectorTunne
 	if tunnelStatus != nil {
 		dto.TunnelConnected = tunnelStatus(dto.ID)
 	}
+	// A node with no tunnels of its own (the control plane) answers from the last report of the node that has
+	// one. A node that HAS a tunnel manager and does not hold this one says so itself; the report of another
+	// node does not overrule it.
+	if dto.TunnelConnected == nil && dto.tunnelReported != nil {
+		dto.TunnelConnected = dto.tunnelReported
+	}
 	// Decided here so every reader gets the same answer — see the note on adminConnector.Online.
 	dto.Online = adminConnectorOnline(*dto, time.Now().UTC())
 }
@@ -201,8 +212,16 @@ func adminConnectorFromModel(conn model.ConnectorRegistration) adminConnector {
 		MetadataKeyCount:         adminConnectorMetadataKeyCount(conn.Metadata),
 		Version:                  adminConnectorVersion(conn.Metadata),
 		UptimeSeconds:            adminConnectorUptimeSeconds(conn.Metadata),
+		TunnelRegion:             adminConnectorMetadataString(conn.Metadata, "tunnel_region"),
+		TunnelReportedAt:         adminConnectorMetadataString(conn.Metadata, "tunnel_reported_at"),
+		tunnelReported:           connectorTunnelReported(conn.Metadata, time.Now()),
 		ReachableRoutes:          adminConnectorReachableRoutesFromModel(conn.ReachableRoutes),
 	}
+}
+
+func adminConnectorMetadataString(metadata map[string]any, key string) string {
+	raw, _ := metadata[key].(string)
+	return strings.TrimSpace(raw)
 }
 
 // adminConnectorVersion reads the connector-reported runtime version from metadata (non-secret). Empty when
@@ -285,7 +304,7 @@ func adminConnectorMetadataKeyCount(metadata map[string]any) int {
 	for key := range metadata {
 		switch key {
 		case "runtime_secret_hash", "runtime_secret_rotated_at", "runtime_secret_rotated_by",
-			"version", "uptime_seconds":
+			"version", "uptime_seconds", "tunnel_reported_at", "tunnel_region", connector.RuntimeObservedAtKey:
 			// runtime-secret keys are server-managed; version/uptime_seconds are surfaced as dedicated
 			// DTO fields, so neither is counted as custom metadata.
 			continue

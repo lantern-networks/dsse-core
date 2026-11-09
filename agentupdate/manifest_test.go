@@ -398,7 +398,7 @@ func TestPreservedStateIsNotEmpty(t *testing.T) {
 // reads as evidence.
 func TestTheSignedManifestNamesTheUpdateKeyNotThePolicyKey(t *testing.T) {
 	signer, pub := newTestSigner(t)
-	env, err := Sign(signer, goodManifest(), time.Now())
+	env, err := Sign(signer, goodManifest(), testNow)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
@@ -410,7 +410,7 @@ func TestTheSignedManifestNamesTheUpdateKeyNotThePolicyKey(t *testing.T) {
 		t.Fatalf("signing_key_id = %q, want an agent-update- prefix", env.SigningKeyID)
 	}
 	// And re-labelling must not have disturbed what actually carries trust.
-	if _, verr := Open(env, []string{pub}, time.Now()); verr != nil {
+	if _, verr := Open(env, []string{pub}, testNow); verr != nil {
 		t.Fatalf("the re-labelled envelope no longer verifies: %v", verr)
 	}
 }

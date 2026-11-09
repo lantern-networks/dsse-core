@@ -94,23 +94,21 @@ func TestConnectorRuntimeRoutesUseCertificateTenantAcrossFleet(t *testing.T) {
 		t.Fatal("runtime decision disclosed another tenant's session identity")
 	}
 	// A connector certificate for another tenant must not claim the seed tenant
-	// in an authentication event. A valid event for its own tenant must work on
-	// this Edge, but it must not replace a browser session from the seed tenant
-	// by reusing its session ID.
-	if w := request(other, http.MethodPost, "/auth/events", `{"id":"auth-forged-seed","session_id":"forged-seed","tenant_id":"tenant_lab_001","user_id":"forged-user","result":"success"}`); w.Code < 400 {
-		t.Fatalf("other tenant forged seed authentication event: %d", w.Code)
+	// Security review S1 (2026-11-07): outside lab mode there is no POST /auth/events at all, so a connector of
+	// another tenant cannot seed, replace or collide with any session by any means. The lab-only seeding and
+	// the production 404 are pinned in a_session_is_minted_only_by_the_identity_provider_test.go.
+	for _, body := range []string{
+		`{"id":"auth-forged-seed","session_id":"forged-seed","tenant_id":"tenant_lab_001","user_id":"forged-user","result":"success"}`,
+		`{"id":"auth-other-valid","session_id":"other-valid","tenant_id":"tenant_other","user_id":"other-user","result":"success"}`,
+	} {
+		if w := request(other, http.MethodPost, "/auth/events", body); w.Code != http.StatusNotFound {
+			t.Fatalf("POST /auth/events on a production node answered %d, want 404: %s", w.Code, w.Body.String())
+		}
 	}
-	if _, ok := sessions.Get("forged-seed"); ok {
-		t.Fatal("forged seed authentication event created a session")
-	}
-	if w := request(other, http.MethodPost, "/auth/events", `{"id":"auth-forged-existing","session_id":"sess-tenant_lab_001","tenant_id":"tenant_lab_001","user_id":"forged-user","result":"success"}`); w.Code < 400 {
-		t.Fatalf("other tenant replaced seed browser session: %d", w.Code)
-	}
-	if w := request(other, http.MethodPost, "/auth/events", `{"id":"auth-other-valid","session_id":"other-valid","tenant_id":"tenant_other","user_id":"other-user","result":"success"}`); w.Code != http.StatusCreated {
-		t.Fatalf("own-tenant authentication event: %d %s", w.Code, w.Body.String())
-	}
-	if w := request(other, http.MethodPost, "/auth/events", `{"id":"auth-other-collision","session_id":"sess-tenant_lab_001","tenant_id":"tenant_other","user_id":"other-user","result":"success"}`); w.Code < 400 {
-		t.Fatalf("other tenant replaced seed session by ID: %d", w.Code)
+	for _, id := range []string{"forged-seed", "other-valid"} {
+		if _, ok := sessions.Get(id); ok {
+			t.Fatalf("session %q was minted from an authentication event on a production node", id)
+		}
 	}
 	seedCookieRequest := httptest.NewRequest(http.MethodGet, "/clientless/apps/sample", nil)
 	seedCookieRequest.AddCookie(&http.Cookie{Name: "session_id", Value: "sess-" + seed})

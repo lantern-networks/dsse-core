@@ -112,7 +112,7 @@ func newTenantTransportMaterialFetcher(endpoint, token string, tlsConfig *tls.Co
 	if endpoint == "" || strings.TrimSpace(token) == "" {
 		return nil
 	}
-	transport := &http.Transport{TLSClientConfig: tlsConfig}
+	transport := edgeTransport(tlsConfig)
 	// ★ THE FLAG IT RIDES ON IS A FULL URL, NOT A BASE. -audit-ingest-url names the audit endpoint itself, so
 	// appending here produced …/audit-ingest/tenant-transport-material and a 404 that read like a missing
 	// route rather than a mis-built URL. Take the base back off it.

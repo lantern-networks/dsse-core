@@ -52,6 +52,9 @@ type adminSite struct {
 	RoutingNamespace       string `json:"routing_namespace,omitempty"`
 	DeploymentType         string `json:"deployment_type,omitempty"`
 	HAPolicy               string `json:"ha_policy,omitempty"`
+	// DoorOrder is the order this site's connectors use the entrances in (region IDs). Empty: the site's
+	// region first, then the deployment's order.
+	DoorOrder []string `json:"door_order,omitempty"`
 }
 
 // adminSiteRouteSummary aggregates the route layer across every connector in a Site. Counts (not the raw
@@ -287,6 +290,7 @@ func adminSiteApplyMeta(site adminSite, meta adminSiteModel) adminSite {
 	site.RoutingNamespace = strings.TrimSpace(meta.RoutingNamespace)
 	site.DeploymentType = strings.TrimSpace(meta.DeploymentType)
 	site.HAPolicy = strings.TrimSpace(meta.HAPolicy)
+	site.DoorOrder = append([]string(nil), meta.DoorOrder...)
 	site.Health = adminSiteHealthWithExpected(site.ConnectorCount, site.OnlineCount, meta.ExpectedConnectorCount)
 	return site
 }

@@ -80,7 +80,10 @@ func singleCPMultiEdgeBackends(env map[string]string, adminName, consoleName str
 	check := "check check-ssl check-sni " + adminName + " verify required ca-file /deployment/deployment-anchor.pem verifyhost " + adminName
 	admin := fmt.Sprintf("    server cp-a %s:%d %s\n", host, planCPAdminPortA, check)
 	data := fmt.Sprintf("    server cp-a %s:%d %s\n", host, planCPDataPortA, check)
-	console := "    option httpchk GET /ready\n    http-check expect status 200\n" + oneRegionThreeNodesManagementServerDefaults + fmt.Sprintf("    server console %s:%d check check-ssl check-sni %s verify none\n", host, planConsolePortA, consoleName)
+	// The Console runs beside this door, so the door reaches it over the container network: through the
+	// published address the runtime's port proxy relays the connection from the network gateway, and the
+	// Console refuses a PROXY header from an address it does not trust.
+	console := "    option httpchk GET /ready\n    http-check expect status 200\n" + oneRegionThreeNodesManagementServerDefaults + fmt.Sprintf("    server console dsse-console:8443 check check-ssl check-sni %s verify none send-proxy resolvers containers init-addr last,libc,none resolve-prefer ipv4\n", consoleName)
 	return admin, data, console, nil
 }
 

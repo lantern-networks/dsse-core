@@ -452,6 +452,8 @@ func (u *updater) pass(now time.Time) result {
 				u.reportRefusalOf(j, updateplatform.RejectedDigest(merr), running,
 					"the update manifest could not be used: "+merr.Error(), now)
 			}
+		} else if isNoManifest(merr) {
+			u.clearStandingRefusal(j, running, "no manifest published for this device", now)
 		}
 		return outcome
 	}
@@ -511,8 +513,9 @@ func (u *updater) pass(now time.Time) result {
 	// through Run, where an operator can see it.
 	if aerr := m.Applicable(running, agentupdate.PlatformDarwin, updateplatform.CurrentArch()); errors.Is(aerr,
 		agentupdate.ErrNotAnUpgrade) {
-		return result{action: "idle", notes: notes,
-			reason: fmt.Sprintf("this device is running %s and %s is not newer: nothing to do", running, m.Version)}
+		why := fmt.Sprintf("this device is running %s and %s is not newer: nothing to do", running, m.Version)
+		u.clearStandingRefusal(j, running, why, now)
+		return result{action: "idle", notes: notes, reason: why}
 	}
 
 	// 4. Bytes on disk, before the window opens. Skipped for MDM delivery, where the management system holds
@@ -627,6 +630,22 @@ func (u *updater) refusal(j *agentupdate.Journal, version, digest, running, reas
 	// device permanently silent about a refusal it never managed to record.
 	if _, err := agentupdate.AppendRefusal(dir, r, agentupdate.RefusalFingerprint(version+digest, reason)); err != nil {
 		fmt.Fprintf(os.Stderr, "dsse-updater: this refusal could NOT be queued for the fleet view: %v\n", err)
+	}
+}
+
+// clearStandingRefusal tells the fleet, once, that a refusal it was sent no longer applies. Called only where a
+// pass got past every reason to refuse. See agentupdate.AppendRefusalCleared.
+func (u *updater) clearStandingRefusal(j *agentupdate.Journal, running, why string, now time.Time) {
+	if u.dryRun || strings.TrimSpace(running) == "" {
+		return
+	}
+	r := agentupdate.ReportOutcome(j, agentupdate.ReportInstalled, running,
+		"the update refusal reported earlier no longer applies: "+why, now)
+	r.TargetVersion, r.FromVersion = "", ""
+	device, tenant := u.addressing()
+	r.DeviceID, r.TenantID = device, tenant
+	if _, _, err := agentupdate.AppendRefusalCleared(agentupdate.ReportsDir(u.journalPath), r); err != nil {
+		fmt.Fprintf(os.Stderr, "dsse-updater: that the earlier refusal no longer applies could NOT be queued: %v\n", err)
 	}
 }
 

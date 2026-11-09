@@ -75,33 +75,47 @@ type GrantIssueRequest struct {
 }
 
 type grantResponse struct {
-	SchemaVersion       string `json:"schema_version"`
-	TenantID            string `json:"tenant_id"`
-	SubjectUserID       string `json:"subject_user_id"`
-	DeviceID            string `json:"device_id"`
-	Destination         string `json:"destination"`
-	Protocol            string `json:"protocol"`
-	ExpiresAt           string `json:"expires_at"`
-	NoSecretAttestation bool   `json:"no_secret_attestation"`
+	SchemaVersion string `json:"schema_version"`
+	TenantID      string `json:"tenant_id"`
+	SubjectUserID string `json:"subject_user_id"`
+	DeviceID      string `json:"device_id"`
+	Destination   string `json:"destination"`
+	Protocol      string `json:"protocol"`
+	ExpiresAt     string `json:"expires_at"`
+	// AuthenticatedBy names the person whose browser ceremony issued this grant; empty for a grant an
+	// administrator issued directly.
+	AuthenticatedBy        string `json:"authenticated_by,omitempty"`
+	CeremonyDeviceVerified bool   `json:"ceremony_device_verified"`
+	NoSecretAttestation    bool   `json:"no_secret_attestation"`
 }
 
 func grantResponseFrom(tenantID string, g decision.EastWestGrant) grantResponse {
 	return grantResponse{
-		SchemaVersion:       "east_west_grant.v1",
-		TenantID:            tenantID,
-		SubjectUserID:       g.SubjectUserID,
-		DeviceID:            g.DeviceID,
-		Destination:         g.Destination,
-		Protocol:            g.Protocol,
-		ExpiresAt:           g.ExpiresAt.UTC().Format(time.RFC3339),
-		NoSecretAttestation: true,
+		SchemaVersion:          "east_west_grant.v1",
+		TenantID:               tenantID,
+		SubjectUserID:          g.SubjectUserID,
+		DeviceID:               g.DeviceID,
+		Destination:            g.Destination,
+		Protocol:               g.Protocol,
+		ExpiresAt:              g.ExpiresAt.UTC().Format(time.RFC3339),
+		AuthenticatedBy:        g.AuthenticatedBy,
+		CeremonyDeviceVerified: g.CeremonyDeviceVerified,
+		NoSecretAttestation:    true,
 	}
+}
+
+// CeremonyProof is what the identity provider's callback actually established: the organization, the subject,
+// and — when the browser came in over the device transport — the device it ran on.
+type CeremonyProof struct {
+	TenantID      string
+	SubjectUserID string
+	DeviceID      string
 }
 
 // issueGrantFromChallenge is private to the authenticated ceremony. Possession
 // of a challenge ID is not authentication: the ID appears in the held flow's
 // response, so callers must first prove and bind the user in CompleteCeremony.
-func issueGrantFromChallenge(policyStore policy.RuntimeStore, challenges *AuthChallengeStore, challengeID string, now time.Time) (grantResponse, error) {
+func issueGrantFromChallenge(policyStore policy.RuntimeStore, challenges *AuthChallengeStore, challengeID string, proof CeremonyProof, deviceVerified bool, now time.Time) (grantResponse, error) {
 	grantStore, ok := policyStore.(grantStore)
 	if !ok {
 		return grantResponse{}, fmt.Errorf("policy store does not support east-west grants")
@@ -111,11 +125,13 @@ func issueGrantFromChallenge(policyStore policy.RuntimeStore, challenges *AuthCh
 		return grantResponse{}, fmt.Errorf("challenge is not a pending, unexpired challenge")
 	}
 	grant := decision.EastWestGrant{
-		SubjectUserID: challenge.SubjectUserID,
-		DeviceID:      challenge.DeviceID,
-		Destination:   challenge.Destination,
-		Protocol:      challenge.Protocol,
-		LastUsedAt:    now,
+		SubjectUserID:          challenge.SubjectUserID,
+		DeviceID:               challenge.DeviceID,
+		Destination:            challenge.Destination,
+		Protocol:               challenge.Protocol,
+		LastUsedAt:             now,
+		AuthenticatedBy:        strings.TrimSpace(proof.SubjectUserID),
+		CeremonyDeviceVerified: deviceVerified,
 	}
 	grant.ExpiresAt = now.Add(EffectiveTTL(grantStore, challenge.TenantID, grant, eastWestGrantDefaultTTL))
 	grantStore.IssueEastWestGrant(challenge.TenantID, grant)
@@ -167,23 +183,41 @@ func IssueGrantDirect(policyStore policy.RuntimeStore, tenantID string, req Admi
 // authenticated tenant and identity match the held flow (identity binding).
 // The endpoint is untrusted, so the grant is bound to who actually proved
 // themselves in the browser, not to who the held flow claimed to be.
-func CompleteCeremony(policyStore policy.RuntimeStore, challenges *AuthChallengeStore, challengeID, authenticatedTenantID, authenticatedUserID string, now time.Time) (grantResponse, error) {
+func CompleteCeremony(policyStore policy.RuntimeStore, challenges *AuthChallengeStore, challengeID string, proof CeremonyProof, now time.Time) (grantResponse, error) {
 	challenge, ok := challenges.Get(challengeID)
 	if !ok || challenge.Status != "pending" {
 		return grantResponse{}, fmt.Errorf("challenge is not a pending challenge")
 	}
-	if strings.TrimSpace(authenticatedTenantID) == "" || challenge.TenantID != authenticatedTenantID {
+	authenticatedTenantID := strings.TrimSpace(proof.TenantID)
+	authenticatedUserID := strings.TrimSpace(proof.SubjectUserID)
+	if authenticatedTenantID == "" || challenge.TenantID != authenticatedTenantID {
 		return grantResponse{}, fmt.Errorf("authenticated tenant does not match the held flow")
 	}
+	// ★★★ A CEREMONY THAT PROVED NOBODY ISSUES NOTHING (2026-11-07, security review S3). The previous rule let an
+	// empty proven identity through when the held flow claimed no subject, on the grounds of a device-attested
+	// flow; device attestation has its own path (DeviceAttestedAuto) and never comes through here. Every
+	// caller of this function has a session, and a session has a subject.
+	if authenticatedUserID == "" {
+		return grantResponse{}, fmt.Errorf("the ceremony proved no identity")
+	}
 	// Identity binding (fail-open review #16): when the held flow CLAIMS a subject, the browser ceremony must have
-	// PROVEN that same subject. The previous `authenticatedUserID != ""` clause let an EMPTY authenticated identity
-	// (the ceremony proved no one) skip the check and issue the grant to the merely-claimed subject. Require the
-	// proven identity to non-emptily equal the claim. A userless (empty-subject) challenge still allows an empty
-	// authenticated id (device-attested flow).
+	// PROVEN that same subject.
 	if challenge.SubjectUserID != "" && challenge.SubjectUserID != authenticatedUserID {
 		return grantResponse{}, fmt.Errorf("authenticated identity does not match the held flow")
 	}
-	return issueGrantFromChallenge(policyStore, challenges, challengeID, now)
+	// ★★★ AND THE DEVICE, WHEN BOTH SIDES NAME ONE (security review S3). The challenge id travels in a URL that
+	// anybody can forward, so "somebody in this organization logged in" is all the subject check proves for a
+	// flow that had no subject. When the ceremony's browser arrived over the device transport, the callback
+	// knows which device ran it; a ceremony run on a different device than the one holding the flow is a
+	// forwarded link, and it releases nothing. When the device cannot be known the grant says so.
+	deviceVerified := false
+	if held, ran := strings.TrimSpace(challenge.DeviceID), strings.TrimSpace(proof.DeviceID); held != "" && ran != "" {
+		if !strings.EqualFold(held, ran) {
+			return grantResponse{}, fmt.Errorf("the ceremony ran on device %q while the held flow is on %q", ran, held)
+		}
+		deviceVerified = true
+	}
+	return issueGrantFromChallenge(policyStore, challenges, challengeID, proof, deviceVerified, now)
 }
 
 type grantToucher interface {

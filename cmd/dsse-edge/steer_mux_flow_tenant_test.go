@@ -5,7 +5,10 @@ import (
 	"crypto/x509"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
+	"time"
 )
 
 // ★★★ A STEERED FLOW BELONGS TO THE ORGANIZATION ITS DEVICE'S CERTIFICATE PROVES (2026-08-28, measured by
@@ -49,5 +52,52 @@ func TestASteeredFlowIsKeyedToTheOrganizationTheCertificateProves(t *testing.T) 
 	plain := httptest.NewRequest(http.MethodGet, "/", nil)
 	if got := steerMuxFlowTenant(plain, nil, "tenant_operator", "no-tls"); got != "tenant_operator" {
 		t.Fatalf("a single-tenant Edge changed behaviour: %q", got)
+	}
+}
+
+// The OS and posture a device reports on its steer-mux CONNECT are kept under the organization its
+// certificate proves, beside what its periodic report says (2026-11-06: an unknown OS on a customer's Devices
+// screen, because the CONNECT wrote under this node's organization and the two writers replaced each other).
+func TestAConnectRecordsTheDevicesOSUnderItsOwnOrganization(t *testing.T) {
+	_, registry, _, _ := tenantCARoutesForTest(t)
+	caCert, caPEM := tenantCATestCA(t, "Acceptance B Device CA")
+	if _, err := registry.Register("tenant_customer", caPEM); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	store := newEndpointRuntimeStore()
+	now := time.Now()
+	yes := true
+	store.ingestFromReport("win-1", "tenant_customer", "", &yes, &yes, "windows_collector", "198.51.100.7", now)
+
+	r := httptest.NewRequest(http.MethodConnect, "/steer-mux", nil)
+	r.TLS = &tls.ConnectionState{VerifiedChains: [][]*x509.Certificate{{caCert}}}
+	r.Header.Set(deviceHeaderOS, "Windows 10 Pro 22H2")
+	ingestSteerMuxConnect(store, r, registry, "tenant_operator", "win-1", now.Add(time.Second))
+
+	store.mu.RLock()
+	e := store.m["win-1"]
+	store.mu.RUnlock()
+	if e == nil || e.tenant != "tenant_customer" {
+		t.Fatalf("the CONNECT moved the device's runtime entry to another organization: %+v", e)
+	}
+	view := e.runtimeView(now.Add(2 * time.Second))
+	if view.OS != "Windows 10 Pro 22H2" {
+		t.Errorf("the OS from the CONNECT is not on the device's own entry: %q", view.OS)
+	}
+	if view.Posture.DiskEncryptionEnabled == nil {
+		t.Error("the CONNECT erased the posture the periodic report had recorded")
+	}
+}
+
+func TestTheSteerMuxHandlerRecordsTheConnectThroughTheOrganizationHelper(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "ingestSteerMuxConnect(deviceRuntime, r, tcaReg, runtimeEvaluator.PolicyBundle.TenantID, transportDeviceID, time.Now())") {
+		t.Fatal("the steer-mux CONNECT no longer records through ingestSteerMuxConnect")
+	}
+	if strings.Contains(string(src), "deviceRuntime.ingestFromConnect(transportDeviceID, runtimeEvaluator.PolicyBundle.TenantID") {
+		t.Fatal("the CONNECT is recorded under this node's organization again")
 	}
 }

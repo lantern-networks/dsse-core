@@ -40,7 +40,7 @@ type regionShape struct {
 // nodeRegions asks one node which region it is in and which regions it knows about.
 func nodeRegions(client *http.Client, adminURL string) regionShape {
 	shape := regionShape{URL: strings.TrimRight(adminURL, "/")}
-	code, body, err := get(client, shape.URL+"/healthz", "")
+	code, body, err := getNodeHealth(client, shape.URL+"/healthz")
 	if err != nil || code != 200 {
 		return shape
 	}

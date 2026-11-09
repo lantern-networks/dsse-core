@@ -9,6 +9,7 @@ import (
 
 func TestStrictSyncVerificationReadsLivePatroniConfig(t *testing.T) {
 	config := `{"synchronous_mode":true,"synchronous_mode_strict":true,"synchronous_node_count":1}`
+	// Patroni's REST API is plain HTTP on the member's address; this is not a /healthz read.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(config))
 	}))
@@ -24,7 +25,7 @@ func TestStrictSyncVerificationReadsLivePatroniConfig(t *testing.T) {
 }
 
 func TestOneRegionThreeNodesVerifiesTwoReplicasWithoutInventingASecondRegion(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"database":{"replicas_streaming":2,"replica_members":["dsse-pg-node-b","dsse-pg-node-c"]}}`))
 	}))
 	defer server.Close()

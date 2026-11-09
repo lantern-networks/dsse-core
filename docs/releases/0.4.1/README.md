@@ -22,7 +22,9 @@ installations.
 The five server images, the MSI and the PKG were all built from one source tree: the
 public commit `1fbcb678e6fee66ffec043bb7ee1325af550fec4`, whose content identity is
 `source-bfafcfd026d5bfe34a226d93d55347a2dd201cd5fde2b5f2b6b861bf8e3f2889`. The release
-tag adds documentation only. Checksums alone do not establish authenticity; verify the
+tag adds documentation and one test change: two `edgeplane` tests now set the Edge's IPv6
+egress themselves instead of depending on the machine that runs them. No product code
+differs. Checksums alone do not establish authenticity; verify the
 signed packages and obtain checksums through a trusted channel. The source SBOM does not
 inventory every native dependency, kernel driver or container base image.
 
@@ -100,7 +102,7 @@ You can check the images with this repository and the registry alone:
   ```
 
   `git diff 1fbcb678e6fee66ffec043bb7ee1325af550fec4 v0.4.1-experimental` shows that the
-  release tag adds documentation only.
+  release tag adds only documentation and that test change.
 - **Vulnerabilities.** Scan the same digests with your own scanner, for example
   `trivy image --platform linux/amd64 <image>@sha256:<digest>`. The release gate found no
   blocking high or critical finding; the one version-mapping exception is described in

@@ -16,6 +16,7 @@ import (
 // whole of its timeout. The attempts now overlap, 300 ms apart, and the first to connect wins.
 func TestADeadRouteInOneFamilyDoesNotHoldTheOtherBack(t *testing.T) {
 	withGuard(t, false)
+	withIPv6Egress(t, true)
 	ln, _ := listenerThatCountsAccepts(t)
 	port := ln.Addr().(*net.TCPAddr).Port
 	resolver := &answeringResolver{answers: [][]net.IPAddr{{
@@ -96,6 +97,7 @@ func (c *closeCountingConn) Close() error { c.closed.Add(1); return c.Conn.Close
 // answered gets neither, and both are closed.
 func TestAConnectionTheRaceDidNotAdoptIsClosed(t *testing.T) {
 	withGuard(t, false)
+	withIPv6Egress(t, true)
 	resolver := &answeringResolver{answers: [][]net.IPAddr{{{IP: net.ParseIP("2001:db8::1")}, {IP: net.IPv4(127, 0, 0, 1)}}}}
 	withResolver(t, resolver)
 	previous := vettedDial
@@ -122,7 +124,7 @@ func TestAConnectionTheRaceDidNotAdoptIsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	close(release) // the IPv6 attempt now connects, after the decision
-	first, second := <-conns, <-conns
+	first, second := receiveConn(t, conns, "first"), receiveConn(t, conns, "second")
 	loser := first
 	if winner == net.Conn(first) || (winner != nil && winnerIs(winner, first)) {
 		loser = second
@@ -168,6 +170,28 @@ func TestAConnectionTheRaceDidNotAdoptIsClosed(t *testing.T) {
 		if c.closed.Load() == 0 {
 			t.Fatalf("late answer %d after the caller gave up was never closed", i+1)
 		}
+	}
+}
+
+// withIPv6Egress fixes, for one test, whether this Edge believes it can egress IPv6. The dialler skips IPv6
+// answers on a node without IPv6 egress, so a test about the IPv6 answer must not depend on whether the machine
+// running it reaches the internet over IPv6 (a hosted CI runner does not).
+func withIPv6Egress(t *testing.T, can bool) {
+	t.Helper()
+	before := edgeIPv6EgressMeasured.Load()
+	SetMeasuredIPv6Egress(can)
+	t.Cleanup(func() { edgeIPv6EgressMeasured.Store(before) })
+}
+
+// receiveConn waits a bounded time for a dial attempt, so a missing attempt fails the test instead of hanging it.
+func receiveConn(t *testing.T, conns <-chan *closeCountingConn, which string) *closeCountingConn {
+	t.Helper()
+	select {
+	case c := <-conns:
+		return c
+	case <-time.After(3 * time.Second):
+		t.Fatalf("the %s dial attempt never happened", which)
+		return nil
 	}
 }
 

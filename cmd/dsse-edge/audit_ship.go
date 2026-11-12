@@ -304,7 +304,14 @@ func (s *remoteAuditShipper) run() {
 			q = append([]auditShipItem(nil), q[over:]...) // drop the oldest un-shipped
 			s.dropped.Add(int64(over))
 			log.Printf("audit ship: pending spool full (max %d) — dropped %d oldest un-shipped record(s); the local jsonl still holds them", s.maxPending, over)
-			s.spool.compact(q) // drop them from disk too, keeping the spool == the queue
+			// ★ NOT A REWRITE PER RECORD (measured with 10,006 devices, 2026-11-11). This compacted here, on
+			// every record that arrived while the queue was full — and a queue is full exactly when records
+			// arrive faster than they ship, so the whole spool (about 3 MB) was rewritten some forty times a
+			// second: 130 MB/s of disk writes from the Edge, for as long as shipping stayed behind. The dropped
+			// records leave the disk at the next ordinary compaction instead, which bounds the file to about
+			// twice the queue; and a restart that finds more than the queue holds already keeps only the
+			// newest (see run), so what is replayed is the same either way.
+			s.spool.maybeCompact(q)
 		} else {
 			s.spool.maybeCompact(q)
 		}

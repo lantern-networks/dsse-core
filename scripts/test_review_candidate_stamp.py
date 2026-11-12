@@ -47,7 +47,7 @@ class ReviewCandidateStampTests(unittest.TestCase):
 
     def verify(self, source, content_id):
         env = os.environ.copy()
-        env["GOTOOLCHAIN"] = "go1.27.3"
+        env["GOTOOLCHAIN"] = "go1.27.4"
         return subprocess.run(["go", "run", "-buildvcs=false", str(VERIFIER),
                                "-root", str(source), "-expected", content_id],
                               cwd=OSS, env=env, text=True, capture_output=True, check=False)
@@ -67,7 +67,7 @@ class ReviewCandidateStampTests(unittest.TestCase):
 
     def verify_archive(self, source, content_id, archive, archive_sha256):
         env = os.environ.copy()
-        env["GOTOOLCHAIN"] = "go1.27.3"
+        env["GOTOOLCHAIN"] = "go1.27.4"
         return subprocess.run(["go", "run", "-buildvcs=false", str(VERIFIER),
                                "-root", str(source), "-expected", content_id,
                                "-archive", str(archive), "-archive-sha256", archive_sha256],

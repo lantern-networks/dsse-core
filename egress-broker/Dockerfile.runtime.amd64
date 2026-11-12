@@ -1,6 +1,6 @@
 # amd64 runtime image for the egress broker. Same shape as Dockerfile.runtime; separate because the engine
 # artifacts are per-architecture (cgo-amd64/ + cli-amd64/, fetched by the README's amd64 build steps).
-FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 RUN apk add --no-cache ca-certificates bash
 COPY egress-broker-amd64 /usr/local/bin/egress-broker
 COPY cgo-amd64/libcurl-impersonate.so* /usr/local/lib/

@@ -37,15 +37,15 @@ mkdir -p "$output_dir"
 output_dir=$(CDPATH= cd -- "$output_dir" && pwd)
 (
     cd "$source_dir"
-    GOTOOLCHAIN=go1.27.3 GOEXPERIMENT=jsonv2 GOOS=linux GOARCH="$architecture" CGO_ENABLED=0 \
+    GOTOOLCHAIN=go1.27.4 GOEXPERIMENT=jsonv2 GOOS=linux GOARCH="$architecture" CGO_ENABLED=0 \
       go build -mod=readonly -trimpath \
       -ldflags "-s -w -X github.com/wal-g/wal-g/cmd/pg.walgVersion=v3.0.9-dsse -X github.com/wal-g/wal-g/cmd/pg.gitRevision=$expected_commit" \
       -o "$output_dir/wal-g" ./main/pg
 )
 chmod 0755 "$output_dir/wal-g"
 
-build_info=$(GOTOOLCHAIN=go1.27.3 go version -m "$output_dir/wal-g")
-grep -Fq 'go1.27.3' <<< "$build_info"
+build_info=$(GOTOOLCHAIN=go1.27.4 go version -m "$output_dir/wal-g")
+grep -Fq 'go1.27.4' <<< "$build_info"
 grep -Eq 'golang.org/x/net[[:space:]]+v0\.62\.0' <<< "$build_info"
 grep -Eq 'google.golang.org/grpc[[:space:]]+v1\.85\.0' <<< "$build_info"
 grep -Eq 'go.opentelemetry.io/otel/sdk[[:space:]]+v1\.47\.0' <<< "$build_info"
@@ -53,4 +53,4 @@ grep -Eq 'go.yaml.in/yaml/v3[[:space:]]+v3\.0\.6' <<< "$build_info"
 grep -Eq 'go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc[[:space:]]+v0\.72\.0' <<< "$build_info"
 # CVE-2026-116587: JWK parsing DoS fixed in go-jose v4.1.6; 0.4.1 carries the current v4.1.8.
 grep -Eq 'github.com/go-jose/go-jose/v4[[:space:]]+v4\.1\.8' <<< "$build_info"
-echo "WAL-G v3.0.9 built from pinned source with Go 1.27.3 for $platform"
+echo "WAL-G v3.0.9 built from pinned source with Go 1.27.4 for $platform"

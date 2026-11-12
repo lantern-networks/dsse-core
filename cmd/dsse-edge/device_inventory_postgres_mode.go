@@ -78,6 +78,8 @@ func setupEdgeDeviceStore(ctx context.Context, config edgeDeviceStoreConfig) (de
 			// Fail closed: a store that exists but cannot be read must not silently start as an empty inventory.
 			return nil, nil, fmt.Errorf("load device inventory from %q: %w", path, err)
 		}
-		return store, func() error { return nil }, nil
+		// A heartbeat that changes only the time is saved a few seconds later; a process that stops in an orderly
+		// way writes those out first.
+		return store, store.Flush, nil
 	}
 }

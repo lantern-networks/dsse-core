@@ -208,8 +208,8 @@ class ImageGateTests(unittest.TestCase):
         image = "registry.example/product@sha256:" + "b" * 64
         sbom = {"bomFormat": "CycloneDX", "specVersion": "1.7",
                 "metadata": {"component": {"name": image, "bom-ref": image}},
-                "components": [{"bom-ref": "pkg:golang/stdlib@v1.27.3", "name": "stdlib",
-                                "purl": "pkg:golang/stdlib@v1.27.3"}]}
+                "components": [{"bom-ref": "pkg:golang/stdlib@v1.27.4", "name": "stdlib",
+                                "purl": "pkg:golang/stdlib@v1.27.4"}]}
         self.assertIsNone(gate.validate_image_sbom(sbom, image))
         self.assertEqual(gate.validate_image_sbom({**sbom, "components": []}, image),
                          "SBOM has no components")

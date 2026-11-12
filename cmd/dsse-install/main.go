@@ -226,7 +226,30 @@ func main() {
 	adminPassword := flag.String("admin-password", "",
 		"with -bootstrap-admin: their password. Generated and printed once when omitted, which is the "+
 			"better of the two — a password on a command line is in the shell history and in every ps listing")
+	up := flag.Bool("up", false, "stand the deployment up: run the steps -order prints, in that order, waiting where a person would wait. Takes -plan, or -deployment and -address for one machine. Steps that belong to another machine are handed to you one command per machine, or done over SSH with -ssh. Run it again after a failure and it continues")
+	deploymentName := flag.String("deployment", "", "with -up and no -plan: the DNS name of a one-machine deployment, one you control (dsse.example.com)")
+	machineAddress := flag.String("address", "", "with -up and no -plan: the address this machine answers on; every name of the deployment is pointed at it")
+	releaseManifest := flag.String("release-manifest", "", "with -up: the release-manifest.json published beside this installer. It names the images of this release, so a plan need not carry them")
+	agentPublisher := flag.String("agent-publisher", "", "with -up and no -plan: who signs the agent packages this deployment will accept, when the release manifest does not say")
+	postgresMajor := flag.Int("postgres-major", 0, "with -up: the PostgreSQL major of the release's database image, when neither the plan nor the release manifest says")
+	printNames := flag.Bool("print-names", false, "with -up: print the deployment's names as hosts-file lines, and do nothing else")
+	overSSH := flag.Bool("ssh", false, "with -up: copy each other machine's package to it and start it there over SSH, as the printed order's scp and remote commands do. Without it, -up stops at each other machine and tells you the one command to run there")
+	confirmed := flag.String("confirmed", "", "with -up, where it cannot ask: comma-separated machines whose one command you have already run")
 	flag.Parse()
+	if *up {
+		timeout := *setupTimeout
+		if !flagWasSet("setup-timeout") {
+			timeout = 30 * time.Minute // the whole stand-up, image pulls included
+		}
+		os.Exit(runUp(upInput{Plan: *planFile, Deployment: *deploymentName, Address: *machineAddress, AdminEmail: *adminEmail,
+			Organization: *orgName, Dir: *dir, Manifest: *releaseManifest, AgentPublisher: *agentPublisher,
+			PostgresMajor: *postgresMajor, PrintNames: *printNames, SSH: *overSSH, Confirmed: *confirmed, Timeout: timeout},
+			os.Stdin, os.Stdout, os.Stderr))
+	}
+	if *deploymentName != "" || *machineAddress != "" || *releaseManifest != "" || *agentPublisher != "" || *postgresMajor != 0 || *printNames || *overSSH || *confirmed != "" {
+		fmt.Fprintln(os.Stderr, "-deployment, -address, -release-manifest, -agent-publisher, -postgres-major, -print-names, -ssh and -confirmed belong to -up")
+		os.Exit(1)
+	}
 	newOperations := 0
 	for _, yes := range []bool{*installPortal != "" && !*startNode, *activateAuth, *preflight, *networkPlan, *startNode} {
 		if yes {

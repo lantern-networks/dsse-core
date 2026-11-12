@@ -2,13 +2,13 @@ module github.com/lantern-networks/dsse-core/egress-broker
 
 go 1.26.9
 
-toolchain go1.27.3
+toolchain go1.27.4
 
 require golang.org/x/net v0.62.0
 
 require (
-	golang.org/x/sys v0.49.0 // indirect
-	golang.org/x/text v0.43.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
 )
 
 // The egress block list lives in dsse-core/swg — one definition for the whole product. The broker imports

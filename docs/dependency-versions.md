@@ -1,9 +1,10 @@
 # Dependency versions
 
-Updated for the 0.4.1 release (November 9, 2026). This page lists what the 0.4.1 source
-selects. The published 0.4.1 images and their digests are in the
-[0.4.1 release README](releases/0.4.1/README.md#server-container-images); the 0.4.0 versions
-and digests stay in the [0.4.0 release README](releases/0.4.0/README.md#server-container-images).
+Updated for the 0.4.2 release (November 13, 2026). This page lists what the 0.4.2 source
+selects. The published 0.4.2 images and their digests are in the
+[0.4.2 release README](releases/0.4.2/README.md#server-container-images); the versions
+and digests of earlier releases stay in their release notes
+([0.4.1](releases/0.4.1/README.md), [0.4.0](releases/0.4.0/README.md#server-container-images)).
 Scan results are recorded against the digest that was scanned.
 Release builds fix the source, Go modules, base images and native archives,
 rather than resolving them at every build. The Go module manifests and native
@@ -14,22 +15,22 @@ identify the verified images; a rebuilt image needs its own inventory and scan.
 
 | Component | Selected version | Source |
 |---|---|---|
-| Release Go toolchain | 1.27.3 | [Go downloads](https://go.dev/dl/) |
-| Product/Console runtime base | Alpine 3.24.3, `sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a` | [Alpine releases](https://alpinelinux.org/releases/) |
-| brotli (Go) | 1.2.7 | [Upstream](https://github.com/andybalholm/brotli) |
-| klauspost/compress | 1.20.3 | [Release](https://github.com/klauspost/compress/releases/tag/v1.20.3) |
+| Release Go toolchain | 1.27.4 | [Go downloads](https://go.dev/dl/) |
+| Product/Console runtime base | Alpine 3.24.4, `sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf` | [Alpine releases](https://alpinelinux.org/releases/) |
+| brotli (Go) | 1.3.0 | [Upstream](https://github.com/andybalholm/brotli) |
+| klauspost/compress | 1.20.4 | [Release](https://github.com/klauspost/compress/releases/tag/v1.20.4) |
 | lib/pq | 1.12.3 | [Releases](https://github.com/lib/pq/releases) |
 | minio-go/v7 S3-compatible client SDK (not the MinIO server) | 7.4.1 | [Releases](https://github.com/minio/minio-go/releases) |
 | golang.org/x/crypto | 0.58.1-0.20261009181718-2f1f834330b2 (pre-release revision; GO-2026-5932 is fixed there and v0.58.0 is the latest tag) | [Module](https://pkg.go.dev/golang.org/x/crypto@v0.58.1-0.20261009181718-2f1f834330b2) |
 | golang.org/x/net | 0.62.0 | [Module](https://pkg.go.dev/golang.org/x/net@v0.62.0) |
-| golang.org/x/sys | 0.49.0 | [Module](https://pkg.go.dev/golang.org/x/sys@v0.49.0) |
-| Additional Go updates | `cpuid/v2` 2.4.2, `go.yaml.in/yaml/v3` 3.0.6, `go-humanize` 1.1.0, `fwd` 1.2.1, `msgp` 1.6.5, `x/text` 0.43.0 | [go.mod](../go.mod) |
+| golang.org/x/sys | 0.50.0 | [Module](https://pkg.go.dev/golang.org/x/sys@v0.50.0) |
+| Additional Go updates | `cpuid/v2` 2.4.2, `go.yaml.in/yaml/v3` 3.0.6, `go-humanize` 1.1.0, `fwd` 1.2.1, `msgp` 1.6.5, `x/text` 0.44.0 | [go.mod](../go.mod) |
 | Console TOTP QR generator | `qr` 0.7.2, vendored source SHA256 `3e3d38c37ecc5691b1edcc5b0dd6882b78280dc7f2130168bd7df074d1b21e47` | [Vendor notice](../console/vendor/README.md) |
 | Windows MSI/Burn toolchain | WiX 7.0.1 with `wix7` OSMF EULA acceptance | [Build guide](../clients/windows-wfp/packaging/README.md) |
 | GitHub Actions | checkout 7.0.1, setup-go 7.0.0, setup-node 7.1.0, upload-artifact 7.0.2 (commit-pinned) | [Workflow](../.github/workflows/ci.yml) |
 | PostgreSQL privilege drop | Alpine `su-exec` 0.3-r0 in the derived PostgreSQL tools image; upstream `gosu` is removed | [Build recipe](../deploy/Dockerfile.postgres-tools) |
-| etcd source and compiler | v3.7.3, commit `0a173d0410a96d01091b484daae81365bbcde57e`, Go 1.27.3, `x/net` 0.62.0 | [Build recipe](../deploy/Dockerfile.etcd) |
-| Spilo source and HA dependencies | source commit `550c5d8c183340ccd98b19098f53f1261b71539a`, PostgreSQL 18.6 target, Patroni 4.1.5, WAL-G 3.0.9 from commit `3e493188db28335fb93a45bd680c6ff8fc3028c1` with Go 1.27.3 and every module linked into it at its newest release, including `x/net` 0.62.0, gRPC 1.85.0, `go-jose` 4.1.8 (CVE-2026-116587 fixed from 4.1.6), `go.yaml.in/yaml/v3` 3.0.6 and `otelgrpc` 0.72.0; `pg_view` commit `3b35609f34b25db861252e2ce9912c2dab8a7934` | [Spilo source patch](../deploy/spilo-4.1-p2.patch), [WAL-G module patch](../deploy/wal-g-v3.0.9-go.patch), [Spilo build](../scripts/build_spilo_source.sh), [WAL-G build](../scripts/build_walg_source.sh) |
+| etcd source and compiler | v3.7.3, commit `0a173d0410a96d01091b484daae81365bbcde57e`, Go 1.27.4, `x/net` 0.62.0 | [Build recipe](../deploy/Dockerfile.etcd) |
+| Spilo source and HA dependencies | source commit `550c5d8c183340ccd98b19098f53f1261b71539a`, PostgreSQL 18.6 target, Patroni 4.1.5, WAL-G 3.0.9 from commit `3e493188db28335fb93a45bd680c6ff8fc3028c1` with Go 1.27.4 and every module linked into it at its newest release, including `x/net` 0.62.0, gRPC 1.85.0, `go-jose` 4.1.8 (CVE-2026-116587 fixed from 4.1.6), `go.yaml.in/yaml/v3` 3.0.6 and `otelgrpc` 0.72.0; `pg_view` commit `3b35609f34b25db861252e2ce9912c2dab8a7934` | [Spilo source patch](../deploy/spilo-4.1-p2.patch), [WAL-G module patch](../deploy/wal-g-v3.0.9-go.patch), [Spilo build](../scripts/build_spilo_source.sh), [WAL-G build](../scripts/build_walg_source.sh) |
 
 ## Third-party image inputs
 
@@ -39,15 +40,15 @@ digests where available.
 
 | Purpose | Image reference | Status |
 |---|---|---|
-| HAProxy public and database entry | `haproxy:3.4.7-alpine3.24@sha256:2caaf8b1a1ef67f3f1ea9b721f2821675d3ba4500fb518e23884fecb93e8dbaa` | Digest fixed (upstream rebuilt 3.4.7 on Alpine 3.24.3; both child images changed). Scanned for 0.4.1 with no high or critical finding; ran in the 0.4.1 acceptance installations |
-| ClickHouse | `clickhouse/clickhouse-server:26.8.36.3-alpine@sha256:f5443f9ffa48f0154cdd50cab39fed732201762574a27f04f1f564bbba81832d` | Unchanged from 0.4.0 (newest 26.8 LTS patch). Scanned for 0.4.1 with no high or critical finding; ran in the 0.4.0 and 0.4.1 acceptance installations |
-| PostgreSQL tools base | `postgres:18.6-alpine3.24@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5` | Digest fixed (upstream rebuilt 18.6 on Alpine 3.24.3). Its bundled `gosu` binary, which the derived image removes, is expected to carry scanner findings |
-| PostgreSQL tools derived image | Builds from the pinned PostgreSQL base, removes `gosu`, uses `su-exec` | Rebuilt for 0.4.1 on the new base and published as `dsse-postgres-tools`; passed the release scan and ran in the 0.4.1 acceptance installations. No arm64 image is published |
-| etcd source-built image | Builds from the pinned v3.7.3 commit with Go 1.27.3 and patched `x/net` | Rebuilt for 0.4.1 and published as `dsse-etcd`; passed the release scan and ran in the 0.4.1 acceptance installations. No arm64 image is published |
-| Spilo/PostgreSQL runtime | Source commit `550c5d8c183340ccd98b19098f53f1261b71539a`, Patroni 4.1.5, PostgreSQL 18.6 only, source-built WAL-G 3.0.9 | Rebuilt for 0.4.1 with the updated WAL-G and published as `dsse-postgres`; passed the release scan with the WAL-G exception below and ran in the 0.4.1 acceptance installations |
+| HAProxy public and database entry | `haproxy:3.4.7-alpine3.24@sha256:b9fe316f718d5015c5cfebd8ca019591f3e44656f61d93cb8b59a1028961e530` | Digest fixed (upstream rebuilt 3.4.7; 3.4.7 is the newest 3.4 release). Scanned for 0.4.2 with no high or critical finding; ran in the 0.4.2 acceptance installations |
+| ClickHouse | `clickhouse/clickhouse-server:26.8.36.3-alpine@sha256:f5443f9ffa48f0154cdd50cab39fed732201762574a27f04f1f564bbba81832d` | Unchanged from 0.4.0 (newest 26.8 LTS patch); unchanged upstream since 0.4.1. Scanned for 0.4.2 with no high or critical finding; ran in the 0.4.2 acceptance installations |
+| PostgreSQL tools base | `postgres:18.6-alpine3.24@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395` | Digest fixed (upstream rebuilt 18.6). Its bundled `gosu` binary, which the derived image removes, is expected to carry scanner findings |
+| PostgreSQL tools derived image | Builds from the pinned PostgreSQL base, removes `gosu`, uses `su-exec` | Rebuilt for 0.4.2 on the new base and published as `dsse-postgres-tools`; passed the release scan and ran in the 0.4.2 acceptance installations. No arm64 image is published |
+| etcd source-built image | Builds from the pinned v3.7.3 commit with Go 1.27.4 and patched `x/net` | Rebuilt for 0.4.2 with Go 1.27.4 and published as `dsse-etcd`; passed the release scan and ran in the 0.4.2 acceptance installations. No arm64 image is published |
+| Spilo/PostgreSQL runtime | Source commit `550c5d8c183340ccd98b19098f53f1261b71539a`, Patroni 4.1.5, PostgreSQL 18.6 only, source-built WAL-G 3.0.9 | Rebuilt for 0.4.2 with Go 1.27.4 and published as `dsse-postgres`; passed the release scan with the WAL-G exception below and ran in the 0.4.2 acceptance installations |
 | Spilo source-build base | `ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11` | Digest fixed; updated 2026-10-29 so the build installs the current Ubuntu security updates (CVE-2026-111497 in `libbrotli1`, fixed in `1.0.9-2ubuntu0.1`); obsolete Ubuntu 18.04 locale stage removed by the source patch |
-| DSSE product and Admin Console runtime | Built from the pinned Go builder and Alpine runtime with host-platform compilation for each target architecture | Rebuilt for 0.4.1 and published as `dsse-service` and `dsse-console`; passed the release scan and ran in the 0.4.1 acceptance installations. No arm64 image is published |
-| Product/Console builder | `golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb` | Digest fixed (upstream rebuilt on Alpine 3.24.3). A build input, not distributed; the images built from it passed the 0.4.1 release scan |
+| DSSE product and Admin Console runtime | Built from the pinned Go builder and Alpine runtime with host-platform compilation for each target architecture | Rebuilt for 0.4.2 on Alpine 3.24.4 and published as `dsse-service` and `dsse-console`; passed the release scan and ran in the 0.4.2 acceptance installations. No arm64 image is published |
+| Product/Console builder | `golang:1.27.4-alpine3.24@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf` | Digest fixed. Go 1.27.4 fixes GO-2026-6859 in `net/http` |
 
 The selected Spilo source currently uses Ubuntu 22.04 as its base. Track an
 upstream base-image migration before Ubuntu 22.04 standard support ends in

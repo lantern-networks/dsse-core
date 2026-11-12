@@ -100,4 +100,4 @@ image. The embedded transport tests live in `egressbroker/transport_embedded_tes
 in the parent module. Test actual upstream requests and failures with the selected build;
 a successful compilation alone does not establish a usable deployment integration.
 
-The build uses Go 1.27.3. On an inspected build host, set `DSSE_INSPECTION_ROOT` to its CA PEM (the macOS agent path is detected automatically). This root is mounted into the Go build container for downloads; the runtime Dockerfile never copies it into the image. The build checks that the runtime image has no inspection-root certificate file. A local builder override requires its verified `DSSE_GO_BUILDER_IMAGE_ID`.
+The build uses Go 1.27.4. On an inspected build host, set `DSSE_INSPECTION_ROOT` to its CA PEM (the macOS agent path is detected automatically). This root is mounted into the Go build container for downloads; the runtime Dockerfile never copies it into the image. The build checks that the runtime image has no inspection-root certificate file. A local builder override requires its verified `DSSE_GO_BUILDER_IMAGE_ID`.

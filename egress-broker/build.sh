@@ -28,7 +28,7 @@ case "${ARCH:-$(uname -m)}" in
 esac
 IMAGE="${IMAGE:-dsse-egress-broker:$ARCH}"
 ARCH="$ARCH" ENGINE_VERSION="$ENGINE_VERSION" bash ./fetch_engine.sh
-builder="${DSSE_GO_BUILDER_IMAGE:-golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb}"
+builder="${DSSE_GO_BUILDER_IMAGE:-golang:1.27.4-alpine3.24@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf}"
 
 if [ -n "${DSSE_GO_BUILDER_IMAGE:-}" ]; then
   expected="${DSSE_GO_BUILDER_IMAGE_ID:-}"
@@ -54,7 +54,7 @@ docker run --rm --platform "linux/$ARCH" -v "$PWD/..:/oss" -w /oss/egress-broker
   -e CGO_ENABLED=1 -e GOTOOLCHAIN=local \
   -e CGO_CFLAGS="-I/oss/egress-broker/cgo-deps/include" \
   -e CGO_LDFLAGS="-L/oss/egress-broker/$LIBDIR -lcurl-impersonate" \
-  "$builder" sh -ec 'apk add --no-cache gcc musl-dev >/dev/null; update-ca-certificates >/dev/null; [ "$(go env GOVERSION)" = go1.27.3 ]; go build -trimpath -o "$1" .' sh "$BIN"
+  "$builder" sh -ec 'apk add --no-cache gcc musl-dev >/dev/null; update-ca-certificates >/dev/null; [ "$(go env GOVERSION)" = go1.27.4 ]; go build -trimpath -o "$1" .' sh "$BIN"
 [ -s "$BIN" ] || { echo "build.sh: $BIN missing or empty after a build that reported success" >&2; exit 1; }
 
 # --- 5. the runtime image ---------------------------------------------------------------------------------

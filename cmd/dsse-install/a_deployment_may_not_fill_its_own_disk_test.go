@@ -15,7 +15,7 @@ func TestEveryServiceInTheGeneratedComposeHasABoundedLog(t *testing.T) {
 
 services:
   postgres:
-    image: haproxy:3.4.7-alpine3.24@sha256:2caaf8b1a1ef67f3f1ea9b721f2821675d3ba4500fb518e23884fecb93e8dbaa
+    image: haproxy:3.4.7-alpine3.24@sha256:b9fe316f718d5015c5cfebd8ca019591f3e44656f61d93cb8b59a1028961e530
     ports: ["5432:5432"]
   dsse-postgres-a:
     image: spilo

@@ -5,12 +5,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/lantern-networks/dsse-core/durablefile"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/lantern-networks/dsse-core/durablefile"
+	"sync/atomic"
 )
 
 // shipSpool is the audit shipper's durable, bounded, restart-surviving buffer of un-acked records — the design's
@@ -35,6 +35,8 @@ type shipSpool struct {
 	f         *os.File
 	appends   int // appends since the last compaction; bounds the on-disk file to ~2x the queue cap
 	compactAt int // compact once this many records have been appended since the last compaction
+	// compactions counts whole-file rewrites, so a test can see how often they happen.
+	compactions atomic.Int64
 }
 
 // spoolRecord is the on-disk encoding of one queued record. R is []byte so json base64-encodes the arbitrary
@@ -251,6 +253,7 @@ func (s *shipSpool) compact(queue []auditShipItem) {
 	}
 	s.reopen()
 	s.appends = 0
+	s.compactions.Add(1)
 }
 
 // closeHandle drops the append handle, leaving nil rather than a closed *os.File so append cannot write into

@@ -1,6 +1,7 @@
 package device
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,10 +23,31 @@ type Store struct {
 	// every registered device: risk markings, posture verdicts and the device catalog itself vanished and only
 	// came back if each endpoint re-registered. Nil = in-memory only.
 	persister blobstore.Persister
+	// ★★★ ONE SAVE CARRIES EVERY CHANGE THAT IS WAITING FOR ONE (2026-11-11). A save is the whole catalog, so its
+	// cost grows with the fleet; paying it once per change, under the store lock, is what capped an Edge at about
+	// 79 heartbeats a second with 1,000 devices. changes counts what has been applied in memory (guarded by mu);
+	// savedThrough is the last change a confirmed save carried (guarded by saveMu). A caller that must not answer
+	// before its change is on disk waits in saveThrough — and finds, more often than not, that the save somebody
+	// else just finished already carried it. Lock order: saveMu, then mu. Never the reverse.
+	changes      uint64
+	saveMu       sync.Mutex
+	savedThrough uint64
+	// A heartbeat that says nothing new except "I am still here" does not wait for a save at all: one deferred
+	// save, at most livenessFlushAfter later, carries every such heartbeat at once. See Heartbeat.
+	livenessTimer      *time.Timer
+	livenessFlushAfter time.Duration
 }
 
+// DefaultLivenessFlushAfter is how far the saved inventory may trail the served one in WHEN a device was last
+// seen (last_seen_at and the posture reading's collected_at) — and in nothing else. It is shorter than the
+// agents' heartbeat period, so a snapshot read after a crash is at most one heartbeat old per device, and every
+// running device corrects it with its first heartbeat after the restart.
+//
+// It is not a throughput limit: no heartbeat is refused, delayed or dropped because of it.
+const DefaultLivenessFlushAfter = 5 * time.Second
+
 func NewStore() *Store {
-	return &Store{devices: map[string]model.Device{}, posturePolicy: DefaultPosturePolicy()}
+	return &Store{devices: map[string]model.Device{}, posturePolicy: DefaultPosturePolicy(), livenessFlushAfter: DefaultLivenessFlushAfter}
 }
 
 // devicePersistSnapshot is the on-disk shape: the full device catalog plus the Edge-side posture ruleset, which
@@ -51,13 +73,19 @@ func reportPersistError(err error) {
 }
 
 // SetPersister enables durable persistence so the device inventory survives an Edge restart. It loads any prior
-// snapshot immediately, then every mutation re-saves the full set. Nil disables persistence.
+// snapshot immediately, then every mutation re-saves the full set — except a heartbeat that changes nothing but
+// the time it was seen, which is saved within livenessFlushAfter (see Heartbeat). Nil disables persistence.
 //
 // FAIL-CLOSED: if a prior snapshot exists but cannot be read or decoded, this returns the error rather than
 // starting empty — a durability-critical store that silently comes up blank is worse than one that refuses.
 func (s *Store) SetPersister(p blobstore.Persister) error {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// What this store holds when a persister is attached is not owed to that persister: exactly as before, the
+	// first save is the next change.
+	s.savedThrough = s.changes
 	if p == nil {
 		s.persister = nil
 		return nil
@@ -91,7 +119,11 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 	return nil
 }
 
-// persistLocked writes the full snapshot. The CALLER must hold s.mu. No-op without a persister.
+// persistLocked makes the change the caller has just applied durable, and returns when a confirmed save carries
+// it. The CALLER holds s.mu (write) and holds it again when this returns — but NOT in between: the lock is
+// released while the save runs, so heartbeats that arrive during a save are applied in memory and carried
+// together by the next one instead of queueing behind the lock one whole-catalog save each. A caller must
+// therefore re-read anything it uses after this returns. No-op without a persister.
 //
 // ★★ IT USED TO SWALLOW THE FAILURE (2026-08-13, thirtieth review #21). A marshal or save error was reported
 // through OnPersistError and never returned, on the argument that it "must not fail the mutation that
@@ -103,16 +135,41 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 // The error is returned now. It is still reported through OnPersistError, because a caller that discards it
 // should not also silence the log.
 func (s *Store) persistLocked() error {
+	s.changes++
 	if s.persister == nil {
 		return nil
 	}
+	mine := s.changes
+	s.mu.Unlock()
+	err := s.saveThrough(mine)
+	s.mu.Lock()
+	return err
+}
+
+// saveThrough returns nil once a confirmed save carries change number `through`. It must be called WITHOUT s.mu.
+// Saves run one at a time; whoever gets the turn writes everything applied so far, so the callers queued behind
+// it usually have nothing left to do. A save that fails is the failure of the caller that ran it, and each
+// caller still waiting runs its own.
+func (s *Store) saveThrough(through uint64) error {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if s.savedThrough >= through {
+		return nil
+	}
+	s.mu.RLock()
+	persister, carried := s.persister, s.changes
+	if persister == nil {
+		s.mu.RUnlock()
+		return nil
+	}
 	data, err := json.Marshal(devicePersistSnapshot{Devices: s.devices, PosturePolicy: s.posturePolicy})
+	s.mu.RUnlock()
 	if err != nil {
 		err = fmt.Errorf("marshal device inventory snapshot: %w", err)
 		reportPersistError(err)
 		return err
 	}
-	if err := s.persister.Save(data); err != nil {
+	if err := persister.Save(data); err != nil {
 		// ★★ SAVED-BUT-NOT-ATOMICALLY IS NOT A FAILURE (2026-08-13, thirty-first review #4). Every sibling store
 		// downgrades this sentinel; making persistLocked return its error made this the only one that did not,
 		// and the edge routes map a persist error to Register=400 and Heartbeat=404. On a bind-mounted file —
@@ -122,13 +179,59 @@ func (s *Store) persistLocked() error {
 		// may already have replaced the file; callers must not infer that an error means no bytes were saved.
 		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			log.Printf("device inventory persist: saved, but NOT atomically — %v", err)
+			s.savedThrough = carried
 			return nil
 		}
 		err = fmt.Errorf("save device inventory snapshot: %w", err)
 		reportPersistError(err)
 		return err
 	}
+	s.savedThrough = carried
 	return nil
+}
+
+// factsOf is a device as the saved file would hold it, minus WHEN it was observed: last_seen_at, and the
+// collected_at stamp of its posture reading. Two devices with the same factsOf differ in nothing a decision, an
+// administrator or an audit reads as a fact — status, trust level, posture values, agent version, policy bundle,
+// metadata. It compares the SAVED form on purpose: a list read back from the file and the same list in memory
+// are different Go types and the same fact.
+func factsOf(dev model.Device) ([]byte, error) {
+	dev.LastSeenAt = ""
+	if dev.Posture != nil {
+		posture := *dev.Posture
+		posture.CollectedAt = ""
+		dev.Posture = &posture
+	}
+	if dev.Metadata == nil {
+		dev.Metadata = map[string]any{}
+	}
+	return json.Marshal(dev)
+}
+
+// saveLivenessLaterLocked records a change nobody waits for and arranges ONE deferred save for it. The CALLER
+// must hold s.mu. A save that fails is reported and leaves the store behind, so the next heartbeat arms the
+// next attempt.
+func (s *Store) saveLivenessLaterLocked() {
+	s.changes++
+	if s.persister == nil || s.livenessTimer != nil {
+		return
+	}
+	s.livenessTimer = time.AfterFunc(s.livenessFlushAfter, func() {
+		s.mu.Lock()
+		s.livenessTimer = nil
+		through := s.changes
+		s.mu.Unlock()
+		_ = s.saveThrough(through) // reported through OnPersistError; no caller is waiting on this one
+	})
+}
+
+// Flush saves the inventory now if anything is waiting for the deferred save. A process that is stopping calls
+// it so the file does not trail by the last few seconds.
+func (s *Store) Flush() error {
+	s.mu.RLock()
+	through := s.changes
+	s.mu.RUnlock()
+	return s.saveThrough(through)
 }
 
 // SetPosturePolicy overrides the Edge-side posture ruleset used to derive device trust from reported
@@ -211,12 +314,13 @@ func (s *Store) Register(dev model.Device, policyBundle model.PolicyBundle, now 
 		retainAuthorityOwnedMetadata(dev.Metadata, prev.Metadata)
 	}
 	s.devices[dev.ID] = dev
+	answer := detachMetadata(dev) // before the lock is lent to the save
 	if err := s.persistLocked(); err != nil {
 		// The device IS registered in memory and the caller is told the write did not last. Reporting success
 		// here is what let a revoked device come back enrolled after a restart.
-		return detachMetadata(dev), err
+		return answer, err
 	}
-	return detachMetadata(dev), nil
+	return answer, nil
 }
 
 func (s *Store) Heartbeat(heartbeat model.DeviceHeartbeat, policyBundle model.PolicyBundle, now time.Time) (model.Device, error) {
@@ -236,6 +340,8 @@ func (s *Store) Heartbeat(heartbeat model.DeviceHeartbeat, policyBundle model.Po
 	if policyBundle.TenantID != "" && dev.TenantID != policyBundle.TenantID {
 		return detachMetadata(dev), fmt.Errorf("device tenant_id %s does not match policy bundle tenant_id %s", dev.TenantID, policyBundle.TenantID)
 	}
+	// dev.Metadata is the stored map and is written in place below; the comparison needs what it held before.
+	factsBefore, factsErr := factsOf(dev)
 	if heartbeat.AgentVersion != "" {
 		dev.AgentVersion = heartbeat.AgentVersion
 	}
@@ -302,12 +408,29 @@ func (s *Store) Heartbeat(heartbeat model.DeviceHeartbeat, policyBundle model.Po
 		}
 	}
 	s.devices[dev.ID] = dev
+	// ★★★ A HEARTBEAT THAT ONLY SAYS "STILL HERE" DOES NOT REWRITE THE INVENTORY (2026-11-11). Every heartbeat
+	// used to marshal and save the whole catalog while holding the store lock. With 1,000 devices that is a
+	// 664 KB file per heartbeat: one Edge answered about 79 heartbeats a second and no more, and 1,000 devices at
+	// the agents' 15-second period already ask for 67. Past that the answers outlast the agent's 10-second
+	// timeout and running devices read as dark.
+	//
+	// What is deferred is only the time. A heartbeat that changes a FACT — status, trust, posture values, agent
+	// version, metadata — is still on disk before it is answered, and its caller is still told when that failed.
+	// What changed for those is that one save carries all of them that are waiting (persistLocked), so a fleet
+	// that reports a new agent version in the same quarter minute costs a handful of saves and not one each.
+	if factsErr == nil {
+		if factsAfter, err := factsOf(dev); err == nil && bytes.Equal(factsBefore, factsAfter) {
+			s.saveLivenessLaterLocked()
+			return detachMetadata(dev), nil
+		}
+	}
+	answer := detachMetadata(dev) // before the lock is lent to the save: what THIS heartbeat made of the device
 	if err := s.persistLocked(); err != nil {
 		// The device IS registered in memory and the caller is told the write did not last. Reporting success
 		// here is what let a revoked device come back enrolled after a restart.
-		return detachMetadata(dev), err
+		return answer, err
 	}
-	return detachMetadata(dev), nil
+	return answer, nil
 }
 
 // ApplyRiskSignal folds a risk signal into the device's risk metadata so the decision path
@@ -353,8 +476,9 @@ func (s *Store) ApplyRiskSignal(deviceID string, sig model.RiskSignal, now time.
 		delete(dev.Metadata, "risk_signal_sources")
 	}
 	s.devices[deviceID] = dev
+	answer := detachMetadata(dev) // before the lock is lent to the save
 	err := s.persistLocked()
-	return detachMetadata(dev), true, high, err
+	return answer, true, high, err
 }
 
 // detachMetadata copies mutable metadata and posture before a Device leaves the store.

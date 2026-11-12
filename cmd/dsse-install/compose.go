@@ -922,7 +922,7 @@ const composeDatabaseDoor = `  # ★★★ THIS DOOR IS HOW A CLIENT REACHES THE
   # clients are lib/pq, which supports ONE host and reads a comma-separated list as a single hostname to
   # resolve. So the door stays, and the reason it stays is written here.
   postgres:
-    image: ${DSSE_HAPROXY_IMAGE:-haproxy:3.4.7-alpine3.24@sha256:2caaf8b1a1ef67f3f1ea9b721f2821675d3ba4500fb518e23884fecb93e8dbaa}
+    image: ${DSSE_HAPROXY_IMAGE:-haproxy:3.4.7-alpine3.24@sha256:b9fe316f718d5015c5cfebd8ca019591f3e44656f61d93cb8b59a1028961e530}
     entrypoint: ["/bin/sh", "/usr/local/bin/dsse-haproxy-resources"]
     # ★ A REGION THAT REBOOTS MUST COME BACK. Without a policy Docker starts nothing when the daemon does, and
     # "on-failure" declines a container that was stopped cleanly — which is every container on a planned
@@ -1448,7 +1448,7 @@ func composeRegionDoorwayWith(edgeDependsOnCP string) string {
     # containers were generated with no restart policy at all, so "temporarily unable" and "permanently
     # broken" had the same outcome. The control planes had this line; the Edges did not.
     restart: unless-stopped
-    image: ${DSSE_HAPROXY_IMAGE:-haproxy:3.4.7-alpine3.24@sha256:2caaf8b1a1ef67f3f1ea9b721f2821675d3ba4500fb518e23884fecb93e8dbaa}
+    image: ${DSSE_HAPROXY_IMAGE:-haproxy:3.4.7-alpine3.24@sha256:b9fe316f718d5015c5cfebd8ca019591f3e44656f61d93cb8b59a1028961e530}
     entrypoint: ["/bin/sh", "/usr/local/bin/dsse-haproxy-resources"]
     # ★★★ THE FRONT DOOR COULD NOT START ON AN ORDINARY HOST (measured the first time this
     # deployment ran with one component per machine):
@@ -1467,6 +1467,14 @@ func composeRegionDoorwayWith(edgeDependsOnCP string) string {
       - "./haproxy-resource-entrypoint.sh:/usr/local/bin/dsse-haproxy-resources:ro"
       - "./haproxy-edge.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"
       - "./deployment-anchor.pem:/deployment/deployment-anchor.pem:ro"
+    # Every local port the kernel has, for the connections this door opens to an Edge. A device holds two
+    # connections through the door, and each is one more connection from this container to the Edge: one
+    # source address and one destination, so one local port apiece. The default range holds about 28,000,
+    # which a large fleet returning at once exhausts ("Connect() failed for backend edge_fleet: no free
+    # ports"). This is not a quota: it is the room a 16-bit port gives, and it applies inside this container
+    # only.
+    sysctls:
+      net.ipv4.ip_local_port_range: "1024 65535"
     # ★★★ A FIXED ADDRESS, BECAUSE THE EDGES ARE TOLD TO BELIEVE IT AND NOTHING ELSE. This container states
     # each device's original address in a PROXY protocol header, and an Edge that believed such a header from
     # anyone would let any peer choose its own source address — and with it every decision keyed on the

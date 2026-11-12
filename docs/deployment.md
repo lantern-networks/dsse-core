@@ -5,8 +5,69 @@ an administrator, and checks the running deployment. Continue with [First use](a
 to configure an organization and connect an endpoint. **This release is experimental.**
 
 `dsse-install` generates the certificates, configuration, start scripts, and Compose files.
-Its `-plan ... -order` output is the command reference for your topology. Run each step
-on the machine it names; the output is instructions, not a shell script to execute wholesale.
+Its `-plan ... -order` output is the command reference for your topology: every step, the
+machine it runs on, what it needs, and why it is in that place.
+
+`dsse-install -up` runs that order for you — see [Run the order with `-up`](#run-the-order-with--up).
+The numbered sections below are the same steps done by hand, and remain the reference for
+what each one does.
+
+## Run the order with `-up`
+
+`-up` runs the steps `-order` prints, in the same order, and waits where the order tells a
+person to wait. It takes one command on the first machine, and one command on each other
+machine.
+
+Before it, each machine needs Docker Engine with Compose v2 and the deployment's names
+resolving (section 4). The first machine also needs `dsse-install` and the release's
+`release-manifest.json`; `-release-manifest` takes the image references from that file, so
+the plan does not have to carry them.
+
+One machine, without writing a plan:
+
+```sh
+A='-up -deployment dsse.example.com -address 10.20.1.10 -admin-email admin@example.com
+   -dir /opt/dsse/region-a -release-manifest release-manifest.json'
+dsse-install $A -print-names | sudo tee -a /etc/hosts   # or create the same records in DNS
+dsse-install $A
+```
+
+Any plan:
+
+```sh
+dsse-install -up -plan plan.json -dir /opt/dsse/region-a \
+  -admin-email admin@example.com -release-manifest release-manifest.json
+```
+
+- Add `-organization "Your Company"` to name the deployment's certificate authority, as in
+  section 4.
+- If the release manifest does not state them, pass `-agent-publisher` (who signs the agent
+  packages) and `-postgres-major` (the PostgreSQL major of the database image).
+- When the order reaches another machine, `-up` has already built that machine's package. It
+  prints where the package is and the one command to run on that machine, and waits. At a
+  terminal, press Enter when the command has finished; otherwise run the same `-up` command
+  again with `-confirmed <machine>`.
+- With `-ssh`, `-up` copies each package and starts each machine itself, using the `scp`
+  and remote commands the order prints. The first machine must be able to `ssh` to the
+  others without a prompt, and each must have Docker and a writable `/opt/dsse`. Where the
+  order starts a machine with `dsse-install -start-node`, that machine needs `dsse-install`
+  too.
+- Every machine needs the deployment's names resolving, not only the first: a machine that
+  cannot resolve them starts and never joins. `-print-names` prints the lines for all of
+  them.
+- Where the order says to wait and ask again — for a started machine to join, and for the
+  store to accept the next member after one was given its vote — `-up` waits and asks again.
+- If a step fails, correct the cause and run the same command again. Completed steps are
+  kept and not repeated.
+- The first administrator's password and second factor are written to
+  `admin-credentials.txt` in the deployment directory, readable only by you, and are not
+  printed. Steps are logged to `<dir>.install.log`.
+
+`-up` ends with `dsse-install -verify`, as the order does. It was used to install one
+machine (50 checks passed, 1 not checked) and three Regions of one combined machine each
+(61 passed, 2 not checked), the third of them over `-ssh`. Tests run the orders of the
+other example plans through it command for command; those topologies were not installed
+with it.
 
 The 0.4.0 images were installed in two topologies: three Regions with one CP+HAProxy
 host and two Edge hosts each, and one Region with three combined nodes, the second
@@ -40,7 +101,7 @@ Before starting, prepare:
 
 - Linux hosts with Docker Engine and the Compose v2 plugin, persistent storage, and
   permission to run Docker and create the deployment directories. The examples use `/opt/dsse`.
-- A build environment with Git and a patched Go toolchain; use Go 1.27.3 for this release
+- A build environment with Git and a patched Go toolchain; use Go 1.27.4 for this release
   as described in [Building](building.md). All nodes must run the same chosen revision.
 - Synchronized clocks on the servers and endpoints. Certificate validity and MFA depend on time.
 - Stable host addresses and DNS records that resolve from the hosts, containers,
@@ -111,7 +172,7 @@ On the founding node, or a build host targeting that node's architecture:
 ```sh
 git clone https://github.com/lantern-networks/dsse-core.git
 cd dsse-core
-export GOTOOLCHAIN=go1.27.3
+export GOTOOLCHAIN=go1.27.4
 mkdir -p bin
 go build -o bin/dsse-install ./cmd/dsse-install
 go build -o bin/dsse-profileverify ./cmd/dsse-profileverify
@@ -120,7 +181,7 @@ export PATH="$PWD/bin:$PATH"
 
 Use the revision associated with the release you are evaluating. Each node needs the
 server images its generated Compose file names: either the images published with the
-release (see [Server container images](releases/0.4.1/README.md#server-container-images)),
+release (see [Server container images](releases/0.4.2/README.md#server-container-images)),
 or both service images and the data-layer images built from this revision and loaded on
 every node, following [Building](building.md#build-the-service-images).
 Keep `dsse-install` on `PATH` when changing directories. If a separate build host is used,
@@ -161,8 +222,8 @@ Replace them before minting:
 
 The examples do not name the images to run, and the installer cannot generate a
 startable deployment without them. Add `image_revision`, `service_image`,
-`console_image` and `data_layer` before minting. For the published 0.4.1 images, copy
-the values from [Using the published images](releases/0.4.1/README.md#using-the-published-images);
+`console_image` and `data_layer` before minting. For the published 0.4.2 images, copy
+the values from [Using the published images](releases/0.4.2/README.md#using-the-published-images);
 for images you built, see [Building](building.md). Without `data_layer`, Compose refuses
 to start with `required variable DSSE_ETCD_IMAGE is missing a value`.
 

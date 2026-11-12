@@ -6,7 +6,7 @@ start with [Deployment](deployment.md); this page describes the build inputs and
 ## Prerequisites
 
 - Git and a patched Go toolchain. The language minimum in [go.mod](../go.mod) is
-  Go 1.26.9; use Go 1.27.3 for the release build. Set `GOTOOLCHAIN=go1.27.3` for the
+  Go 1.26.9; use Go 1.27.4 for the release build. Set `GOTOOLCHAIN=go1.27.4` for the
   commands below so an older local toolchain does not reintroduce fixed standard-library vulnerabilities.
 - Docker with the Compose v2 plugin for deployment images. Build Linux images matching
   the nodes' CPU architecture, either on a matching host or with a configured cross-build runtime.
@@ -129,7 +129,7 @@ a registry every host can pull from, and put the digests the pushes print in
 ## Build operator tools and native binaries
 
 ```sh
-export GOTOOLCHAIN=go1.27.3
+export GOTOOLCHAIN=go1.27.4
 mkdir -p bin
 go build -buildvcs=false -trimpath -o bin/dsse-install ./cmd/dsse-install
 go build -buildvcs=false -trimpath -o bin/dsse-profileverify ./cmd/dsse-profileverify
@@ -137,6 +137,18 @@ go build -buildvcs=false -trimpath -o bin/dsse-deployment-crl ./cmd/dsse-deploym
 go build -buildvcs=false -trimpath -o bin/dsse-signupdate ./cmd/dsse-signupdate
 export PATH="$PWD/bin:$PATH"
 ```
+
+To build `dsse-install` for a release, for both Linux architectures and stamped with the
+version:
+
+```sh
+DSSE_SOURCE_CONTENT_ID=source-<content id of this tree> sh scripts/build_installer_release.sh dist
+```
+
+It writes `dsse-install-<version>-linux-amd64`, `dsse-install-<version>-linux-arm64` and
+their SHA-256 sums. A release that ships them should also state `agent_publisher` and
+`container_images.postgres_major` in its `release-manifest.json`, so that
+`dsse-install -up -release-manifest` needs neither flag.
 
 These binaries target the machine running `go build`. The deployment CRL signer and
 keyless publisher run on Linux hosts and require the reviewed Linux binary from the
@@ -184,4 +196,4 @@ DSSE_TRUSTED_FRONT_DOORS=10.78.0.5
 The front door has a fixed address because Edges restrict which peers may supply a
 PROXY protocol header. Update any diagnostic `--add-host` arguments to match it.
 
-Release image builds pin Go 1.27.3. For matching local builds, set `GOTOOLCHAIN=go1.27.3` before running the Go commands.
+Release image builds pin Go 1.27.4. For matching local builds, set `GOTOOLCHAIN=go1.27.4` before running the Go commands.

@@ -181,7 +181,7 @@ export PATH="$PWD/bin:$PATH"
 
 Use the revision associated with the release you are evaluating. Each node needs the
 server images its generated Compose file names: either the images published with the
-release (see [Server container images](releases/0.4.1/README.md#server-container-images)),
+release (see [Server container images](releases/0.4.2/README.md#server-container-images)),
 or both service images and the data-layer images built from this revision and loaded on
 every node, following [Building](building.md#build-the-service-images).
 Keep `dsse-install` on `PATH` when changing directories. If a separate build host is used,
@@ -222,8 +222,8 @@ Replace them before minting:
 
 The examples do not name the images to run, and the installer cannot generate a
 startable deployment without them. Add `image_revision`, `service_image`,
-`console_image` and `data_layer` before minting. For the published 0.4.1 images, copy
-the values from [Using the published images](releases/0.4.1/README.md#using-the-published-images);
+`console_image` and `data_layer` before minting. For the published 0.4.2 images, copy
+the values from [Using the published images](releases/0.4.2/README.md#using-the-published-images);
 for images you built, see [Building](building.md). Without `data_layer`, Compose refuses
 to start with `required variable DSSE_ETCD_IMAGE is missing a value`.
 

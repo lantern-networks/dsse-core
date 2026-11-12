@@ -7,15 +7,15 @@ with values from your deployment. Use the documentation from the revision you bu
 
 ## Current release
 
-[0.4.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.4.1-experimental)
-was published on November 9, 2026. Its release notes provide signed macOS and Windows
-downloads, the server container images and the artifact checksums. The
-[0.4.1 documentation](releases/0.4.1/README.md) lists the assets and images,
-[changes since 0.4.0](releases/0.4.1/changes.md), [moving from 0.4.0](releases/0.4.1/upgrade.md)
-and [acceptance](releases/0.4.1/verification.md). 0.4.1 is accepted for fresh
+[0.4.2 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.4.2-experimental)
+was published on November 13, 2026. Its release notes provide the installer, signed macOS and
+Windows downloads, the server container images and the artifact checksums. The
+[0.4.2 documentation](releases/0.4.2/README.md) lists the assets and images,
+[changes since 0.4.1](releases/0.4.2/changes.md), [moving from 0.4.1](releases/0.4.2/upgrade.md)
+and [acceptance](releases/0.4.2/verification.md). 0.4.2 is accepted for fresh server
 installations. The [multi-Edge installation guide](releases/0.4.0/install-multi-edge.md)
-from 0.4.0 explains the three-entrance layouts; with 0.4.1, install every layout from
-`-order` as [Deployment](deployment.md) describes, with the 0.4.1 image values.
+from 0.4.0 explains the three-entrance layouts; with 0.4.2, install every layout with
+`-up` as [Deployment](deployment.md) describes, with the published release manifest.
 [Maintenance history](maintenance.md) describes 0.3.1 and earlier.
 
 ## Choose a starting point

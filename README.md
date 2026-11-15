@@ -23,16 +23,17 @@ A successful installation check is not evidence of long-duration reliability or 
 security audit. It has not been independently run at length by anyone who did not write it.
 See the [threat model](docs/threat-model.md) and each platform's limitations.
 
-## Latest release — 0.4.2 experimental
+## Latest release — 0.4.3 experimental
 
-[0.4.2 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.4.2-experimental) was released on November 13, 2026.
-It is a maintenance update of 0.4.1: `dsse-install -up` installs a machine with one command
-for every layout, an Edge saves device heartbeats without rewriting its inventory, and every
-binary is rebuilt with Go 1.27.4; see [the 0.4.2 changes](docs/releases/0.4.2/changes.md).
-It is accepted for fresh server installations and for upgrading a Windows device from 0.4.1.
-See the release notes for signed downloads, the [0.4.2 documentation](docs/releases/0.4.2/README.md)
-for the assets, images and what was checked, and the
-[0.4.0 documentation](docs/releases/0.4.0/README.md) for the layouts 0.4.0 introduced.
+[0.4.3 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.4.3-experimental) was released on November 15, 2026.
+It is a maintenance update of 0.4.2: `dsse-install -upgrade` moves a server to a new release one
+machine at a time, the macOS agent's name lookups are answered by its Edge, an Edge starts again
+after a restart, and a flow the device names is decided by the rules written for that name; see
+[the 0.4.3 changes](docs/releases/0.4.3/changes.md). It is accepted for fresh server installations,
+for upgrading a server installed with 0.4.2, and for upgrading Windows and macOS devices enrolled
+with 0.4.2. See the release notes for signed downloads, the
+[0.4.3 documentation](docs/releases/0.4.3/README.md) for the assets, images and what was checked,
+and the [0.4.0 documentation](docs/releases/0.4.0/README.md) for the layouts 0.4.0 introduced.
 
 ## Why we built it
 

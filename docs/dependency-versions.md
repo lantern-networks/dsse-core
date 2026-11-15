@@ -3,11 +3,11 @@
 This page lists the inputs this source selects. It says what is built from; it does not say
 that an image built from these inputs has been scanned or run. The images each release
 published, their digests, and what was scanned and accepted for them are in that release's
-notes ([0.4.2](releases/0.4.2/README.md#server-container-images),
+notes ([0.4.3](releases/0.4.3/README.md#server-container-images),
+[0.4.2](releases/0.4.2/README.md#server-container-images),
 [0.4.1](releases/0.4.1/README.md), [0.4.0](releases/0.4.0/README.md#server-container-images)).
-The inputs below differ from 0.4.2's in `golang.org/x/crypto`, PostgreSQL (18.7), ClickHouse
-and the Spilo build base; the 0.4.2 scan and acceptance results are for the 0.4.2 images and
-do not cover them. Scan results are recorded against the digest that was scanned.
+The inputs below are those of the 0.4.3 release images. Scan results are recorded against
+the digest that was scanned.
 Release builds fix the source, Go modules, base images and native archives,
 rather than resolving them at every build. The Go module manifests and native
 archive checksums are the authoritative build inputs. The image builds also apply
@@ -42,8 +42,8 @@ digests where available.
 
 | Purpose | Image reference | Status |
 |---|---|---|
-| HAProxy public and database entry | `haproxy:3.4.7-alpine3.24@sha256:b9fe316f718d5015c5cfebd8ca019591f3e44656f61d93cb8b59a1028961e530` | Digest fixed (upstream rebuilt 3.4.7; 3.4.7 is the newest 3.4 release). Scanned for 0.4.2 with no high or critical finding; ran in the 0.4.2 acceptance installations |
-| ClickHouse | `clickhouse/clickhouse-server:26.8.37.168-alpine@sha256:1ce2d087a317a6e17369d2e358d496c04ba34cdf9f60593a85031218e98b60ff` | Updated to the newest 26.8 LTS patch |
+| HAProxy public and database entry | `haproxy:3.4.7-alpine3.24@sha256:b9fe316f718d5015c5cfebd8ca019591f3e44656f61d93cb8b59a1028961e530` | Digest fixed (upstream rebuilt 3.4.7; 3.4.7 is the newest 3.4 release). Scanned for 0.4.3 with no high or critical finding; ran in the 0.4.3 acceptance installations |
+| ClickHouse | `clickhouse/clickhouse-server:26.8.37.168-alpine@sha256:1ce2d087a317a6e17369d2e358d496c04ba34cdf9f60593a85031218e98b60ff` | Updated to the newest 26.8 LTS patch. Scanned for 0.4.3 with no high or critical finding; ran in the 0.4.3 acceptance installations |
 | PostgreSQL tools base | `postgres:18.7-alpine3.24@sha256:75dcac3dfb1cd01ca3536910bbc84128759362f8b118bf8c55b38a94f68f3b73` | Digest fixed. Its bundled `gosu` binary, which the derived image removes, is expected to carry scanner findings |
 | PostgreSQL tools derived image | Builds from the pinned PostgreSQL base, removes `gosu`, uses `su-exec` | Published as `dsse-postgres-tools`. A release scans the image it publishes. No arm64 image is published |
 | etcd source-built image | Builds from the pinned v3.7.3 commit with Go 1.27.4 and patched `x/net` | Published as `dsse-etcd`. A release scans the image it publishes. No arm64 image is published |

@@ -133,7 +133,7 @@ function deviceEffectiveRiskWithoutOverlay(value) {
 // ★ AND "NEVER REPORTED" IS ITS OWN STATE, not "up to date". The inventory carries an agent_version from the
 // heartbeat, so a device that has never completed an update still LOOKS current — on a fleet where the
 // reporting lane is broken, every machine would read as fine.
-function applyUpdateState(st, u) {
+function applyUpdateState(st, u, somethingIsOffered = true) {
   st.update = u || null;
   if (!u) return;
   if (u.state === "refused") {
@@ -163,8 +163,12 @@ function applyUpdateState(st, u) {
     // Not a hazard on the device — a gap in what the fleet publishes, or in what it knows about the device.
     st.updateChip = "no_release";
     st.signals.push({ text: bl({ en: "no release for this device", ja: "配布対象なし" }), tone: "", title: u.reason || "" });
-  } else if (u.state === "never_reported") {
+  } else if (u.state === "never_reported" && somethingIsOffered) {
     // Quiet, and counted: this is not a hazard on one device, it is a hole in what the fleet number covers.
+    //
+    // Only while this deployment offers a release. With nothing published there is no outcome a device could
+    // have reported, and a deployment that does not distribute agents through this lane showed "no update
+    // report" against every device for as long as it ran.
     st.updateChip = "never_reported";
   }
   // `unknown` deliberately sets NOTHING. It is what the endpoint says when it could not read the outcome
@@ -539,7 +543,7 @@ async function renderList(host) {
       ? (d.effective_risk && d.effective_risk.trim()) || riskMax(sev || "none", grpSev || "none")
       : deviceEffectiveRiskWithoutOverlay(d.effective_risk);
     const st = deviceStateOf(d, obs, rt, effSev, runtimeFleetWide);
-    applyUpdateState(st, updates[d.identity]);
+    applyUpdateState(st, updates[d.identity], Object.keys(updateOffering).length > 0 || !!updateFrozen);
     return { d, rt, obs, sev, grpSev, effSev, st };
   });
   const withoutRuntime = enrich.filter(({d}) => !runtime[d.identity] && !runtime[deviceKey(d.identity)]).length;

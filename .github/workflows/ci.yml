@@ -86,7 +86,7 @@ jobs:
             --env CLICKHOUSE_PASSWORD=ci_manual_delete \
             --env CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
             --publish 127.0.0.1:58124:8123 \
-            clickhouse/clickhouse-server:26.8.36.3-alpine@sha256:f5443f9ffa48f0154cdd50cab39fed732201762574a27f04f1f564bbba81832d
+            clickhouse/clickhouse-server:26.8.37.168-alpine@sha256:1ce2d087a317a6e17369d2e358d496c04ba34cdf9f60593a85031218e98b60ff
           for attempt in $(seq 1 30); do
             if curl --fail --silent --user default:ci_manual_delete 'http://127.0.0.1:58124/?query=SELECT%201' >/dev/null; then exit 0; fi
             sleep 1

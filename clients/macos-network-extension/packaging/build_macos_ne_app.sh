@@ -171,6 +171,7 @@ cat > "$sx/Contents/Info.plist" <<PLIST
 		<key>NEProviderClasses</key>
 		<dict>
 			<key>com.apple.networkextension.app-proxy</key><string>DsseAppProxyProviderSkeleton.DsseAppProxyProvider</string>
+			<key>com.apple.networkextension.dns-proxy</key><string>DsseAppProxyProviderSkeleton.DsseDNSProxyProvider</string>
 		</dict>
 	</dict>
 	<key>NSSystemExtensionUsageDescription</key><string>${sx_usage}</string>
@@ -245,6 +246,9 @@ sx_kind="$(dsse_profile_kind "$pf/sysext.plist")"
 # in a way that signs cleanly and does not activate.
 app_ne="$(dsse_profile_ne_appproxy "$pf/app.plist")" || { echo "build_macos_ne_app: the app profile grants no App Proxy entitlement"; exit 1; }
 sx_ne="$(dsse_profile_ne_appproxy "$pf/sysext.plist")" || { echo "build_macos_ne_app: the extension profile grants no App Proxy entitlement"; exit 1; }
+# The extension also answers the Mac's DNS (DsseDNSProxyProvider), so both bundles need the DNS Proxy value too.
+app_dns="$(dsse_profile_ne_dnsproxy "$pf/app.plist")" || { echo "build_macos_ne_app: the app profile grants no DNS Proxy entitlement"; exit 1; }
+sx_dns="$(dsse_profile_ne_dnsproxy "$pf/sysext.plist")" || { echo "build_macos_ne_app: the extension profile grants no DNS Proxy entitlement"; exit 1; }
 
 # The app group is named in the profile; a mismatch means DSSE_APP_GROUP and the portal disagree, and the
 # symptom would be the agent and its extension failing to reach each other over their Mach service.
@@ -260,7 +264,7 @@ cp "$sx_profile" "$sx/Contents/embedded.provisionprofile"
 # The bundle contains public resources and executables, never enrollment secrets.
 chmod -R u+rwX,go+rX,go-w "$app"
 echo "==> embedded $app_kind profiles: $(dsse_profile_name "$pf/app.plist") / $(dsse_profile_name "$pf/sysext.plist")"
-echo "==> App Proxy entitlement from the profile: $app_ne"
+echo "==> App Proxy entitlement from the profile: $app_ne; DNS Proxy: $app_dns"
 
 ents="$out/.entitlements"
 mkdir -p "$ents"
@@ -270,7 +274,7 @@ cat > "$ents/app.entitlements" <<PLIST
 <plist version="1.0">
 <dict>
 	<key>com.apple.application-identifier</key><string>${team}.${app_id}</string>
-	<key>com.apple.developer.networking.networkextension</key><array><string>${app_ne}</string></array>
+	<key>com.apple.developer.networking.networkextension</key><array><string>${app_ne}</string><string>${app_dns}</string></array>
 	<key>com.apple.developer.system-extension.install</key><true/>
 	<key>com.apple.developer.team-identifier</key><string>${team}</string>
 	<key>com.apple.security.application-groups</key><array><string>${app_group}</string></array>
@@ -283,7 +287,7 @@ cat > "$ents/sysext.entitlements" <<PLIST
 <plist version="1.0">
 <dict>
 	<key>com.apple.application-identifier</key><string>${team}.${sx_id}</string>
-	<key>com.apple.developer.networking.networkextension</key><array><string>${sx_ne}</string></array>
+	<key>com.apple.developer.networking.networkextension</key><array><string>${sx_ne}</string><string>${sx_dns}</string></array>
 	<key>com.apple.developer.team-identifier</key><string>${team}</string>
 	<key>com.apple.security.application-groups</key><array><string>${app_group}</string></array>
 </dict>

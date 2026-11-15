@@ -335,6 +335,7 @@ swg-tenant-restriction-operator-config	String	""
 swg-tenant-restriction-operator-value-store	String	""
 tenant-device-authority-store	String	""
 tenant-interception-authority-store	String	""
+tenant-interception-crl-origins	String	""
 tenant-model-store	String	""
 tenant-transport-authority-store	String	""
 tenant-transport-material-from-cp	Bool	false

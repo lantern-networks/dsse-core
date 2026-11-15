@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -109,6 +111,13 @@ type remoteAuditShipper struct {
 	quit     chan struct{}
 	quitOnce sync.Once
 	done     chan struct{} // closed by run on its way out, after the spool is compacted and closed
+	// batchUnsupportedUntil is when to ask the receiver for the many-records route again after it answered
+	// that it has none (a control plane of an earlier release, mid-upgrade). Read and written by run only.
+	batchUnsupportedUntil time.Time
+	// batches counts requests that carried more than one record and were answered record by record. It is how
+	// a deployment can see that batching is in effect: a control plane that refuses the route leaves this at
+	// zero while "shipped" keeps rising one request at a time.
+	batches atomic.Int64
 }
 
 // stop ends the shipping goroutine and WAITS for it, so that when this returns the spool has been compacted to
@@ -293,6 +302,9 @@ func (s *remoteAuditShipper) run() {
 	// How many times the head has been rotated to the back since anything last shipped. Bounded by the queue
 	// length: one pass is the experiment, and a second would be the same question asked twice.
 	rotationsSinceProgress := 0
+	// True from a batch in which the receiver did not accept every record until the one-at-a-time path has
+	// dealt with what it left.
+	batchPaused := false
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
 	armed := false
@@ -376,7 +388,64 @@ func (s *remoteAuditShipper) run() {
 				return
 			}
 		}
-		if err := s.ship(q[0]); err != nil {
+		// ★ MANY RECORDS TO A REQUEST WHEN THERE ARE MANY (measured with 10,006 devices, 2026-11-11: one request
+		// per record carried a few hundred records a second, and an Edge producing more fell behind for as
+		// long as the load lasted). The receiver answers each record of a batch on its own. What it accepted
+		// leaves the queue; anything it did not accept stays, in order, and is offered one at a time below —
+		// so the question "is it this record or the channel" is still answered by the experiment that
+		// answers it, and batching stays off until that experiment has set the record aside.
+		var err error
+		shippedNow := 0
+		if n := auditBatchLen(q); n > 1 && !batchPaused && !time.Now().Before(s.batchUnsupportedUntil) {
+			statuses, berr := s.shipBatch(q[:n])
+			switch {
+			case errors.Is(berr, errAuditBatchUnsupported):
+				// An earlier release's control plane. One record per request works there; ask again later,
+				// because the control plane is what an upgrade replaces.
+				s.batchUnsupportedUntil = time.Now().Add(auditBatchRetryUnsupportedAfter)
+			case errors.Is(berr, errAuditBatchNotAnswered):
+				// The request was answered, but not record by record. Whether that is the channel or the
+				// records is the question the one-at-a-time path knows how to ask; let it, and do not put a
+				// second request in front of every record while it does.
+				s.batchUnsupportedUntil = time.Now().Add(auditBatchRetryNotAnsweredAfter)
+			case berr != nil:
+				err = berr
+			default:
+				s.batches.Add(1)
+				kept := make([]auditShipItem, 0, len(q))
+				firstKeptStatus := 0
+				for i, item := range q[:n] {
+					if statuses[i] >= 200 && statuses[i] < 300 {
+						shippedNow++
+						continue
+					}
+					if len(kept) == 0 {
+						firstKeptStatus = statuses[i]
+					}
+					kept = append(kept, item)
+				}
+				if len(kept) > 0 {
+					batchPaused = true
+					// The receiver took other records in the very request in which it refused this one, so
+					// the channel has worked since the refusal began: the evidence the one-at-a-time path
+					// waits for is already in. It still offers the record once more before setting it aside.
+					if shippedNow > 0 && shippedWhenHeadFirstRefused < 0 && (auditShipRefusal{status: firstKeptStatus}).recordSpecific() {
+						shippedWhenHeadFirstRefused = s.shipped.Load()
+					}
+				}
+				q = append(kept, q[n:]...)
+			}
+		}
+		if err == nil && shippedNow == 0 && len(q) > 0 {
+			if err = s.ship(q[0]); err == nil {
+				shippedNow = 1
+				q = q[1:]
+				if shippedWhenHeadFirstRefused < 0 {
+					batchPaused = false
+				}
+			}
+		}
+		if err != nil {
 			// ★ A REFUSAL THAT WILL NEVER SUCCEED MUST NOT HOLD THE QUEUE (2026-08-16). Set the record aside
 			// durably, say so, and carry on with the next one. Two facts have to stay separate: the receiver
 			// refuses THIS record, and every other record is still deliverable. Retrying the first forever
@@ -425,6 +494,7 @@ func (s *remoteAuditShipper) run() {
 						err, dead.stream, s.refused.Load())
 					shippedWhenHeadFirstRefused = -1
 					rotationsSinceProgress = 0
+					batchPaused = false
 					continue
 				}
 				if len(q) > 1 && rotationsSinceProgress < len(q) {
@@ -483,8 +553,7 @@ func (s *remoteAuditShipper) run() {
 			s.failingSinceUnix.Store(0)
 			s.lastError.Store(nil)
 		}
-		s.shipped.Add(1)
-		q = q[1:]
+		s.shipped.Add(int64(shippedNow))
 		if len(q) == 0 {
 			s.spool.compact(q) // fully drained → clear the durable spool
 		} else {
@@ -520,6 +589,86 @@ func (s *remoteAuditShipper) ship(item auditShipItem) error {
 		return auditShipRefusal{status: resp.StatusCode}
 	}
 	return nil
+}
+
+// errAuditBatchUnsupported is the receiver saying it has no many-records route.
+var errAuditBatchUnsupported = errors.New("the control plane has no batch audit route")
+
+// auditBatchRetryUnsupportedAfter is how long the shipper sends one record per request before asking again.
+const auditBatchRetryUnsupportedAfter = 10 * time.Minute
+
+// auditBatchRetryNotAnsweredAfter is the same wait after a batch got an answer that was not one per record.
+const auditBatchRetryNotAnsweredAfter = 30 * time.Second
+
+// maxAuditShipBatchBytes bounds one request's records. It is a quarter of what the receiver reads for a batch
+// (maxAuditIngestBatchBytes), leaving room for the envelope; it is the size of a message, not a rate.
+const maxAuditShipBatchBytes = 1 << 20
+
+// auditBatchLen is how many records from the head of q go into one request: as many as fit.
+func auditBatchLen(q []auditShipItem) int {
+	n, size := 0, 0
+	for _, item := range q {
+		size += len(item.record) + len(item.stream) + 32
+		if n > 0 && size > maxAuditShipBatchBytes {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// errAuditBatchNotAnswered is a batch request that got an answer which is not one status per record.
+var errAuditBatchNotAnswered = errors.New("the batch was not answered record by record")
+
+// shipBatch offers items in one request and reports the status the receiver gave each. An error means the
+// request as a whole failed and says nothing about any record.
+func (s *remoteAuditShipper) shipBatch(items []auditShipItem) ([]int, error) {
+	url := s.baseURL()
+	if strings.TrimSpace(url) == "" {
+		return nil, fmt.Errorf("no in-boundary control plane reachable (retaining audit record)")
+	}
+	batch := auditIngestBatch{Records: make([]auditIngestBatchRecord, len(items))}
+	for i, item := range items {
+		batch.Records[i] = auditIngestBatchRecord{Stream: item.stream, Record: json.RawMessage(item.record)}
+	}
+	body, err := json.Marshal(batch)
+	if err != nil {
+		// A record that is not JSON cannot ride in a batch. One at a time, the receiver refuses it by name.
+		return nil, errAuditBatchNotAnswered
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(url, "/")+"/batch", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("content-type", "application/json")
+	if s.token != "" {
+		req.Header.Set("authorization", "Bearer "+s.token)
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		return nil, errAuditBatchUnsupported
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, errAuditBatchNotAnswered
+	}
+	// An answer that is not one result per record did not come from the batch route — something in front of
+	// the control plane answered for it. One record per request still works, and the receiver files a record
+	// it has already seen only once.
+	var answer auditIngestBatchAnswer
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxAuditIngestBatchBytes)).Decode(&answer); err != nil || len(answer.Results) != len(items) {
+		return nil, errAuditBatchNotAnswered
+	}
+	statuses := make([]int, len(items))
+	for i, result := range answer.Results {
+		statuses[i] = result.Status
+	}
+	return statuses, nil
 }
 
 // auditShipRefusal is a non-2xx answer from the ingest endpoint, carrying whether retrying could ever help.
@@ -564,6 +713,7 @@ func (s *remoteAuditShipper) health(now time.Time) map[string]any {
 		"endpoint":   s.baseURL(),
 		"pending":    s.pending.Load(),
 		"shipped":    s.shipped.Load(),
+		"batches":    s.batches.Load(),
 		"failed":     s.failed.Load(),
 		"dropped":    s.dropped.Load(),
 		// refused records are set aside rather than lost: "the receiver refuses this" and "this never

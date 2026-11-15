@@ -87,7 +87,7 @@ from the administrator for the organization this device will join:
 
 | File | Purpose |
 |---|---|
-| `DsseAgent.msi` | Signed installer for the device's architecture. The 0.4.2 release file is `DsseAgent-0.4.2-windows-x64.msi`; substitute its name for `DsseAgent.msi` in the commands below |
+| `DsseAgent-<version>-windows-x64.msi` | Signed installer for the device's architecture, under the name it was released with (for 0.4.2, `DsseAgent-0.4.2-windows-x64.msi`). Keep exactly one installer in the directory: the commands below find it by the `DsseAgent*.msi` pattern and stop if there is none or more than one |
 | `install_profile.json` | Signed configuration and trust material |
 | `enrolment_token.txt` | One-time authorization for this device to join |
 | `profile_signing_key.txt` | Public key used to verify the profile |
@@ -125,7 +125,8 @@ Extract into an **empty directory**. Numbered browser downloads such as
 package signature against the expected publisher:
 
 ```powershell
-Get-AuthenticodeSignature .\DsseAgent.msi | Format-List Status,SignerCertificate
+$msi = @(Get-Item .\DsseAgent*.msi); if ($msi.Count -ne 1) { throw "expected exactly one DsseAgent MSI in this directory, found $($msi.Count)" }
+Get-AuthenticodeSignature $msi[0].FullName | Format-List Status,SignerCertificate
 ```
 
 `Valid` must refer to the publisher your administrator designated. Obtain the profile
@@ -169,7 +170,8 @@ The following PowerShell commands start in the empty directory containing the fo
 Run with administrator privileges. Absolute paths avoid ambiguity in MSI custom actions:
 
 ```powershell
-$msi = (Resolve-Path .\DsseAgent.msi).Path
+$msi = @(Get-Item .\DsseAgent*.msi); if ($msi.Count -ne 1) { throw "expected exactly one DsseAgent MSI in this directory, found $($msi.Count)" }
+$msi = $msi[0].FullName
 $config = (Resolve-Path .\install_profile.json).Path
 $token = (Resolve-Path .\enrolment_token.txt).Path
 $pin = (Resolve-Path .\profile_signing_key.txt).Path
@@ -246,9 +248,12 @@ certificate errors. Configure those programs to use a maintained public CA bundl
 the intended organization's interception root, or a supported system-trust mode. Keep
 TLS verification enabled. Recheck after certificate changes and agent upgrades.
 
-**Known limitation: revocation checking under inspection.** The certificates the Edge issues
-for an inspected site carry no revocation information (no CRL distribution point and no
-OCSP responder). A client that requires an online revocation check therefore fails on an
+**Known limitation: revocation checking under inspection.** Whether the certificates the
+Edge issues for an inspected site name a place to check revocation depends on the
+deployment. They do when the deployment publishes revocation lists (see "Publishing
+revocation lists" in [deployment.md](deployment.md)); they do not when it publishes none.
+Publishing is decided before the deployment is created. Without
+that address, a client that requires an online revocation check fails on an
 inspected site even when it trusts the organization's interception root: for example
 `curl.exe` with Schannel reports `CRYPT_E_NO_REVOCATION_CHECK (0x80092012)`, and .NET
 validation that demands revocation reports `RevocationStatusUnknown`. Browsers and
@@ -341,7 +346,8 @@ Avoid resetting all Windows Firewall or adapter settings: those may belong to ot
 From the folder holding the original MSI, with administrator privileges:
 
 ```powershell
-$msi = (Resolve-Path .\DsseAgent.msi).Path
+$msi = @(Get-Item .\DsseAgent*.msi); if ($msi.Count -ne 1) { throw "expected exactly one DsseAgent MSI in this directory, found $($msi.Count)" }
+$msi = $msi[0].FullName
 $log = Join-Path $PWD 'uninstall.log'
 $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/x `"$msi`" /qn /l*v `"$log`""
 $p.ExitCode

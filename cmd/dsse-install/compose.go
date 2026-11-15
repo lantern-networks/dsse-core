@@ -1137,7 +1137,7 @@ func composeControlPlaneOwnedWith(adminUpstream, edgeUpstream string) string {
   # is in /docker-entrypoint-initdb.d on FIRST boot only — so a schema change is a migration and not an edit,
   # and the deployment says so by shipping the files rather than by hiding them in an image.
   dsse-clickhouse:
-    image: ${DSSE_CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:26.8.36.3-alpine@sha256:f5443f9ffa48f0154cdd50cab39fed732201762574a27f04f1f564bbba81832d}
+    image: ${DSSE_CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:26.8.37.168-alpine@sha256:1ce2d087a317a6e17369d2e358d496c04ba34cdf9f60593a85031218e98b60ff}
     # ★ A REGION THAT REBOOTS MUST COME BACK. Without a policy Docker starts nothing when the daemon does, and
     # "on-failure" declines a container that was stopped cleanly — which is every container on a planned
     # restart. A node brought back then serves its door with its Edge and nothing behind it, and the fleet

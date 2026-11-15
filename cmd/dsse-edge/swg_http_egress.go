@@ -250,6 +250,15 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 	//
 	// The interception boundary now carries the organization across with the device identity beside it; a flow
 	// that brings none leaves the bundle's value alone, which is right on a single-tenant deployment.
+	// ★ AND THAT ORGANIZATION'S OWN SETTINGS, NOT ONLY ITS NAME ON THE REQUEST. The evaluator above was built
+	// for this node's organization: its Connector Access posture, rules and grants. A request read out of a
+	// customer's connection was then judged by the node's Connector Access rules under the customer's name —
+	// allowed when the connection opened, by the right organization's rule, and refused at its first request
+	// by "nothing matched" in somebody else's. The evaluator is rebuilt for the flow's organization the way
+	// the tunnel entrance builds it.
+	if tenant := edgeplane.FlowTenantFromContext(r.Context()); tenant != "" && tenant != strings.TrimSpace(runtimeEvaluator.PolicyBundle.TenantID) {
+		runtimeEvaluator = overlayRuntimeDLPRules(runtimeEvaluatorForTenant(config.Evaluator, config.PolicyStore, tenant), config.DLPRules)
+	}
 	flowBundle := runtimeEvaluator.PolicyBundle
 	if tenant := edgeplane.FlowTenantFromContext(r.Context()); tenant != "" {
 		flowBundle.TenantID = tenant
@@ -259,6 +268,14 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 		setSWGHTTPEgressOutcome(w, edgeplane.EdgeSWGHTTPEgressOutcomeBadRequest)
 		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	// A request read out of a connection Connector Access let through belongs to Connector Access as well.
+	// Only this Edge's own in-process forward can say so: the mark is put on the context by the code that
+	// opened the connection, and an outside caller of this route cannot set it.
+	if config.DeviceAuthenticatedInProcess && edgeplane.ConnectorAccessAtOpenFromContext(r.Context()) {
+		baseReq.ConnectorRouteVerified = true
+		baseReq.ConnectorFlowFromDevice = true
+		baseReq.ConnectorSignInDoneForRule = edgeplane.ConnectorSignInDoneForRuleFromContext(r.Context())
 	}
 	req := enrichDecisionRequestWithSession(baseReq, config.SessionStore)
 	req = enrichDecisionRequestWithTransportDevice(req, r.Context(), config.DeviceStore)

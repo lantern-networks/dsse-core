@@ -150,6 +150,11 @@ Edge. Store contents, recent-window limits, and delivery delay can therefore dif
 Access decisions carry decision-trace fields; there is no separate current decision-trace
 stream. DLP Findings is not a record of every scanned or skipped request.
 
+On a deployment of several Regions, each Region keeps its own records, and a query is
+answered from the records held in one Region, not from all of them. Which Region answers
+can change, for example when leadership moves, and the records shown change with it;
+nothing is deleted.
+
 A default denial with `no_policy_match` has no matching policy: the decision API's
 `policy_id` and the explanation's `final_policy_id` are empty, and the access log's
 `policy_id` is null. A nearest-candidate rule mentioned in the reason is diagnostic,

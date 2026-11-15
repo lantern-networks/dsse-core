@@ -44,12 +44,17 @@ func main() {
 	replicaOrigin := flag.String("replica-origin", "", "with -mode replica-units: independent public HTTP origin encoded in the certificates")
 	unitsDir := flag.String("units-dir", "", "with -mode replica-units: output directory for Linux systemd units and activation script")
 	listen := flag.String("listen", "127.0.0.1:18080", "with -mode serve: local HTTP bind, normally behind the operator's public port-80 front door")
+	upstream := flag.String("inspection-crl-upstream", "", "with -mode serve: loopback address of the control plane's read-only list listener (127.0.0.1:18080); requests under /pki/crl/ for the declared origins are handed to it, so one HTTP entrance serves the deployment's lists and its organizations'")
 	flag.Parse()
+	inspectionUpstream = *upstream
 	if err := run(*dir, *mode, *certPath, *reason, *origins, *sourceOrigin, *replicaOrigin, *unitsDir, *listen); err != nil {
 		fmt.Fprintln(os.Stderr, "dsse-deployment-crl:", err)
 		os.Exit(1)
 	}
 }
+
+// inspectionUpstream is -inspection-crl-upstream; see deploymentcrl.WithInspectionCRLUpstream.
+var inspectionUpstream string
 
 func run(dir, mode, certPath string, reason int, origins, sourceOrigin, replicaOrigin, unitsDir, listen string) error {
 	if dir == "" || strings.TrimSpace(dir) != dir {
@@ -93,6 +98,11 @@ func run(dir, mode, certPath string, reason int, origins, sourceOrigin, replicaO
 		h, err := deploymentcrl.Handler(publicDir, root, certs, strings.Split(origins, ","))
 		if err != nil {
 			return err
+		}
+		if inspectionUpstream != "" {
+			if h, err = deploymentcrl.WithInspectionCRLUpstream(h, strings.Split(origins, ","), inspectionUpstream); err != nil {
+				return err
+			}
 		}
 		server := &http.Server{Addr: listen, Handler: h, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 		return server.ListenAndServe()

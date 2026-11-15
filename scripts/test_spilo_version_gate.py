@@ -21,7 +21,7 @@ class SpiloVersionGate(unittest.TestCase):
                                 '*/wal-g) exit "$WALG_EXIT";;\nesac\n')
                 path.chmod(0o755)
             baseline = {**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"],
-                        "PG_VERSION": "postgres (PostgreSQL) 18.6",
+                        "PG_VERSION": "postgres (PostgreSQL) 18.7",
                         "PATRONI_VERSION": "patroni 4.1.5", "WALG_EXIT": "0"}
             for overrides, ok in (({}, True), ({"PG_VERSION": "postgres (PostgreSQL) 17.0"}, False),
                                   ({"PATRONI_VERSION": "patroni 3.0.0"}, False), ({"WALG_EXIT": "1"}, False)):

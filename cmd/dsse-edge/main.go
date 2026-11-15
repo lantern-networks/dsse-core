@@ -8316,8 +8316,27 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				logWarnf("steer_mux_bad_authority flow=%d", flowID)
 				return
 			}
+			// One destination, one spelling. A dual-stack socket names an IPv4 destination "::ffff:10.0.0.1";
+			// rules, routes, the observation inventory and the log would each have treated that as a second
+			// destination beside "10.0.0.1".
+			if plain := ipv4HostWithoutMapping(host); plain != host {
+				host = plain
+				authority = net.JoinHostPort(host, portStr)
+			}
+			// A named destination whose address lies in a registered network is that address's flow: decided by
+			// Connector Access and carried by the connector, with the name kept for rules and the log. See
+			// a_name_inside_a_registered_network.go.
+			namedAs := ""
+			if addr, ok := registeredAddressBehindName(r.Context(), config.Registry, dnsConntrack.LookupAddresses, flowTenant, host, time.Now()); ok {
+				namedAs = host
+				host = addr
+				authority = net.JoinHostPort(host, portStr)
+			}
 			port, _ := strconv.Atoi(portStr)
 			req := steerDecisionRequest(flowTenant, host, port)
+			if namedAs != "" {
+				req.FQDN = strings.TrimSuffix(strings.ToLower(namedAs), ".")
+			}
 			// ★ THE OBSERVED TUNNEL SOURCE, AS THE INTERCEPT PATH RECORDS IT (2026-11-04, found on a fresh single-machine
 			// install: allowed https rows named the device's address and the denied row beside them showed "—"). A flow
 			// decided here at the mux OPEN — every denial, and every non-https flow — wrote no source at all.
@@ -8332,6 +8351,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			// identifier is never used as this proof.
 			if _, routed, routeErr := connectorForDestination(r.Context(), config.Registry, flowTenant, host, ""); routeErr == nil && routed {
 				req.ConnectorRouteVerified = true
+				req.ConnectorFlowFromDevice = true
 			}
 			// Bind the mux flow's AUTHORITATIVE identity onto the decision request: the verified (T) transport
 			// device (mTLS CN, e.g. win-dev-1) + the steered OS-user carried on the mux OPEN metadata. Without
@@ -8409,9 +8429,14 @@ func newServerWithConfig(config serverConfig) http.Handler {
 						observeUser = strings.TrimSpace(osUser)
 					}
 					at := time.Now()
-					config.EastWestObserveStore.Observe(req.TenantID, transportDeviceID, observeUser, host, req.ServiceFamily, port, at)
+					// The inventory names the destination the way the decision and the access log do. A device
+					// sends the address it resolved; the decision recovers the name that address was resolved
+					// from and matches rules by it. Recording the bare address here listed a flow as "uncovered"
+					// while the log beside it showed the same flow allowed by a rule written for the name.
+					observedDestination := observedDestinationFor(host, req)
+					config.EastWestObserveStore.Observe(req.TenantID, transportDeviceID, observeUser, observedDestination, req.ServiceFamily, port, at)
 					// The control plane holds the inventory; this Edge's copy ends with this process.
-					reportEastWestFlow(req.TenantID, transportDeviceID, observeUser, host, req.ServiceFamily, port, at)
+					reportEastWestFlow(req.TenantID, transportDeviceID, observeUser, observedDestination, req.ServiceFamily, port, at)
 				}
 			}
 			dec := evaluateWithRuntimeEvidence(r.Context(), runtimeEvaluator, req, humanApprovals, delegatedGrants, nonHumanIdentities, time.Now())
@@ -8547,6 +8572,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 								return model.AccessDecision{}, false
 							} else {
 								fresh.ConnectorRouteVerified = routed
+								fresh.ConnectorFlowFromDevice = routed
 							}
 							currentEvaluator := runtimeEvaluatorForTenant(evaluator, policyStore, flowTenant)
 							fresh = resolveDestinationForLocality(r.Context(), fresh, currentEvaluator.EastWestInternalNetworks, time.Now())
@@ -8652,7 +8678,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				}
 			}
 			logDebugf("steer_mux_forwarded host=%s dst_port=%d family=%s", host, port, req.ServiceFamily)
-			route := edgeplane.NetworkExtensionRuntimeCopyTCPRoute{Host: host, Port: port, DeviceIdentity: transportDeviceID, OSUser: osUser, AuthOwner: authOwner, SourceApp: sourceApp, TenantID: req.TenantID, TunnelSourceIP: edgeplane.RemoteAddrString(clientConn), BuiltBy: "steer-mux"}
+			route := edgeplane.NetworkExtensionRuntimeCopyTCPRoute{Host: host, Port: port, DeviceIdentity: transportDeviceID, OSUser: osUser, AuthOwner: authOwner, SourceApp: sourceApp, TenantID: req.TenantID, TunnelSourceIP: edgeplane.RemoteAddrString(clientConn), BuiltBy: "steer-mux",
+				// Reaching here means the decision let the flow through, or a sign-in it asked for was completed.
+				ConnectorAccess: decision.IsConnectorAccessDecision(dec),
+				// Only the rule whose sign-in this flow completed. A plain allow or an observed flow names none.
+				ConnectorSignInDoneForRule: decision.ConnectorSignInDoneForRule(dec)}
 			if err := steerEgressForward(r.Context(), vc, authority, route, steerInterceptionDialer, func() {
 				if heldAuthRequestID != "" {
 					heldAuthResult.FinalAsync("resumed")

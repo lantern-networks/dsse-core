@@ -44,10 +44,88 @@ func registerAuditIngestReceiver(mux *http.ServeMux, writer *logs.Writer, token 
 		return
 	}
 	allowed := auditIngestAllowedStreams()
-	mux.HandleFunc("POST /audit-ingest", func(w http.ResponseWriter, r *http.Request) {
+	// ingest files one shipped record: the checks, then the stores. It answers with the status the record
+	// earns, so the single-record route and the batch route refuse and accept on the same terms.
+	ingest := func(ctx context.Context, shipper auditIngestShipper, verified bool, stream string, body []byte) (int, error) {
+		if !allowed[stream] {
+			return http.StatusBadRequest, fmt.Errorf("audit-ingest: unknown stream %q", stream)
+		}
+		var probe any
+		if json.Unmarshal(body, &probe) != nil {
+			return http.StatusBadRequest, fmt.Errorf("audit-ingest: body is not valid JSON")
+		}
+		if verified {
+			// ★ AN EMPTY TENANT WAS A WAY PAST THE CHECK (2026-08-12, twelfth review). The comparison was
+			// skipped when the record claimed no tenant, and nothing required the body to be an object at all —
+			// so an Edge holding a valid certificate could write arbitrary tenant-less JSON into the `_system`
+			// partition, which is the one place a record belongs to nobody and everybody reads.
+			//
+			// A verified shipment must name a tenant, and it must be the one its certificate proves.
+			want, err := auditIngestCanonicalTenant(body)
+			if err != nil {
+				return http.StatusBadRequest, fmt.Errorf("audit-ingest: a shipped record must be a JSON "+
+					"object with one unambiguous tenant_id: %w", err)
+			}
+			if want == "" {
+				return http.StatusForbidden, fmt.Errorf("audit-ingest: this record names no tenant, and a " +
+					"shipment from an identified edge cannot be filed under none")
+			}
+			if !edgeMayShipForTenant(shipper, want) {
+				return http.StatusForbidden, fmt.Errorf("audit-ingest: %s is not authorised to ship "+
+					"records for tenant %q. A control plane serving several tenants needs an edge→tenants map "+
+					"(-audit-ingest-authority); with none, an edge may ship only for the tenant its certificate "+
+					"was issued by", shipper, want)
+			}
+		}
+		// An Edge's observations are held here, not by the Edge (observation_report.go). The store is the
+		// durable copy, so a report is acknowledged only once it has committed, and it is not also written to
+		// this node's logs.
+		if isObservationReportStream(stream) {
+			status, rerr := applyObservationReport(captureCPWriteLease(ctx), reports, stream, shipper.Identity, body)
+			if rerr != nil {
+				return status, rerr
+			}
+			return status, nil
+		}
+		// Append the original record verbatim (RawMessage re-encodes as-is) -> local jsonl + postgres mirror.
+		if err := writer.Append(stream, json.RawMessage(body)); err != nil {
+			return http.StatusInternalServerError, fmt.Errorf("audit-ingest: persist: %w", err)
+		}
+		// ★ THE FLEET'S UPDATE PICTURE IS BUILT HERE, ONE EVENT AT A TIME (2026-08-12, and this is the SECOND
+		// attempt — the first one read it back out of the hot store on every Console load).
+		//
+		// A device reports to its EDGE, so the Edge's in-process telemetry knows and the control plane's does
+		// not: `GET /admin/agent-rollout` answered total=1 on the Edge and total=0 on the CP, which is the
+		// number an operator actually sees. The records themselves DO arrive here — that is what this handler
+		// is — so the fix belongs at arrival.
+		//
+		// The first fix queried the hot store when the summary was asked for. Measured in the lab: an
+		// unwindowed scan with a JSON filter took ClickHouse from idle to 340% CPU, made its own INGEST time
+		// out, and then the control plane would not start because its hot-store health check timed out. Asking
+		// what the fleet had installed took down the store the answer comes from. Recording on arrival is O(1)
+		// per event and leaves the summary the cheap in-memory read it already was.
+		recordShippedAgentUpdate(ctx, agentTelemetry, stream, body)
+		// A device's own report of what it is applying, folded into THIS node's observed-exclusion store — on
+		// the control plane, that is the deployment's durable copy. See observed_exclusion_ship.go.
+		if err := recordShippedObservedExclusion(observedExclusions, stream, body); err != nil {
+			log.Printf("audit-ingest: observed report not committed: %v", err)
+			return http.StatusServiceUnavailable, fmt.Errorf("observed report persistence unavailable")
+		}
+		// Which certificate a device is presenting, as an Edge saw it. The device-CA withdrawal gate reads this,
+		// and a control plane observes no handshakes of its own — see device_certificate_fact_ship.go.
+		recordShippedDeviceCertificateFact(stream, body)
+		// ★ AND THE FLEET'S DEVICE PICTURE, for the same reason one comment up (2026-08-14). The fleet view used
+		// to replay 48 hours of these rows per Console load; a steering device now re-ships once a minute, which
+		// took that query to 10.7 seconds and pushed quiet devices out of a 2000-row cap. Folding here is O(1)
+		// per event and bounded by the number of devices rather than by how much they steer.
+		recordShippedDeviceState(fleetDeviceProjectionStore, stream, body)
+		return http.StatusAccepted, nil
+	}
+	// admit is who may ship at all: the shared bearer, and an Edge this deployment can identify.
+	admit := func(w http.ResponseWriter, r *http.Request) (auditIngestShipper, bool, bool) {
 		if !auditIngestBearerValid(r, token) {
 			writeError(w, http.StatusUnauthorized, fmt.Errorf("audit-ingest: unauthorized"))
-			return
+			return auditIngestShipper{}, false, false
 		}
 		// ★ WHICH EDGE IS THIS, AND MAY IT SPEAK FOR THAT TENANT (2026-08-12, ninth review). The bearer is
 		// shared by every Edge in the deployment and nothing checked the tenant on the record — so one
@@ -73,97 +151,90 @@ func registerAuditIngestReceiver(mux *http.ServeMux, writer *logs.Writer, token 
 				"client certificate, so the tenant on its records cannot be bound to the edge that sent them. "+
 				"Configure -audit-ingest-client-cert/-key on the edge and terminate this endpoint with the "+
 				"operator-TLS anchors"))
+			return auditIngestShipper{}, false, false
+		}
+		return shipper, verified, true
+	}
+	mux.HandleFunc("POST /audit-ingest", func(w http.ResponseWriter, r *http.Request) {
+		shipper, verified, ok := admit(w, r)
+		if !ok {
 			return
 		}
 		stream := strings.TrimSpace(r.Header.Get("x-audit-stream"))
-		if !allowed[stream] {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("audit-ingest: unknown stream %q", stream))
-			return
-		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxEdgeRuntimeJSONBodyBytes))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("audit-ingest: read body: %w", err))
 			return
 		}
-		var probe any
-		if json.Unmarshal(body, &probe) != nil {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("audit-ingest: body is not valid JSON"))
+		status, err := ingest(r.Context(), shipper, verified, stream, body)
+		if err != nil {
+			writeError(w, status, err)
 			return
 		}
-		if verified {
-			// ★ AN EMPTY TENANT WAS A WAY PAST THE CHECK (2026-08-12, twelfth review). The comparison was
-			// skipped when the record claimed no tenant, and nothing required the body to be an object at all —
-			// so an Edge holding a valid certificate could write arbitrary tenant-less JSON into the `_system`
-			// partition, which is the one place a record belongs to nobody and everybody reads.
-			//
-			// A verified shipment must name a tenant, and it must be the one its certificate proves.
-			want, err := auditIngestCanonicalTenant(body)
-			if err != nil {
-				writeError(w, http.StatusBadRequest, fmt.Errorf("audit-ingest: a shipped record must be a JSON "+
-					"object with one unambiguous tenant_id: %w", err))
-				return
-			}
-			if want == "" {
-				writeError(w, http.StatusForbidden, fmt.Errorf("audit-ingest: this record names no tenant, and a "+
-					"shipment from an identified edge cannot be filed under none"))
-				return
-			}
-			if !edgeMayShipForTenant(shipper, want) {
-				writeError(w, http.StatusForbidden, fmt.Errorf("audit-ingest: %s is not authorised to ship "+
-					"records for tenant %q. A control plane serving several tenants needs an edge→tenants map "+
-					"(-audit-ingest-authority); with none, an edge may ship only for the tenant its certificate "+
-					"was issued by", shipper, want))
-				return
-			}
-		}
-		// An Edge's observations are held here, not by the Edge (observation_report.go). The store is the
-		// durable copy, so a report is acknowledged only once it has committed, and it is not also written to
-		// this node's logs.
-		if isObservationReportStream(stream) {
-			status, rerr := applyObservationReport(captureCPWriteLease(r.Context()), reports, stream, shipper.Identity, body)
-			if rerr != nil {
-				writeError(w, status, rerr)
-				return
-			}
-			w.WriteHeader(status)
-			return
-		}
-		// Append the original record verbatim (RawMessage re-encodes as-is) -> local jsonl + postgres mirror.
-		if err := writer.Append(stream, json.RawMessage(body)); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("audit-ingest: persist: %w", err))
-			return
-		}
-		// ★ THE FLEET'S UPDATE PICTURE IS BUILT HERE, ONE EVENT AT A TIME (2026-08-12, and this is the SECOND
-		// attempt — the first one read it back out of the hot store on every Console load).
-		//
-		// A device reports to its EDGE, so the Edge's in-process telemetry knows and the control plane's does
-		// not: `GET /admin/agent-rollout` answered total=1 on the Edge and total=0 on the CP, which is the
-		// number an operator actually sees. The records themselves DO arrive here — that is what this handler
-		// is — so the fix belongs at arrival.
-		//
-		// The first fix queried the hot store when the summary was asked for. Measured in the lab: an
-		// unwindowed scan with a JSON filter took ClickHouse from idle to 340% CPU, made its own INGEST time
-		// out, and then the control plane would not start because its hot-store health check timed out. Asking
-		// what the fleet had installed took down the store the answer comes from. Recording on arrival is O(1)
-		// per event and leaves the summary the cheap in-memory read it already was.
-		recordShippedAgentUpdate(r.Context(), agentTelemetry, stream, body)
-		// A device's own report of what it is applying, folded into THIS node's observed-exclusion store — on
-		// the control plane, that is the deployment's durable copy. See observed_exclusion_ship.go.
-		if err := recordShippedObservedExclusion(observedExclusions, stream, body); err != nil {
-			log.Printf("audit-ingest: observed report not committed: %v", err)
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observed report persistence unavailable"))
-			return
-		}
-		// Which certificate a device is presenting, as an Edge saw it. The device-CA withdrawal gate reads this,
-		// and a control plane observes no handshakes of its own — see device_certificate_fact_ship.go.
-		recordShippedDeviceCertificateFact(stream, body)
-		// ★ AND THE FLEET'S DEVICE PICTURE, for the same reason one comment up (2026-08-14). The fleet view used
-		// to replay 48 hours of these rows per Console load; a steering device now re-ships once a minute, which
-		// took that query to 10.7 seconds and pushed quiet devices out of a 2000-row cap. Folding here is O(1)
-		// per event and bounded by the number of devices rather than by how much they steer.
-		recordShippedDeviceState(fleetDeviceProjectionStore, stream, body)
-		w.WriteHeader(http.StatusAccepted)
+		w.WriteHeader(status)
 	})
+	// The same records, many to a request. An Edge that produces records faster than one request per record
+	// can carry them — a few hundred a second — fell behind for as long as the load lasted; the limit was the
+	// round trip, not the stores. Each record is checked and filed exactly as the route above does it and is
+	// answered on its own, so one refused record neither hides behind nor condemns its neighbours.
+	mux.HandleFunc("POST /audit-ingest/batch", func(w http.ResponseWriter, r *http.Request) {
+		shipper, verified, ok := admit(w, r)
+		if !ok {
+			return
+		}
+		raw, err := io.ReadAll(io.LimitReader(r.Body, maxAuditIngestBatchBytes+1))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("audit-ingest: read body: %w", err))
+			return
+		}
+		if len(raw) > maxAuditIngestBatchBytes {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("audit-ingest: a batch may be at most %d bytes", maxAuditIngestBatchBytes))
+			return
+		}
+		var batch auditIngestBatch
+		if err := json.Unmarshal(raw, &batch); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("audit-ingest: the batch is not valid JSON: %w", err))
+			return
+		}
+		answer := auditIngestBatchAnswer{Results: make([]auditIngestBatchResult, len(batch.Records))}
+		for i, record := range batch.Records {
+			status, ierr := http.StatusBadRequest, fmt.Errorf("audit-ingest: a record may be at most %d bytes", maxEdgeRuntimeJSONBodyBytes)
+			if len(record.Record) <= maxEdgeRuntimeJSONBodyBytes {
+				status, ierr = ingest(r.Context(), shipper, verified, strings.TrimSpace(record.Stream), record.Record)
+			}
+			answer.Results[i].Status = status
+			if ierr != nil {
+				answer.Results[i].Error = ierr.Error()
+			}
+		}
+		writeJSON(w, http.StatusOK, answer)
+	})
+}
+
+// auditIngestBatchPath is the many-records route beside /audit-ingest, as registered above.
+const auditIngestBatchPath = "/audit-ingest/batch"
+
+// maxAuditIngestBatchBytes bounds what the receiver holds in memory for one request. It is a property of the
+// message, not a quota on throughput: a sender with more to ship sends another batch.
+const maxAuditIngestBatchBytes = 4 << 20
+
+type auditIngestBatchRecord struct {
+	Stream string          `json:"stream"`
+	Record json.RawMessage `json:"record"`
+}
+
+type auditIngestBatch struct {
+	Records []auditIngestBatchRecord `json:"records"`
+}
+
+// auditIngestBatchResult is one record's answer: the status the single-record route would have given it.
+type auditIngestBatchResult struct {
+	Status int    `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+type auditIngestBatchAnswer struct {
+	Results []auditIngestBatchResult `json:"results"`
 }
 
 // auditIngestCanonicalTenant checks the bytes that will be persisted, not a

@@ -53,6 +53,9 @@ type upInput struct {
 	SSH            bool
 	Confirmed      string
 	Timeout        time.Duration
+	// The browser certificate a layout with a Portal serves: -install-portal-certificate, -portal-key and
+	// -portal-ca, as -start-node takes them. See withWhatANodeStartNeeds for which machine reads the paths.
+	PortalCertificate, PortalKey, PortalCA string
 }
 
 func flagWasSet(name string) bool {
@@ -273,6 +276,14 @@ type upStep struct {
 	// AfterRemote marks a step on this machine that follows another machine's start, and so may have to wait
 	// for that machine before it succeeds.
 	AfterRemote bool
+	// CPAnswersLater marks a restart after which the control plane cannot answer yet: in a layout with three
+	// voting store members, closing the first-administrator bootstrap fences the control plane until all three
+	// have joined, and the steps that join them come after this one. CPAnswersNow marks the step that completes
+	// the joining; the wait the restart could not make is made there.
+	CPAnswersLater, CPAnswersNow bool
+	// HeldThere, on another machine's step: files that machine must already hold, by the path its command
+	// names. They are looked for before the first step runs.
+	HeldThere []string
 }
 
 var (
@@ -323,7 +334,174 @@ func upSteps(plan *Plan, dir, planPath, organization, adminEmail string) ([]upSt
 	if len(out) == 0 || out[0].Kind != upMint {
 		return nil, fmt.Errorf("the order for this plan does not begin by minting the deployment, so -up will not run it")
 	}
+	if threeVoterProfile(plan.Profile) {
+		lastJoin := -1
+		for i, st := range out {
+			if st.Kind == upRun && strings.Contains(st.Shell, "member promote") {
+				lastJoin = i
+			}
+		}
+		if lastJoin < 0 {
+			return nil, fmt.Errorf("the order for this plan never completes its three voting store members, so -up will not run it")
+		}
+		out[lastJoin].CPAnswersNow = true
+		for i := range out[:lastJoin] {
+			if out[i].Kind == upRestart {
+				out[i].CPAnswersLater = true
+			}
+		}
+	}
 	return out, nil
+}
+
+var nodeStartDir = regexp.MustCompile(`dsse-install -start-node -dir (\S+)`)
+
+// withWhatANodeStartNeeds gives each `-start-node` step what that command requires and does not fetch for itself.
+//
+// A machine started with -start-node is checked first, and the check takes nothing from the network: the
+// release's images must already be on the machine, and a machine that serves the browser Portal must already
+// hold its certificate. Left to the reader, that made -up a command to run, watch stop, prepare for, and run
+// again. So -up fetches the images on each machine just before that machine's check — the check still decides,
+// by digest and revision label, whether they are the release's — and sees to the certificate.
+//
+// Where the certificate comes from depends on what the first machine is. A first machine that holds an Edge is
+// handed the certificate, and the other machines receive it in their package. A first machine that holds no
+// Edge never holds the browser key: there the paths name files each Edge machine already holds, every Edge
+// machine's start installs from them, and the first machine is given only the CA, for the check at the end.
+func withWhatANodeStartNeeds(steps []upStep, plan *Plan, dir string, in upInput, exists func(string) bool) ([]upStep, error) {
+	cert, key, ca := strings.TrimSpace(in.PortalCertificate), strings.TrimSpace(in.PortalKey), strings.TrimSpace(in.PortalCA)
+	if !declaredNodeMapProfile(plan.Profile) {
+		if cert != "" || key != "" || ca != "" {
+			return nil, fmt.Errorf("-install-portal-certificate, -portal-key and -portal-ca are for a plan with a profile; this plan's machines are not started with -start-node")
+		}
+		return steps, nil
+	}
+	if (cert == "") != (key == "") {
+		return nil, fmt.Errorf("-install-portal-certificate and -portal-key are given together")
+	}
+	minting := plan.foundingRegion().controlPlane()
+	holdsEdges := minting.Holds.has("edges")
+	edgeMachine := map[string]bool{}
+	for _, region := range plan.Regions {
+		for _, machine := range region.Machines {
+			if machine.Holds.has("edges") {
+				edgeMachine[machine.Name] = true
+			}
+		}
+	}
+	if holdsEdges {
+		if cert == "" && !exists(filepath.Join(dir, "clientless", "tls.crt")) {
+			return nil, fmt.Errorf("this plan's machines serve the browser Portal, and %s holds no certificate for it. Pass -install-portal-certificate <full chain> and -portal-key <key> (and -portal-ca <bundle> when its issuer is not in the system trust store): a certificate for the plan's Portal names, which browsers already trust", dir)
+		}
+		var err error
+		for _, p := range []*string{&cert, &key, &ca} {
+			if *p != "" {
+				if *p, err = filepath.Abs(*p); err != nil {
+					return nil, err
+				}
+			}
+		}
+	} else {
+		if cert == "" {
+			return nil, fmt.Errorf("the first machine of this plan (%s) holds no Edge, so the browser certificate's private key never passes through it. Put each Edge machine's certificate and key on that machine, at the same two paths on every Edge machine, and pass those paths with -install-portal-certificate and -portal-key (and -portal-ca, a CA bundle held at one path here and on every Edge machine, when the issuer is not in the system trust store)", minting.Name)
+		}
+		for _, p := range []string{cert, key, ca} {
+			if p != "" && !filepath.IsAbs(p) {
+				return nil, fmt.Errorf("%s is not an absolute path. The first machine of this plan (%s) holds no Edge, so the certificate paths name files on each Edge machine, and they are read there", p, minting.Name)
+			}
+		}
+		if ca != "" && !exists(ca) {
+			return nil, fmt.Errorf("%s is not on this machine. The CA bundle is read on every Edge machine and here, where the last step checks the Portals with it; the certificate and its key stay on the Edge machines", ca)
+		}
+	}
+	certificateFlags := " -install-portal-certificate " + shellQuote(cert) + " -portal-key " + shellQuote(key)
+	if ca != "" {
+		certificateFlags += " -portal-ca " + shellQuote(ca)
+	}
+	out := make([]upStep, len(steps))
+	copy(out, steps)
+	for i, st := range out {
+		if !holdsEdges && ca != "" && st.Kind == upRun && strings.HasPrefix(st.Shell, "dsse-install -verify ") {
+			out[i].Shell = st.Shell + " -portal-ca " + shellQuote(ca)
+			continue
+		}
+		m := nodeStartDir.FindStringSubmatch(st.Shell)
+		if m == nil {
+			continue
+		}
+		start := m[0]
+		switch {
+		case holdsEdges && st.Kind != upRemote && cert != "":
+			start += certificateFlags
+		case !holdsEdges && st.Kind == upRemote && edgeMachine[st.Machine]:
+			start += certificateFlags
+			out[i].HeldThere = []string{cert, key}
+			if ca != "" {
+				out[i].HeldThere = append(out[i].HeldThere, ca)
+			}
+		}
+		fetch := "(cd " + m[1] + " && docker compose --env-file deployment.env pull --policy missing --quiet)"
+		out[i].Shell = strings.Replace(st.Shell, m[0], fetch+" && "+start, 1)
+	}
+	return out, nil
+}
+
+// nothingStarted is a refusal made before the first step ran.
+type nothingStarted struct{ error }
+
+// whatOtherMachinesDoNotHold asks each machine whose step is still to run for the files that step names, over
+// the SSH destination the order gives, and reports the first that is missing. It is asked before the first
+// step, because the machines that need these files are started last.
+func whatOtherMachinesDoNotHold(ctx context.Context, steps []upStep, prog *upProgress, confirmed map[string]bool, r upRunner, workDir string, log io.Writer) error {
+	for i, s := range steps {
+		if s.Kind != upRemote || len(s.HeldThere) == 0 || prog.done(i, s) || confirmed[s.Machine] {
+			continue
+		}
+		host := ""
+		for j := i - 1; j >= 0 && host == ""; j-- {
+			if steps[j].Kind == upCopy {
+				host = steps[j].Host
+			}
+		}
+		if host == "" {
+			return fmt.Errorf("the order names no SSH destination for %s", s.Machine)
+		}
+		for _, file := range s.HeldThere {
+			if err := r.run(ctx, workDir, "ssh "+shellQuote(host)+" "+shellQuote("test -r "+shellQuote(file)), log); err != nil {
+				return fmt.Errorf("%s does not hold a readable %s (asked over ssh %s). Nothing has been started. Each Edge machine holds its own browser certificate and key before this command runs; they are not copied from here", s.Machine, file, host)
+			}
+		}
+	}
+	return nil
+}
+
+// mintLeftEverything reports whether dir holds every file a completed mint leaves beside its anchor.
+func mintLeftEverything(r upRunner, dir string) bool {
+	// The saved plan is the last thing the first step writes: the authorities are created, then the plan is
+	// applied to this machine, then the plan is saved. Without it the directory holds a deployment that was
+	// created and not yet shaped for this machine — the generic files are all there and none of them says so.
+	for _, name := range []string{agentPolicySigningKeyFile, "deployment.env", composeFileName(), installPlanFile} {
+		if !r.exists(filepath.Join(dir, name)) {
+			return false
+		}
+	}
+	return true
+}
+
+// bootstrapOutputFile is where this attempt at the first-administrator step writes. That is the pending file,
+// unless an earlier attempt left something there that may matter: then the earlier file stays untouched and
+// this attempt gets a name of its own beside it (kept = true). Output that only records a request nobody
+// answered created nothing, and an empty file holds nothing; both are written over.
+func bootstrapOutputFile(pending string, now time.Time) (path string, kept bool) {
+	info, err := os.Stat(pending)
+	if err != nil && os.IsNotExist(err) {
+		return pending, false
+	}
+	if err == nil && (info.Size() == 0 || firstRequestNeverAnswered(pending)) {
+		return pending, false
+	}
+	// Present with content, or present and unreadable: not ours to write over.
+	return pending + ".attempt-" + now.UTC().Format("20060102T150405.000000000Z"), true
 }
 
 // waitForControlPlane waits until the control plane answers. Started is not answering: compose returns as soon
@@ -425,6 +603,19 @@ func stepDigest(s upStep) string {
 
 func (p *upProgress) done(i int, s upStep) bool { return p.Done[strconv.Itoa(i)] == stepDigest(s) }
 
+// commandDone / markCommandDone record that a step's own command succeeded while something the step still
+// waits for has not. A command that must not be given twice — giving a store member its vote — is then not
+// given again when the wait is what failed.
+func (p *upProgress) commandDone(i int, s upStep) bool {
+	return p.Done[strconv.Itoa(i)+"/command"] == stepDigest(s)
+}
+
+func (p *upProgress) markCommandDone(i int, s upStep) error {
+	p.Done[strconv.Itoa(i)+"/command"] = stepDigest(s)
+	raw, _ := json.MarshalIndent(p, "", " ")
+	return os.WriteFile(p.path, append(raw, '\n'), 0o600)
+}
+
 func (p *upProgress) mark(i int, s upStep) error {
 	p.Done[strconv.Itoa(i)] = stepDigest(s)
 	raw, _ := json.MarshalIndent(p, "", " ")
@@ -438,6 +629,15 @@ type upRunner struct {
 	confirm func(machine string) bool
 	sleep   func(ctx context.Context, d time.Duration)
 	exists  func(path string) bool
+}
+
+// remoteCommandThatRemovesItsPackage is another machine's command followed by the removal of the package it
+// started from, in the directory the package was copied to.
+func remoteCommandThatRemovesItsPackage(shell, pkg string) string {
+	if pkg == "" {
+		return shell
+	}
+	return "( " + shell + " ) && rm -f " + shellQuote(pkg)
 }
 
 func stepTitle(s upStep) string {
@@ -454,6 +654,8 @@ func stepTitle(s upStep) string {
 		return "start " + s.Machine
 	}
 	switch {
+	case strings.Contains(s.Shell, "install-deployment-crl-services.sh"):
+		return "publish this deployment's revocation lists"
 	case strings.Contains(s.Shell, " -carry "):
 		return "pack what another machine needs"
 	case strings.Contains(s.Shell, "-activate-auth"):
@@ -462,6 +664,8 @@ func stepTitle(s upStep) string {
 		return "check the whole deployment"
 	case strings.Contains(s.Shell, "member add"):
 		return "announce a new store member"
+	case strings.Contains(s.Shell, "synchronous_mode=true"):
+		return "require a second copy of the database before a write succeeds"
 	case strings.Contains(s.Shell, "member promote"):
 		return "give the new store member its vote"
 	case strings.Contains(s.Shell, "-start-node") || strings.HasSuffix(s.Shell, " up -d"):
@@ -550,10 +754,26 @@ func executeUp(ctx context.Context, steps []upStep, in upInput, dir, workDir, lo
 			confirmedList[m] = true
 		}
 	}
+	if in.SSH {
+		if err := whatOtherMachinesDoNotHold(ctx, steps, prog, confirmedList, r, workDir, logFile); err != nil {
+			return 0, nothingStarted{err}
+		}
+	}
 	for i := 0; i < len(steps); i++ {
 		s := steps[i]
 		label := fmt.Sprintf("[%d/%d] %s", i+1, len(steps), stepTitle(s))
-		if prog.done(i, s) {
+		done := prog.done(i, s)
+		if done && s.Kind == upCopy && in.SSH {
+			// With -ssh the package is removed from the other machine once that machine has started. Until
+			// then a copy made earlier may be the one a failed start already consumed, so it is made again.
+			for j := i + 1; j < len(steps); j++ {
+				if steps[j].Kind == upRemote {
+					done = prog.done(j, steps[j]) || confirmedList[steps[j].Machine]
+					break
+				}
+			}
+		}
+		if done {
 			fmt.Fprintf(stdout, "%s ... already done\n", label)
 			continue
 		}
@@ -563,7 +783,10 @@ func executeUp(ctx context.Context, steps []upStep, in upInput, dir, workDir, lo
 		switch s.Kind {
 		case upMint:
 			fmt.Fprintf(stdout, "%s ... ", label)
-			if !r.exists(anchor) {
+			// The anchor is written before the rest. On its own it says a mint began, not that one finished:
+			// only a directory that holds everything a mint leaves is kept as it is. Anything less goes back to
+			// the mint, which names what is missing and replaces no authority.
+			if !r.exists(anchor) || !mintLeftEverything(r, dir) {
 				err = r.run(ctx, workDir, s.Shell, logFile)
 			}
 		case upFirstAdmin:
@@ -576,7 +799,13 @@ func executeUp(ctx context.Context, steps []upStep, in upInput, dir, workDir, lo
 			}
 			// The output holds the administrator's credentials. It goes to a private file and nowhere else, and
 			// the file takes its final name only when the step succeeded, so a failed attempt can be run again.
-			pending := s.Capture + ".pending"
+			// What an earlier attempt printed may be the only copy of the administrator's credentials: the
+			// account can exist although the step failed after creating it, and it is never issued twice. Such
+			// a file is left exactly as it is, and this attempt writes beside it.
+			pending, kept := bootstrapOutputFile(s.Capture+".pending", time.Now())
+			if kept {
+				fmt.Fprintf(logFile, "an earlier attempt at the first-administrator step left output in %s; it is kept, and this attempt writes to %s\n", s.Capture+".pending", pending)
+			}
 			f, openErr := os.OpenFile(pending, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 			if openErr != nil {
 				err = openErr
@@ -606,7 +835,7 @@ func executeUp(ctx context.Context, steps []upStep, in upInput, dir, workDir, lo
 			}
 		case upRestart:
 			fmt.Fprintf(stdout, "%s ... ", label)
-			if err = r.run(ctx, workDir, s.Shell, logFile); err == nil {
+			if err = r.run(ctx, workDir, s.Shell, logFile); err == nil && !s.CPAnswersLater {
 				// The processes that were answering are the ones being replaced: give them a moment to go, then
 				// wait for the new ones.
 				r.sleep(ctx, 10*time.Second)
@@ -651,7 +880,15 @@ func executeUp(ctx context.Context, steps []upStep, in upInput, dir, workDir, lo
 					err = fmt.Errorf("the order names no SSH destination for %s", s.Machine)
 					break
 				}
-				err = r.run(ctx, workDir, "ssh "+shellQuote(host)+" "+shellQuote(s.Shell), logFile)
+				// The package carries this deployment's identity for that machine and its fleet credential.
+				// -up put the copy there, so -up removes it once the machine has started from it.
+				//
+				// The machine's own command runs in a subshell. It may change directory — the three-Region order
+				// does, into the deployment's directory, before it starts the services — and the package is
+				// where scp put it, the directory the SSH session starts in. Appended to the command itself,
+				// the removal ran after that cd, removed nothing, and succeeded (review, 2026-11-14).
+				remote := remoteCommandThatRemovesItsPackage(s.Shell, pkg)
+				err = r.run(ctx, workDir, "ssh "+shellQuote(host)+" "+shellQuote(remote), logFile)
 				break
 			}
 			{
@@ -659,6 +896,7 @@ func executeUp(ctx context.Context, steps []upStep, in upInput, dir, workDir, lo
 				if pkg != "" {
 					fmt.Fprintf(stdout, "      1. Copy %s to %s (for example: scp %s %s:)\n", filepath.Join(workDir, pkg), s.Machine, filepath.Join(workDir, pkg), host)
 					fmt.Fprintf(stdout, "      2. On %s, in the directory you copied it to, run:\n\n           %s\n\n", s.Machine, s.Shell)
+					fmt.Fprintf(stdout, "      3. When it has finished, delete %s on %s: it carries that machine's identity and the fleet credential.\n\n", pkg, s.Machine)
 				} else {
 					fmt.Fprintf(stdout, "      On %s, run:\n\n           %s\n\n", s.Machine, s.Shell)
 				}
@@ -673,16 +911,32 @@ func executeUp(ctx context.Context, steps []upStep, in upInput, dir, workDir, lo
 				err = announceStoreMember(ctx, r, workDir, s.Shell, add, logFile)
 				break
 			}
-			err = r.run(ctx, workDir, s.Shell, logFile)
-			// A step that follows another machine's start may be early: that machine is still joining. The
-			// order says to wait for it; waiting is trying again, and a refusal changes nothing.
-			for attempt := 0; err != nil && s.AfterRemote && attempt < 60 && ctx.Err() == nil; attempt++ {
-				r.sleep(ctx, 5*time.Second)
+			// The command and the wait after it are remembered separately. A member that has been given its vote
+			// cannot be given it again — the store refuses to promote what is no longer a learner — so when the
+			// command succeeded and only the wait for the control plane failed, running this step again waits
+			// and does not promote.
+			if !prog.commandDone(i, s) {
 				err = r.run(ctx, workDir, s.Shell, logFile)
+				// A step that follows another machine's start may be early: that machine is still joining. The
+				// order says to wait for it; waiting is trying again, and a refusal changes nothing.
+				for attempt := 0; err != nil && s.AfterRemote && attempt < 60 && ctx.Err() == nil; attempt++ {
+					r.sleep(ctx, 5*time.Second)
+					err = r.run(ctx, workDir, s.Shell, logFile)
+				}
+				if err != nil && s.AfterRemote {
+					// What this step waited for is on the other machine, so that is where the cause is.
+					err = fmt.Errorf("%w; the machine started just before this step has not joined — on that machine, check that its containers are running and that this deployment's names resolve there", err)
+				}
+				if err == nil && s.CPAnswersNow {
+					if merr := prog.markCommandDone(i, s); merr != nil {
+						return i, merr
+					}
+				}
 			}
-			if err != nil && s.AfterRemote {
-				// What this step waited for is on the other machine, so that is where the cause is.
-				err = fmt.Errorf("%w; the machine started just before this step has not joined — on that machine, check that its containers are running and that this deployment's names resolve there", err)
+			if err == nil && s.CPAnswersNow {
+				// The third voting member has joined: the control plane, fenced since the bootstrap closed, can
+				// answer from here on, and the steps after this one need it to.
+				err = r.waitCP(ctx, cpURL, anchor)
 			}
 		}
 		if err != nil {
@@ -771,11 +1025,17 @@ func runUp(in upInput, stdin io.Reader, stdout, stderr io.Writer) int {
 	planPath := dir + ".plan.json"
 	if have, err := os.ReadFile(planPath); err == nil {
 		if !bytes.Equal(have, planRaw) {
-			return fail("%s already holds a different plan. A deployment is minted once; to stand up a different one, use a different -dir", planPath)
+			return fail("%s already holds a different plan. A deployment is minted once; to stand up a different one, use a different -dir. To move this one to another release, run: dsse-install -upgrade -dir %s -release-manifest <release-manifest.json>", planPath, dir)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fail("%v", err)
 	} else {
+		// A directory that already holds a deployment, and no record that -up stood it up, is a running
+		// deployment. Running the install steps over it changes nothing it holds and restarts its control plane
+		// and Edges, which interrupts every device for no reason anybody asked for.
+		if minted, _ := alreadyMinted(dir); minted {
+			return fail("%s already holds a deployment, and -up did not stand it up, so -up will not run the install steps over it. To move it to this release, run: dsse-install -upgrade -dir %s -release-manifest <release-manifest.json>", dir, dir)
+		}
 		if err := os.MkdirAll(filepath.Dir(planPath), 0o755); err != nil {
 			return fail("%v", err)
 		}
@@ -789,6 +1049,9 @@ func runUp(in upInput, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	steps, err := upSteps(plan, dir, planPath, organization, strings.TrimSpace(in.AdminEmail))
 	if err != nil {
+		return fail("%v", err)
+	}
+	if steps, err = withWhatANodeStartNeeds(steps, plan, dir, in, func(p string) bool { _, e := os.Stat(p); return e == nil }); err != nil {
 		return fail("%v", err)
 	}
 	// Packages for other machines hold private keys; they are written to a private directory beside the
@@ -859,6 +1122,10 @@ func runUp(in upInput, stdin io.Reader, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "%s: %d machine(s), %d steps. The log is %s\n", plan.Deployment, machines, len(steps), logPath)
 	stopped, err := executeUp(ctx, steps, in, dir, workDir, logPath, loadUpProgress(dir+".install-progress.json"), runner, logFile, stdout)
 	if err != nil {
+		if refused, ok := err.(nothingStarted); ok {
+			fmt.Fprintf(stderr, "dsse-install: %v\n", refused.error)
+			return 2
+		}
 		if strings.HasPrefix(err.Error(), "waiting for ") {
 			fmt.Fprintf(stderr, "dsse-install: %v\n", err)
 			return 3
@@ -868,6 +1135,8 @@ func runUp(in upInput, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		if steps[stopped].Kind != upFirstAdmin {
 			fmt.Fprintf(stderr, "%s\n", tailOf(logPath, 25))
+		} else {
+			fmt.Fprintf(stderr, "dsse-install: what this step printed is in %s.pending, and earlier attempts beside it (private files). If the administrator was created before the step failed, those files hold the only copy of the credentials: read them before running this again, and do not delete them.\n", steps[stopped].Capture)
 		}
 		fmt.Fprintf(stderr, "dsse-install: step %d of %d did not complete (%v). Steps already done are kept; correct the cause and run the same command again. The full log is %s\n",
 			stopped+1, len(steps), err, logPath)

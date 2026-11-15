@@ -211,6 +211,12 @@ if [ "\$uid" = "0" ]; then
 fi
 if [ -d "\$APP" ]; then
 	echo "==> removing the transparent proxy configuration and deactivating the extension (as console user \$uid)"
+	# The app turns steering off only for an administrator. This script is root; it says so in the one way a
+	# process running as the console user can check: a file only root can write, a moment old.
+	approval="/Library/Application Support/Dsse/admin-approval"
+	rm -rf "\$approval"; mkdir -m 0755 "\$approval"; chown root:wheel "\$approval"
+	( umask 022 && : > "\$approval/uninstall" )
+	trap 'rm -rf "/Library/Application Support/Dsse/admin-approval"' EXIT
 	if ! launchctl asuser "\$uid" sudo -u "#\$uid" "\$APP/Contents/MacOS/${app_exec}" --uninstall; then
 		echo "dsse-uninstall: the app could not remove the transparent proxy configuration or deactivate" >&2
 		echo "   its system extension. STOPPING with the" >&2
@@ -257,8 +263,16 @@ else
 			&& echo "     removed the keyless certificate \$(echo "\$sha" | cut -c1-16)"
 	done
 	rm -f "/Library/Application Support/Dsse/device_identity_pointer.json"
-	echo "   BEFORE INSTALLING AGAIN: remove this device in the Admin Console (Devices > \$cn > Remove device)"
-	echo "   and approve it again for a fresh enrolment token. The Edge holds the registration, not this Mac."
+	# The approval this Mac enrolled with is used. Left in place it is what the next install would try to
+	# enrol with, be refused, and fail closed on. Renamed, never deleted; the installer reads this name.
+	if [ -s "/Library/Application Support/Dsse/enrolment_token.txt" ]; then
+		mv "/Library/Application Support/Dsse/enrolment_token.txt" \
+		   "/Library/Application Support/Dsse/enrolment_token.retired-\$(date -u +%Y%m%dT%H%M%SZ).txt" \
+			&& echo "     retired the used enrolment token (kept, renamed)"
+	fi
+	echo "   BEFORE INSTALLING AGAIN: in the Admin Console, allow this device to enrol again (Devices > \$cn),"
+	echo "   or remove it, and make a fresh enrolment token. Put that token beside the installer. The installer"
+	echo "   refuses without one. The Edge holds the registration, not this Mac."
 	echo "   The rest of the configuration under /Library/Application Support/Dsse was kept."
 fi
 
@@ -370,6 +384,38 @@ fi
 echo "dsse-uninstall: done."
 UNINST
 chmod 755 "$root/Library/Application Support/Dsse/bin/dsse-uninstall"
+
+# The steering switch. Turning steering off takes an administrator; this is how one does it from a terminal.
+cat > "$root/Library/Application Support/Dsse/bin/dsse-steering" <<SWITCH
+#!/bin/sh
+# dsse-steering off | on — turn this Mac's steering (and its DNS through the Edge) off or back on.
+#
+# Run with sudo. Off needs an administrator: it takes this Mac out from under its organization's policy until
+# it is turned on again. The app, the enrolment and the trust material stay installed.
+set -eu
+APP="/Applications/${app_exec}.app/Contents/MacOS/${app_exec}"
+case "\${1:-}" in
+off) command="--disable" ;;
+on) command="--enable" ;;
+*) echo "usage: sudo dsse-steering off | on" >&2; exit 2 ;;
+esac
+[ "\$(id -u)" = "0" ] || { echo "dsse-steering: run with sudo" >&2; exit 1; }
+[ -x "\$APP" ] || { echo "dsse-steering: the agent is not installed" >&2; exit 1; }
+uid="\$(stat -f %u /dev/console 2>/dev/null || echo 0)"
+[ "\$uid" != "0" ] || { echo "dsse-steering: nobody is logged in at the console; the proxy configuration belongs to that user" >&2; exit 1; }
+if [ "\$command" = "--disable" ]; then
+	approval="/Library/Application Support/Dsse/admin-approval"
+	rm -rf "\$approval"; mkdir -m 0755 "\$approval"; chown root:wheel "\$approval"
+	( umask 022 && : > "\$approval/disable" )
+	trap 'rm -rf "/Library/Application Support/Dsse/admin-approval"' EXIT
+fi
+rc=0
+out="\$(launchctl asuser "\$uid" sudo -u "#\$uid" "\$APP" "\$command" 2>&1)" || rc=\$?
+printf '%s\n' "\$out" | grep -E "completed error=|REFUSED|did not connect|no Dsse" | sed 's/^.*DsseAgent: //' | sort -u || true
+[ "\$rc" -eq 0 ] && echo "dsse-steering: steering is \$1" || echo "dsse-steering: FAILED (exit \$rc)" >&2
+exit "\$rc"
+SWITCH
+chmod 755 "$root/Library/Application Support/Dsse/bin/dsse-steering"
 
 # ★ SIGN IT. Missed until Apple's notary service refused the package on 2026-08-10 with three errors against
 # this one file: not signed with a Developer ID certificate, no secure timestamp, no hardened runtime.
@@ -493,6 +539,27 @@ NEW_BUILD="__BUILD__"
 # from the same two values, here and in DsseDeviceHeartbeat.agentVersion().
 AGENT_VERSION="__AGENT_VERSION__"
 INTENT="/Library/Application Support/Dsse/rollback/rollback_intent.json"
+
+# What this script says when it refuses is the only explanation there is, and `installer` shows none of it:
+# the person sees "The upgrade failed" and the reason sits in /var/log/install.log. So everything written to
+# stderr is kept, passed on where it always went, and — when this script refuses — also printed on the
+# terminal `installer` was run from.
+DSSE_SAID="$(mktemp -t dsse-preinstall)" || DSSE_SAID=""
+if [ -n "$DSSE_SAID" ]; then
+	exec 3>&2 2>"$DSSE_SAID"
+	dsse_say_it_where_it_is_read() {
+		status=$?
+		exec 2>&3
+		cat "$DSSE_SAID" >&2 2>/dev/null || true
+		if [ "$status" -ne 0 ] && [ -s "$DSSE_SAID" ]; then
+			for t in $(ps -axo tty=,comm= 2>/dev/null | awk '$2 ~ /(^|\/)installer$/ && $1 != "??" { print $1 }' | sort -u); do
+				[ -w "/dev/$t" ] && cat "$DSSE_SAID" > "/dev/$t" 2>/dev/null || true
+			done
+		fi
+		rm -f "$DSSE_SAID"
+	}
+	trap dsse_say_it_where_it_is_read EXIT
+fi
 
 # --- OS gate (CompatGate equivalent) ---
 os="$(sw_vers -productVersion)"
@@ -709,6 +776,79 @@ except Exception:
 PYEOF
 }
 
+# dsse_token_value <file> — the token in <file> as it is ENROLLED WITH. postinstall writes
+# `read_text(encoding="utf-8").strip()` into the configuration, and this is that expression, run by the same
+# interpreter — not an approximation of it. A shell rendering of "strip" differed from Python's on blanks
+# outside ASCII and by locale, and a used token with such a blank in front of it was taken as a new one.
+# Every question asked here — is there one, is it a retired one — and what is stored are about this one string.
+dsse_token_value() {
+	[ -r "$1" ] || return 0
+	/usr/bin/python3 - "$1" <<'PYEOF' 2>/dev/null || true
+import pathlib, sys
+try:
+    sys.stdout.write(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip())
+except Exception:
+    pass
+PYEOF
+}
+
+# dsse_token_is_wellformed <file> — true when the token, as enrolled with, is printable ASCII with no blank in
+# it. The Console issues nothing else; anything else is refused rather than normalized further.
+dsse_token_is_wellformed() {
+	/usr/bin/python3 - "$1" <<'PYEOF' 2>/dev/null
+import pathlib, sys
+try:
+    v = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+except Exception:
+    sys.exit(1)
+sys.exit(0 if v and v.isascii() and v.isprintable() and not any(c.isspace() for c in v) else 1)
+PYEOF
+}
+
+# dsse_token_was_retired <file> — true when the token in <file> is one the uninstaller retired on this Mac.
+# A retired token is a used one. It is still lying in the folder the package was first opened from, and
+# offering it again is not a new approval.
+dsse_token_was_retired() {
+	offered="$(dsse_token_value "$1")"
+	[ -n "$offered" ] || return 1
+	for retired in "$CONFIG_DIR"/enrolment_token.retired-*.txt; do
+		[ -f "$retired" ] || continue
+		[ "$offered" = "$(dsse_token_value "$retired")" ] && return 0
+	done
+	return 1
+}
+
+# dsse_take_fresh_token <file> — install the token in <file> as this Mac's enrolment token: the value that was
+# compared, 0600 whatever was there before. Writing through an existing file keeps ITS mode, and an empty 0644
+# file would have left the secret readable.
+dsse_take_fresh_token() {
+	fresh="$(dsse_token_value "$1")"
+	rm -f "$CONFIG_DIR/enrolment_token.txt"
+	( umask 077 && printf '%s' "$fresh" > "$CONFIG_DIR/enrolment_token.txt" )
+	chmod 600 "$CONFIG_DIR/enrolment_token.txt"
+}
+
+# dsse_this_mac_holds_no_token — true when there is no current enrolment token on this Mac.
+dsse_this_mac_holds_no_token() {
+	[ -z "$(dsse_token_value "$CONFIG_DIR/enrolment_token.txt")" ]
+}
+
+# dsse_take_token_beside <folder> — for a Mac that keeps its profile: take a fresh token from beside the
+# package when this Mac holds none, or holds one that was retired (an earlier build could copy the used token
+# back; the new one must be able to replace it, or the refusal below would name a step that cannot work).
+# A valid token on file is never replaced this way. A retired one beside the package is refused by name.
+dsse_take_token_beside() {
+	[ -n "$(dsse_token_value "$1/enrolment_token.txt")" ] || return 0
+	dsse_this_mac_holds_no_token || dsse_token_was_retired "$CONFIG_DIR/enrolment_token.txt" || return 0
+	dsse_token_is_wellformed "$1/enrolment_token.txt" ||
+		profile_adoption_refuse "The enrolment_token.txt beside this installer is not a token the Console issues (it holds blanks or characters outside plain text). Copy the token again from the Console."
+	if dsse_token_was_retired "$1/enrolment_token.txt"; then
+		profile_adoption_refuse "The enrolment_token.txt beside this installer is the one this Mac already used; uninstalling retired it. In the Console, allow this device to enrol again (or remove it) and make a NEW token, and put that one beside the installer."
+	fi
+	dsse_take_fresh_token "$1/enrolment_token.txt"
+	echo "==> took the enrolment token placed beside this installer"
+}
+
 adopt_artefacts_from_beside_the_package() {
 	here_tenant=""
 	if [ -e "$CONFIG_DIR/install_profile.json" ]; then
@@ -719,7 +859,12 @@ adopt_artefacts_from_beside_the_package() {
 	[ -n "$pkg_path" ] || return 0
 	beside="$(dirname "$pkg_path")"
 	[ -d "$beside" ] || return 0
-	[ -e "$beside/install_profile.json" ] || return 0
+	if [ ! -e "$beside/install_profile.json" ]; then
+		# No profile beside the package: this Mac keeps the one it has. A new token on its own is how a Mac
+		# that was uninstalled is enrolled again in the same deployment.
+		[ -n "$here_tenant" ] && dsse_take_token_beside "$beside"
+		return 0
+	fi
 	beside_tenant="$(dsse_profile_tenant "$beside/install_profile.json")" ||
 		profile_adoption_refuse "Cannot read the supplied profile's organization. Check the profile and that /usr/bin/python3 can run; obtain verified setup files before retrying."
 	if [ -z "$here_tenant" ] && { [ -e "$CONFIG" ] || [ -e "$CONFIG_DIR/device_identity_pointer.json" ]; }; then
@@ -742,20 +887,27 @@ adopt_artefacts_from_beside_the_package() {
 	# handed the machine wins — and what was here is moved aside, by name, never deleted.
 	if [ -f "$CONFIG_DIR/install_profile.json" ] \
 	   && cmp -s "$beside/install_profile.json" "$CONFIG_DIR/install_profile.json"; then
-		return 0   # the same profile: a re-install, nothing to adopt
+		# The same profile: a re-install. The one thing to take is a fresh approval for a Mac that holds none —
+		# the uninstaller retires the used one, and a new token is how the Console lets the device enrol again.
+		dsse_take_token_beside "$beside"
+		return 0
 	fi
 	[ -r "$beside/profile_signing_key.txt" ] && [ -s "$beside/profile_signing_key.txt" ] ||
 		profile_adoption_refuse "The supplied profile needs its nonempty profile_signing_key.txt beside the package."
 	keep_token=0
-	if { [ ! -r "$beside/enrolment_token.txt" ] || [ -z "$(tr -d '\n\r' < "$beside/enrolment_token.txt")" ]; } \
-	   && [ "$beside_tenant" = "$here_tenant" ] && [ -r "$CONFIG_DIR/enrolment_token.txt" ] \
-	   && [ -n "$(tr -d '\n\r' < "$CONFIG_DIR/enrolment_token.txt")" ]; then
+	if [ -z "$(dsse_token_value "$beside/enrolment_token.txt")" ] \
+	   && [ "$beside_tenant" = "$here_tenant" ] && ! dsse_this_mac_holds_no_token \
+	   && ! dsse_token_was_retired "$CONFIG_DIR/enrolment_token.txt"; then
 		keep_token=1
 	fi
 	if [ "$keep_token" -eq 0 ]; then
-		[ -r "$beside/enrolment_token.txt" ] && [ -s "$beside/enrolment_token.txt" ] \
-		   && [ -n "$(tr -d '\n\r' < "$beside/enrolment_token.txt")" ] ||
+		[ -n "$(dsse_token_value "$beside/enrolment_token.txt")" ] ||
 			profile_adoption_refuse "The supplied profile needs a nonempty enrolment_token.txt beside the package."
+		dsse_token_is_wellformed "$beside/enrolment_token.txt" ||
+			profile_adoption_refuse "The enrolment_token.txt beside this installer is not a token the Console issues (it holds blanks or characters outside plain text). Copy the token again from the Console."
+		if dsse_token_was_retired "$beside/enrolment_token.txt"; then
+			profile_adoption_refuse "The enrolment_token.txt beside this installer is the one this Mac already used; uninstalling retired it. Make a NEW token in the Console and put that one beside the installer."
+		fi
 	fi
 	# A readable tenant inside payload_b64 is not an authenticated tenant. In
 	# particular, do not move a working profile/configuration/root before the
@@ -813,12 +965,32 @@ adopt_artefacts_from_beside_the_package() {
 	# The one-time approval is a credential: it lands mode 600, and a trailing newline from a browser download
 	# would otherwise be sent as part of the token.
 	if [ "$keep_token" -eq 0 ]; then
-		tr -d '\n\r' < "$beside/enrolment_token.txt" > "$CONFIG_DIR/enrolment_token.txt"
-		chmod 600 "$CONFIG_DIR/enrolment_token.txt"
+		dsse_take_fresh_token "$beside/enrolment_token.txt"
 		echo "    enrolment_token.txt       this device's one-time approval"
 	fi
 }
 adopt_artefacts_from_beside_the_package "${1:-}"
+
+# ★ A MAC THAT WAS UNINSTALLED HAS NO IDENTITY AND A USED APPROVAL. Its private key left with the system
+# extension, and the uninstaller retired the token it enrolled with. Installing over what is left would arm
+# steering on a device that cannot enrol: every connection refused, nothing on screen saying why, until
+# somebody disables it. Refused here, where the machine is still exactly as it was.
+if ls "$CONFIG_DIR"/enrolment_token.retired-*.txt >/dev/null 2>&1 \
+   && { dsse_this_mac_holds_no_token || dsse_token_was_retired "$CONFIG_DIR/enrolment_token.txt"; }; then
+	echo "" >&2
+	echo "REFUSING TO INSTALL: this Mac was uninstalled, and it has nothing to enrol with." >&2
+	echo "" >&2
+	echo "  Uninstalling removed this device's key. The deployment still lists the device, and the approval it" >&2
+	echo "  enrolled with has been used. Installed like this it would steer all traffic to a deployment that" >&2
+	echo "  refuses it, and this Mac would lose its network." >&2
+	echo "" >&2
+	echo "  In the Console: Devices > $(hostname -s) > allow it to enrol again (or remove it), then make a new" >&2
+	echo "  enrolment token for it. Put the new enrolment_token.txt in the SAME FOLDER as this installer and" >&2
+	echo "  install again; this Mac keeps its profile. (If the Console issued a new install_profile.json and" >&2
+	echo "  profile_signing_key.txt, put those there too.) The token this Mac used before is not accepted." >&2
+	echo "" >&2
+	exit 1
+fi
 
 refuse() {
 	echo "" >&2
@@ -1229,7 +1401,10 @@ if _exact_endpoints is not None:
                     or _address.is_multicast or _address.is_unspecified or _address in _seen_addresses):
                 raise ValueError("signed exact HTTPS passthrough endpoint has an unsafe or duplicate address")
             _seen_addresses.add(_address)
-token = pathlib.Path(token_path).read_text().strip()
+# The same expression preinstall compared with a retired token and stored: one string, start to end.
+token = pathlib.Path(token_path).read_text(encoding="utf-8").strip()
+if not (token and token.isascii() and token.isprintable() and not any(c.isspace() for c in token)):
+    raise SystemExit("postinstall: the enrolment token is not a token the Console issues; refusing to derive a configuration from it")
 tenant = (body.get("organization") or {}).get("tenant_id") or body.get("tenant_id") or ""
 door = body.get("transport_url") or ""
 device = __import__("socket").gethostname().split(".")[0]

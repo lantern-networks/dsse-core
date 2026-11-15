@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/model"
 )
 
@@ -20,7 +21,8 @@ import (
 // So a flow that is let through because the required authentication was verified is recorded as allowed, says
 // why, and keeps what the rule required. A flow that is HELD for authentication keeps authenticate_required.
 
-const reasonCodeAuthenticationSatisfied = "authentication_satisfied"
+// One spelling, shared with the code that reads it back to carry the completed sign-in into the connection.
+const reasonCodeAuthenticationSatisfied = decision.AuthenticationSatisfiedReasonCode
 
 func decisionAllowedByAuthentication(dec model.AccessDecision) model.AccessDecision {
 	out := dec

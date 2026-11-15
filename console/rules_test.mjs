@@ -180,3 +180,117 @@ test('a destination says whether it is an application, a network or a device, an
  assert.match(text,/"Device".{0,200}"DESKTOP-ACC3"/s);
  assert.doesNotMatch(text,/"Endpoint"/,'every destination here says what it is');
 });
+
+// A first rule used to stop at the destination picker: the destination had to be made on the Groups & Services
+// page before a rule could name it.
+test('a destination that is not in the list yet can be added from the rule editor and comes back selected',async()=>{
+ const make=(tag,attrs={},children=[])=>{
+  const node={tag,className:attrs.class||'',textContent:attrs.text||'',children:[],events:{},style:{},value:'',checked:false,disabled:false,
+   classList:{add(){},toggle(){}},
+   appendChild(child){this.children.push(child);return child},addEventListener(name,fn){this.events[name]=fn}};
+  for(const child of (Array.isArray(children)?children:[children])) if(child) node.appendChild(child);
+  return node;
+ };
+ const calls=[];
+ let answer={ok:true,status:200,body:{id:'ep-new',alias:'prod database',address:'10.0.0.10',kind:'network',source:'manual'}};
+ const c=vm.createContext({bl:b=>b.en,el:make,uiBadge:(label)=>make('span',{text:label}),apiFetch:async(...a)=>{calls.push(a);return answer}});
+ vm.runInContext(readFileSync(new URL('./rules.js',import.meta.url),'utf8'),c);
+ const find=(node,pred)=>{ if(pred(node)) return node; for(const child of node.children){const f=find(child,pred);if(f)return f} return null; };
+ const inputs=(node,out=[])=>{ if(node.tag==='input'&&node.className==='ui-input') out.push(node); node.children.forEach(ch=>inputs(ch,out)); return out; };
+
+ const source=c.subjectPicker('Source',[],{});
+ assert.equal(find(source.el,n=>/Add server/.test(n.textContent)),null,'only the destination offers it');
+
+ const picker=c.subjectPicker('Destination',[],{addServer:true});
+ const toggle=find(picker.el,n=>/Add server/.test(n.textContent));
+ const panel=find(picker.el,n=>n.className==='subject-add-panel');
+ assert.equal(panel.style.display,'none');
+ toggle.events.click();
+ assert.equal(panel.style.display,'');
+ const [nameIn,addrIn]=inputs(panel);
+ const add=find(panel,n=>n.tag==='button'&&n.textContent==='Add');
+ const problem=find(panel,n=>n.className.includes('subject-add-problem'));
+
+ await add.events.click();
+ assert.equal(calls.length,0,'nothing is sent without a name and an address');
+ assert.match(problem.textContent,/name and an address/);
+
+ nameIn.value='prod database'; addrIn.value='10.0.0.10';
+ await add.events.click();
+ assert.deepEqual(JSON.parse(JSON.stringify(calls[0])),['POST','/admin/assets/endpoints',{alias:'prod database',address:'10.0.0.10',kind:'network',source:'manual',steered:false}]);
+ assert.deepEqual([...picker.selected()],['ep-new']);
+ assert.equal(nameIn.value,'');
+
+ // What is plainly not an address is said so by the Console, and nothing is sent.
+ const sent=calls.length;
+ nameIn.value='x'; addrIn.value='not an address';
+ await add.events.click();
+ assert.equal(calls.length,sent);
+ assert.match(problem.textContent,/Give an IP address/);
+ // What the Console lets through and the server refuses is answered in the server's words.
+ answer={ok:false,status:400,body:{error:'address is not valid'}};
+ nameIn.value='x'; addrIn.value='10.0.0.0/33';
+ await add.events.click();
+ assert.equal(problem.textContent,'address is not valid');
+ assert.deepEqual([...picker.selected()],['ep-new'],'a refused server selects nothing new');
+});
+
+// Found on a Windows walk (2026-11-14): the Source list of a new rule offered "*.anthropic.com" and every other
+// built-in destination.
+test('the source list offers devices and the administrator\'s groups, and keeps what a rule already names',()=>{
+ const subjects=[
+  {id:'dev-1',label:'DESKTOP-ACC3',kind:'endpoint',what:'device'},
+  {id:'net-1',label:'prod database',kind:'endpoint',what:'network'},
+  {id:'app-1',label:'Wiki',kind:'endpoint',what:'application'},
+  {id:'grp-mine',label:'Finance laptops',kind:'group',builtIn:false},
+  {id:'grp-builtin',label:'Anthropic',kind:'group',builtIn:true},
+ ];
+ const ids=(list)=>JSON.stringify(list.map(s=>s.id));
+ assert.equal(ids(context.ruleSourceSubjects(subjects)),'["dev-1","grp-mine"]');
+ assert.equal(ids(context.ruleSourceSubjects(subjects,['net-1'])),'["dev-1","net-1","grp-mine"]','a rule that already names a network as its source still shows it');
+});
+
+// Found on the second Windows walk: a new rule was offered priority 100, the same as the starting
+// "everything allowed" rule, and saved as offered it was listed after that rule.
+test('a new rule is offered a priority ahead of the rules already written for the same kind of access',()=>{
+ const rules=[{plane:'egress',priority:100},{plane:'egress',priority:40},{plane:'east_west',priority:5}];
+ assert.equal(context.ruleDefaultPriority(rules,'egress'),30);
+ assert.equal(context.ruleDefaultPriority(rules,'east_west'),1);
+ assert.equal(context.ruleDefaultPriority([{plane:'egress',priority:100}],'egress'),90);
+ assert.equal(context.ruleDefaultPriority([],'egress'),100);
+ assert.equal(context.ruleDefaultPriority(null,'egress'),100);
+});
+
+test('the Console\'s first look at an address agrees with what a rule can match',()=>{
+ for(const ok of ['10.0.0.10','10.0.0.0/24','2001:db8::1','db.example.com','*.example.com','intranet','wiki.10.55.1.30.nip.io']) assert.equal(context.ruleAddressLooksLikeOne(ok),true,ok);
+ for(const bad of ['not an address','http://db.example.com','exa mple.com','','-bad.example.com','*']) assert.equal(context.ruleAddressLooksLikeOne(bad),false,bad);
+});
+
+// Review finding (2026-11-14): with "Any" selected, a server added from the picker showed as checked and the
+// rule would still have been saved for every destination.
+test('adding a server while Any is selected selects that server, and what is saved is what is shown',async()=>{
+ const make=(tag,attrs={},children=[])=>{
+  const node={tag,className:attrs.class||'',textContent:attrs.text||'',children:[],events:{},style:{},value:'',checked:false,disabled:false,
+   classList:{add(){},toggle(){}},
+   appendChild(child){this.children.push(child);return child},addEventListener(name,fn){this.events[name]=fn}};
+  for(const child of (Array.isArray(children)?children:[children])) if(child) node.appendChild(child);
+  return node;
+ };
+ const c=vm.createContext({bl:b=>b.en,el:make,uiBadge:(label)=>make('span',{text:label}),
+  apiFetch:async()=>({ok:true,status:200,body:{id:'ep-new',alias:'prod database',address:'10.0.0.10',kind:'network',source:'manual'}})});
+ vm.runInContext(readFileSync(new URL('./rules.js',import.meta.url),'utf8'),c);
+ const find=(node,pred)=>{ if(pred(node)) return node; for(const child of node.children){const f=find(child,pred);if(f)return f} return null; };
+ const inputs=(node,out=[])=>{ if(node.tag==='input'&&node.className==='ui-input') out.push(node); node.children.forEach(ch=>inputs(ch,out)); return out; };
+ const picker=c.subjectPicker('Destination',[{id:'ep-old',label:'old server',kind:'endpoint',what:'network'}],{addServer:true});
+ picker.setSelected(['*']);
+ assert.deepEqual([...picker.selected()],['*']);
+ const panel=find(picker.el,n=>n.className==='subject-add-panel');
+ const [nameIn,addrIn]=inputs(panel);
+ nameIn.value='prod database'; addrIn.value='10.0.0.10';
+ await find(panel,n=>n.tag==='button'&&n.textContent==='Add').events.click();
+ assert.deepEqual([...picker.selected()],['ep-new'],'the rule is saved for the server that shows as selected');
+ const anyRow=find(picker.el,n=>n.className.includes('subject-any'));
+ assert.equal(anyRow.children[0].checked,false,'Any is no longer shown as selected');
+ const summary=find(picker.el,n=>n.className==='subject-summary');
+ assert.match(summary.textContent,/prod database/);
+});

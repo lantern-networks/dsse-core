@@ -170,7 +170,14 @@ func TestGuardEncryptedSpoolFailureDoesNotReleasePendingBytes(t *testing.T) {
 				case "write":
 					_ = g.spool.file.Close()
 				case "decrypt":
-					_, _ = g.spool.file.WriteAt([]byte{0xff}, spillHeaderSize+1)
+					// Flip the byte rather than set it: one ciphertext byte in 256 is already 0xff, and writing
+					// 0xff over it damaged nothing, so the body was correctly released and this test failed.
+					var b [1]byte
+					if _, err := g.spool.file.ReadAt(b[:], spillHeaderSize+1); err != nil {
+						t.Errorf("read the spilled byte to damage: %v", err)
+						return
+					}
+					_, _ = g.spool.file.WriteAt([]byte{^b[0]}, spillHeaderSize+1)
 				}
 			}
 			var sink bytes.Buffer

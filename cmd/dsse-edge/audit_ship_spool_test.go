@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -206,6 +207,10 @@ func TestRemoteAuditShipperReplaysSpoolOnStartup(t *testing.T) {
 	var bodies []string
 	var got int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/batch") {
+			http.NotFound(w, r) // a receiver with no many-records route, so each record arrives on its own
+			return
+		}
 		b, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		bodies = append(bodies, string(b))

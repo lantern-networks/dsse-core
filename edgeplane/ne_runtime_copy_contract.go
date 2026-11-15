@@ -55,6 +55,13 @@ type NetworkExtensionRuntimeCopyTCPRoute struct {
 	// only distinguishing evidence was which Edge node happened to serve it. Naming the builder costs a
 	// string and ends the guessing.
 	BuiltBy string
+	// ConnectorAccess is true when Connector Access decided this flow when it opened — its destination is on
+	// a registered network — and let it through. A request read out of the flow after decryption belongs
+	// to the same plane; see WithConnectorAccessAtOpen.
+	ConnectorAccess bool
+	// ConnectorSignInDoneForRule is the Connector Access rule whose sign-in was completed before this flow
+	// was let through, or "". It is evidence about that rule only.
+	ConnectorSignInDoneForRule string
 }
 
 type NetworkExtensionRuntimeCopyTCPDialer interface {

@@ -68,7 +68,7 @@ func steerInteractiveEastWestFamily(family string) bool {
 // steerDecisionRequest builds a minimal decision request for a steered flow to host:port. Identity /
 // device / posture enrichment is a later slice; W3 decides on destination + port-derived service family.
 func steerDecisionRequest(tenantID, host string, port int) model.DecisionRequest {
-	return model.DecisionRequest{
+	req := model.DecisionRequest{
 		TenantID:        strings.TrimSpace(tenantID),
 		ActorType:       "human",
 		Destination:     strings.TrimSpace(host),
@@ -81,6 +81,16 @@ func steerDecisionRequest(tenantID, host string, port int) model.DecisionRequest
 		// policies that do not constrain steering_mode still match.
 		SteeringMode: "steer",
 	}
+	// ★★★ A DESTINATION THE DEVICE NAMED IS DECIDED BY ITS NAME (2026-11-15, measured on the 0.4.3
+	// acceptance). A rule written for a name compiles to an fqdn condition, and the fqdn condition reads FQDN —
+	// which this request left empty when the device sent a name instead of an address, as the macOS agent does.
+	// So the flow fell past the deny written for example.org to the next rule: an "allow, not inspected" rule
+	// let it through raw, and only an inspecting catch-all ever reached the deny, one stage later, on the
+	// decrypted request. The Edge dials the name itself, so the name IS where the flow goes.
+	if name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), "."); name != "" && net.ParseIP(name) == nil {
+		req.FQDN = name
+	}
+	return req
 }
 
 // InterceptAll — make every steered (allowed) outbound flow subject to the SAME Edge TLS interception

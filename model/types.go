@@ -754,11 +754,22 @@ type DecisionRequest struct {
 	// Connector route. It is intentionally absent from JSON: a client must not be
 	// able to move its request from Internet Access to Connector Access by claiming
 	// a Connector ID.
-	ConnectorRouteVerified bool   `json:"-"`
-	SourceIP               string `json:"source_ip"`
-	SourcePort             int    `json:"source_port"`
-	Destination            string `json:"destination"`
-	DestinationIP          string `json:"destination_ip"`
+	ConnectorRouteVerified bool `json:"-"`
+	// ConnectorFlowFromDevice is set only by the Edge, on a flow an enrolled device's tunnel carried to a
+	// Connector route. While Connector Access is only observing, these are the flows it observes and lets
+	// through. A browser reaching a published application through the Portal is not one of them: nothing
+	// has identified a device there, and its access is decided by the application's own policies.
+	ConnectorFlowFromDevice bool `json:"-"`
+	// ConnectorSignInDoneForRule is set only by the Edge, on a request that travels inside a connection
+	// which was opened only after the sign-in a Connector Access rule asks for was completed. It holds that
+	// rule's id. A request inside the connection is not asked to sign in again for THAT rule. It says
+	// nothing about any other rule: a connection let through by a plain allow, or while observing, has
+	// completed no sign-in and carries nothing here.
+	ConnectorSignInDoneForRule string `json:"-"`
+	SourceIP                   string `json:"source_ip"`
+	SourcePort                 int    `json:"source_port"`
+	Destination                string `json:"destination"`
+	DestinationIP              string `json:"destination_ip"`
 	// DestinationResolvedIP is an address the EDGE resolved for this destination's name, recorded so plane
 	// membership can be decided about a host given only as a name.
 	//

@@ -1510,6 +1510,9 @@ func BuildNetworkExtensionLabTLSForwardRequest(req *http.Request, route NetworkE
 	if route.TenantID != "" {
 		forwardCtx = WithFlowTenant(forwardCtx, route.TenantID)
 	}
+	if route.ConnectorAccess {
+		forwardCtx = WithConnectorAccessAtOpenAfterSignIn(forwardCtx, route.ConnectorSignInDoneForRule)
+	}
 	forwardReq = forwardReq.WithContext(forwardCtx)
 	forwardReq.Header.Set(EdgeSWGHTTPEgressTargetURLHeader, target.String())
 	forwardReq.Header.Set(EdgeSWGHTTPEgressNERuntimeHeader, "runtime_copy_lab_tls")

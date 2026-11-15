@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
@@ -31,7 +32,11 @@ type Store struct {
 	// else just finished already carried it. Lock order: saveMu, then mu. Never the reverse.
 	changes      uint64
 	saveMu       sync.Mutex
-	savedThrough uint64
+	savedThrough atomic.Uint64 // written under saveMu; read anywhere
+	// factChange is, per device, the change number of the last change to a FACT about it — anything but when it
+	// was seen. Until a confirmed save has carried that number, the fact is in memory only, and a heartbeat that
+	// repeats it has not been saved either, whatever the comparison with memory says (guarded by mu).
+	factChange map[string]uint64
 	// A heartbeat that says nothing new except "I am still here" does not wait for a save at all: one deferred
 	// save, at most livenessFlushAfter later, carries every such heartbeat at once. See Heartbeat.
 	livenessTimer      *time.Timer
@@ -85,7 +90,8 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 	defer s.mu.Unlock()
 	// What this store holds when a persister is attached is not owed to that persister: exactly as before, the
 	// first save is the next change.
-	s.savedThrough = s.changes
+	s.savedThrough.Store(s.changes)
+	s.factChange = nil
 	if p == nil {
 		s.persister = nil
 		return nil
@@ -134,10 +140,19 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 //
 // The error is returned now. It is still reported through OnPersistError, because a caller that discards it
 // should not also silence the log.
-func (s *Store) persistLocked() error {
+func (s *Store) persistLocked() error { return s.persistFactLocked("") }
+
+// persistFactLocked is persistLocked for a change to one device, which it records as that device's latest fact.
+func (s *Store) persistFactLocked(deviceID string) error {
 	s.changes++
 	if s.persister == nil {
 		return nil
+	}
+	if deviceID != "" {
+		if s.factChange == nil {
+			s.factChange = map[string]uint64{}
+		}
+		s.factChange[deviceID] = s.changes
 	}
 	mine := s.changes
 	s.mu.Unlock()
@@ -153,7 +168,7 @@ func (s *Store) persistLocked() error {
 func (s *Store) saveThrough(through uint64) error {
 	s.saveMu.Lock()
 	defer s.saveMu.Unlock()
-	if s.savedThrough >= through {
+	if s.savedThrough.Load() >= through {
 		return nil
 	}
 	s.mu.RLock()
@@ -179,14 +194,14 @@ func (s *Store) saveThrough(through uint64) error {
 		// may already have replaced the file; callers must not infer that an error means no bytes were saved.
 		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			log.Printf("device inventory persist: saved, but NOT atomically — %v", err)
-			s.savedThrough = carried
+			s.savedThrough.Store(carried)
 			return nil
 		}
 		err = fmt.Errorf("save device inventory snapshot: %w", err)
 		reportPersistError(err)
 		return err
 	}
-	s.savedThrough = carried
+	s.savedThrough.Store(carried)
 	return nil
 }
 
@@ -315,7 +330,7 @@ func (s *Store) Register(dev model.Device, policyBundle model.PolicyBundle, now 
 	}
 	s.devices[dev.ID] = dev
 	answer := detachMetadata(dev) // before the lock is lent to the save
-	if err := s.persistLocked(); err != nil {
+	if err := s.persistFactLocked(dev.ID); err != nil {
 		// The device IS registered in memory and the caller is told the write did not last. Reporting success
 		// here is what let a revoked device come back enrolled after a restart.
 		return answer, err
@@ -421,11 +436,25 @@ func (s *Store) Heartbeat(heartbeat model.DeviceHeartbeat, policyBundle model.Po
 	if factsErr == nil {
 		if factsAfter, err := factsOf(dev); err == nil && bytes.Equal(factsBefore, factsAfter) {
 			s.saveLivenessLaterLocked()
+			// ★ THE SAME AS MEMORY IS NOT THE SAME AS SAVED. The comparison above is with what this store holds,
+			// and a fact can be held without being on disk: the save that carried it failed, or is still being
+			// written while the lock is lent. A heartbeat repeating such a fact is answered when that fact is
+			// saved, and told when it could not be — exactly as the heartbeat that first reported it was.
+			if at, recorded := s.factChange[dev.ID]; recorded && s.persister != nil {
+				if at > s.savedThrough.Load() {
+					answer := detachMetadata(dev)
+					s.mu.Unlock()
+					err := s.saveThrough(at)
+					s.mu.Lock()
+					return answer, err
+				}
+				delete(s.factChange, dev.ID)
+			}
 			return detachMetadata(dev), nil
 		}
 	}
 	answer := detachMetadata(dev) // before the lock is lent to the save: what THIS heartbeat made of the device
-	if err := s.persistLocked(); err != nil {
+	if err := s.persistFactLocked(dev.ID); err != nil {
 		// The device IS registered in memory and the caller is told the write did not last. Reporting success
 		// here is what let a revoked device come back enrolled after a restart.
 		return answer, err
@@ -477,7 +506,7 @@ func (s *Store) ApplyRiskSignal(deviceID string, sig model.RiskSignal, now time.
 	}
 	s.devices[deviceID] = dev
 	answer := detachMetadata(dev) // before the lock is lent to the save
-	err := s.persistLocked()
+	err := s.persistFactLocked(deviceID)
 	return answer, true, high, err
 }
 

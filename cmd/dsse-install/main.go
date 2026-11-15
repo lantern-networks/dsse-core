@@ -235,7 +235,21 @@ func main() {
 	printNames := flag.Bool("print-names", false, "with -up: print the deployment's names as hosts-file lines, and do nothing else")
 	overSSH := flag.Bool("ssh", false, "with -up: copy each other machine's package to it and start it there over SSH, as the printed order's scp and remote commands do. Without it, -up stops at each other machine and tells you the one command to run there")
 	confirmed := flag.String("confirmed", "", "with -up, where it cannot ask: comma-separated machines whose one command you have already run")
+	upgrade := flag.Bool("upgrade", false, "move this machine to another release: write that release's images and generated files into -dir, fetch the images, replace this machine's services and wait for them. Takes -dir and -release-manifest. Authorities, certificates, secrets and data are not touched; the files it replaces are kept in -dir/upgrade-kept. On a deployment of several machines, run it on one machine at a time")
+	upgradeProject := flag.String("project", "", "with -upgrade: the compose project of this machine's services, when none is running for -upgrade to find")
 	flag.Parse()
+	if *upgrade {
+		timeout := *setupTimeout
+		if !flagWasSet("setup-timeout") {
+			timeout = 30 * time.Minute // image pulls included
+		}
+		os.Exit(runUpgrade(upgradeInput{Dir: *dir, Manifest: *releaseManifest, Project: *upgradeProject, Timeout: timeout},
+			realUpgradeDeps(), os.Stdout, os.Stderr))
+	}
+	if *upgradeProject != "" {
+		fmt.Fprintln(os.Stderr, "-project belongs to -upgrade")
+		os.Exit(1)
+	}
 	if *up {
 		timeout := *setupTimeout
 		if !flagWasSet("setup-timeout") {
@@ -243,7 +257,8 @@ func main() {
 		}
 		os.Exit(runUp(upInput{Plan: *planFile, Deployment: *deploymentName, Address: *machineAddress, AdminEmail: *adminEmail,
 			Organization: *orgName, Dir: *dir, Manifest: *releaseManifest, AgentPublisher: *agentPublisher,
-			PostgresMajor: *postgresMajor, PrintNames: *printNames, SSH: *overSSH, Confirmed: *confirmed, Timeout: timeout},
+			PostgresMajor: *postgresMajor, PrintNames: *printNames, SSH: *overSSH, Confirmed: *confirmed, Timeout: timeout,
+			PortalCertificate: *installPortal, PortalKey: *portalKey, PortalCA: *portalCA},
 			os.Stdin, os.Stdout, os.Stderr))
 	}
 	if *deploymentName != "" || *machineAddress != "" || *releaseManifest != "" || *agentPublisher != "" || *postgresMajor != 0 || *printNames || *overSSH || *confirmed != "" {

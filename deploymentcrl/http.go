@@ -28,7 +28,7 @@ func Handler(publicDir string, root *x509.Certificate, issuers []*x509.Certifica
 			return nil, err
 		}
 		u, _ := url.Parse(origin)
-		allowedHosts[strings.ToLower(u.Host)] = true
+		allowedHosts[httpHostKey(u.Host)] = true
 	}
 	if len(allowedHosts) == 0 {
 		return nil, fmt.Errorf("no deployment CRL HTTP host configured")
@@ -54,7 +54,7 @@ func Handler(publicDir string, root *x509.Certificate, issuers []*x509.Certifica
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if !allowedHosts[strings.ToLower(r.Host)] || r.URL.RawQuery != "" || r.URL.Fragment != "" || r.URL.RawPath != "" {
+		if !allowedHosts[httpHostKey(r.Host)] || r.URL.RawQuery != "" || r.URL.Fragment != "" || r.URL.RawPath != "" {
 			http.NotFound(w, r)
 			return
 		}

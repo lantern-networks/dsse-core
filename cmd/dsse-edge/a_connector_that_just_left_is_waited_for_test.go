@@ -101,18 +101,97 @@ func TestAFlowForAConnectorThatJustLeftIsHeldUntilTheDeploymentSaysWhereItWent(t
 	}
 }
 
-// ★ A CONNECTOR THIS NODE NEVER HELD IS REFUSED AT ONCE. "No tunnel here" is a move only where this node saw
-// the tunnel end; anywhere else it is the ordinary refusal and must not start costing every flow a wait.
-func TestAConnectorThisNodeDidNotJustLoseIsRefusedAtOnce(t *testing.T) {
-	departures := newConnectorDepartureLog(5*time.Second, 0)
+// ★★★ A NODE THAT DID NOT SEE THE CONNECTOR LEAVE LEARNS FROM ITS OWN REFUSAL (2026-11-13, measured while a
+// Region was upgraded: thirty seconds of refusals on Edges that were restarted or were in another Region). The
+// flow that finds no way to the connector asks early, is held, and goes where the deployment then says.
+func TestAFlowThatFindsNoWayToAConnectorAsksWhereItIsAndIsCarriedThere(t *testing.T) {
+	departures := newConnectorDepartureLog(5*time.Second, 10*time.Millisecond)
+	reg, dialer, direct := departedConnectorScene(t, departures)
+	// Nothing told this node the connector left. Whoever answers the early question says where it is.
+	go func() {
+		select {
+		case <-departures.hurryRequests():
+		case <-time.After(3 * time.Second):
+			t.Error("the refusal did not ask the control plane early")
+			return
+		}
+		if _, err := reg.RecordAttachedRegion("tenant-a", "conn-home", "region-a"); err != nil {
+			t.Errorf("record where it went: %v", err)
+		}
+		departures.learned("conn-home")
+	}()
+	conn, err := openCorpHost(dialer)
+	if err != nil {
+		t.Fatalf("the flow was refused although the deployment knew where the connector was: %v", err)
+	}
+	defer conn.Close()
+	if direct.called {
+		t.Fatal("a destination a connector fronts was dialled directly")
+	}
+}
+
+// ★ A CONNECTOR THAT IS GONE COSTS ONE WAIT, THEN REFUSALS AT ONCE. Traffic for it must not become a stream of
+// questions or a wait on every flow: after a wait that learned nothing, refusals start nothing for a while, and
+// that while doubles.
+func TestAConnectorThatIsGoneIsWaitedForOnceAndThenRefusedAtOnce(t *testing.T) {
+	const window = 200 * time.Millisecond
+	departures := newConnectorDepartureLog(window, 0)
 	_, dialer, _ := departedConnectorScene(t, departures)
 
 	started := time.Now()
 	if _, err := openCorpHost(dialer); err == nil {
 		t.Fatal("a connector with no tunnel here and a catalogue naming this region was served")
 	}
+	if waited := time.Since(started); waited < window-50*time.Millisecond || waited > window+time.Second {
+		t.Fatalf("the first refusal came after %s; it should come when the %s wait is over", waited, window)
+	}
+	for i := 0; i < 5; i++ {
+		started = time.Now()
+		if _, err := openCorpHost(dialer); err == nil {
+			t.Fatal("served")
+		}
+		if waited := time.Since(started); waited > window/2 {
+			t.Fatalf("refusal %d after the fruitless wait took %s; it should be immediate", i+1, waited)
+		}
+	}
+	// The quiet after the first fruitless wait is one window; after the second it is two.
+	departures.mu.Lock()
+	first := departures.quiet["conn-home"]
+	departures.mu.Unlock()
+	time.Sleep(time.Until(first) + 20*time.Millisecond)
+	if _, err := openCorpHost(dialer); err == nil { // waits a second time, learns nothing
+		t.Fatal("served")
+	}
+	departures.mu.Lock()
+	second, fruitless := departures.quiet["conn-home"], departures.fruitless["conn-home"]
+	departures.mu.Unlock()
+	if fruitless != 2 || time.Until(second) < window {
+		t.Fatalf("after two fruitless waits: counted %d, quiet for another %s (want more than %s)", fruitless, time.Until(second), window)
+	}
+}
+
+// ★ A BOUNDARY THE ORGANIZATION DREW IS NOT A QUESTION. Learning where the connector is cannot change that
+// refusal, so it starts nothing and is answered at once.
+func TestARefusalForResidencyAsksNothing(t *testing.T) {
+	departures := newConnectorDepartureLog(5*time.Second, 0)
+	reg, dialer, _ := departedConnectorScene(t, departures)
+	// The connector is in region-a, and this organization keeps its traffic in region-b.
+	if _, err := reg.RecordAttachedRegion("tenant-a", "conn-home", "region-a"); err != nil {
+		t.Fatal(err)
+	}
+	dialer.Residency = func(string) ([]string, error) { return []string{"region-b"}, nil }
+	started := time.Now()
+	if _, err := openCorpHost(dialer); err == nil {
+		t.Fatal("a connector outside the organization's boundary was served")
+	}
 	if waited := time.Since(started); waited > time.Second {
-		t.Fatalf("a refusal that has nothing to wait for took %s", waited)
+		t.Fatalf("a residency refusal took %s", waited)
+	}
+	departures.mu.Lock()
+	_, waiting := departures.left["conn-home"]
+	departures.mu.Unlock()
+	if waiting {
+		t.Fatal("a residency refusal started a wait")
 	}
 }
 

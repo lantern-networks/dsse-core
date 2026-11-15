@@ -91,11 +91,14 @@ func (a *tenantInterceptionAuthority) Generation() uint64 {
 }
 
 type storedTenantInterceptionIssuer struct {
-	TenantID    string                            `json:"tenant_id"`
-	RootCRL     []byte                            `json:"root_crl,omitempty"`
-	IssuingCRL  []byte                            `json:"issuing_crl,omitempty"`
-	CRLBaseURL  string                            `json:"crl_base_url,omitempty"`
-	Delegations map[string]interceptionDelegation `json:"delegations,omitempty"`
+	TenantID string `json:"tenant_id"`
+	RootCRL  []byte `json:"root_crl,omitempty"`
+	// RootKeyNotKept marks an authority this deployment made: the root's key was discarded once it had signed
+	// the issuing certificate and one sealed list. Only such a row has its root list validated as sealed.
+	RootKeyNotKept bool                              `json:"root_key_not_kept,omitempty"`
+	IssuingCRL     []byte                            `json:"issuing_crl,omitempty"`
+	CRLBaseURL     string                            `json:"crl_base_url,omitempty"`
+	Delegations    map[string]interceptionDelegation `json:"delegations,omitempty"`
 	// RootPEM is the customer's root. Held only so the material handed to an Edge can carry the chain up to
 	// what devices actually trust; nothing here ever signs with it, because its key is not here.
 	RootPEM string `json:"root_pem"`
@@ -193,6 +196,18 @@ func (a *tenantInterceptionAuthority) saveLocked() error {
 // not a CA, or whose key does not match it, would produce leaves every device refuses — and the refusal would
 // arrive at the browser, not here.
 func (a *tenantInterceptionAuthority) Import(tenant, rootPEM, issuingPEM, issuingKeyPEM string, rootCRLs ...[]byte) (*storedTenantInterceptionIssuer, error) {
+	return a.importAuthority(tenant, rootPEM, issuingPEM, issuingKeyPEM, false, rootCRLs...)
+}
+
+// ImportMadeHere stores an authority this deployment has just made, whose root key no longer exists.
+func (a *tenantInterceptionAuthority) ImportMadeHere(tenant, rootPEM, issuingPEM, issuingKeyPEM string, sealedRootCRL []byte) (*storedTenantInterceptionIssuer, error) {
+	if len(sealedRootCRL) == 0 {
+		return a.importAuthority(tenant, rootPEM, issuingPEM, issuingKeyPEM, false)
+	}
+	return a.importAuthority(tenant, rootPEM, issuingPEM, issuingKeyPEM, true, sealedRootCRL)
+}
+
+func (a *tenantInterceptionAuthority) importAuthority(tenant, rootPEM, issuingPEM, issuingKeyPEM string, rootKeyNotKept bool, rootCRLs ...[]byte) (*storedTenantInterceptionIssuer, error) {
 	key := strings.TrimSpace(tenant)
 	if key == "" {
 		return nil, fmt.Errorf("an organization must be named")
@@ -247,7 +262,7 @@ func (a *tenantInterceptionAuthority) Import(tenant, rootPEM, issuingPEM, issuin
 	if len(rootCRLs) == 1 {
 		rootCRL = rootCRLs[0]
 	}
-	crlBase, err := authorityCRLBase(root, issuing, strings.TrimSpace(tenant), rootCRL, now)
+	crlBase, err := authorityCRLBase(root, issuing, strings.TrimSpace(tenant), rootCRL, now, rootKeyNotKept)
 	if err != nil {
 		return nil, err
 	}
@@ -256,6 +271,7 @@ func (a *tenantInterceptionAuthority) Import(tenant, rootPEM, issuingPEM, issuin
 		IssuingCertPEM: strings.TrimSpace(issuingPEM) + "\n",
 		IssuingKeyPEM:  strings.TrimSpace(issuingKeyPEM) + "\n",
 		ImportedAt:     now.Format(time.RFC3339), RootCRL: append([]byte(nil), rootCRL...), CRLBaseURL: crlBase,
+		RootKeyNotKept: rootKeyNotKept && crlBase != "",
 	}
 	if crlBase != "" {
 		if err := signIssuingCRL(row, now, false); err != nil {
@@ -425,7 +441,7 @@ func (a *tenantInterceptionAuthority) IssueFor(tenant, edgeID string, ttl time.D
 		template.NotAfter = root.NotAfter
 	}
 	if row.CRLBaseURL != "" {
-		bases, baseErr := authorityCRLBases(root, issuing, row.TenantID, row.RootCRL, now)
+		bases, baseErr := authorityCRLBases(root, issuing, row.TenantID, row.RootCRL, now, row.RootKeyNotKept)
 		if baseErr != nil {
 			return tenantInterceptionMaterial{}, baseErr
 		}

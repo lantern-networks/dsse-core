@@ -552,15 +552,25 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			}
 		}
 		now := time.Now()
+		requestedEdgeURL := strings.TrimSpace(request.EdgeURL)
 		enrollEdgeURL := strings.TrimSpace(config.ConnectorEnrollmentEdgeURL)
-		if strings.TrimSpace(request.EdgeURL) != "" {
-			enrollEdgeURL = strings.TrimSpace(request.EdgeURL)
+		if requestedEdgeURL != "" {
+			enrollEdgeURL = requestedEdgeURL
 		}
 		// The bootstrap URL carries the first CSR, before the connector can poll a
 		// durable profile. Resolve it and the failover list from the same tenant-
 		// scoped region snapshot; reject an out-of-boundary override before the
 		// Site bootstrap secret is rotated.
 		enrollEdgeURL, enrollmentEndpoints, endpointErr := connectorEnrollmentMaterial(tenantID, enrollEdgeURL)
+		// ★★★ THIS NODE'S OWN DOOR IS NOT AN OVERRIDE (2026-11-15, measured on a three-region deployment). The
+		// Console asks with an empty body, and this node's default is the door of the region it runs in. For an
+		// organization held to region-a, that default was refused as out of bounds whenever the request was
+		// answered in region-c — so "Add connector" worked only while leadership happened to sit in one of the
+		// organization's regions. Only a door the operator NAMED is refused; otherwise the organization's own
+		// first door is the answer.
+		if endpointErr != nil && requestedEdgeURL == "" {
+			enrollEdgeURL, enrollmentEndpoints, endpointErr = connectorEnrollmentMaterial(tenantID, "")
+		}
 		if endpointErr != nil {
 			writeError(w, http.StatusConflict, endpointErr)
 			return

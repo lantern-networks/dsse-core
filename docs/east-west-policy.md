@@ -51,6 +51,46 @@ East-West layer; other admission, routing, or security checks can still reject a
 | Warn | Allows the flow and records/notifies what would be enforced |
 | Enforce | Denies or requires authentication as configured |
 
+Which layer decides a flow depends on where it goes, not on the posture. A flow to a
+registered network — a destination a Connector route carries — is Connector Access;
+everything else is Internet Access. An Internet Access rule — its action and its DLP
+setting — does not apply to a flow to a registered network in any posture. Connector
+Access rules have no DLP setting.
+
+| Posture | Access-log row for a flow to a registered network |
+|---|---|
+| OBSERVE | Allowed; decided by Connector Access (observed, not enforcing) |
+| PARTIAL / FULL ENFORCE, a rule matched | Names the Connector Access rule that decided |
+| PARTIAL / FULL ENFORCE, no rule matched | Decided by Connector Access (allowed in Partial, denied in Full) |
+
+Every connection to a registered network is recorded, allowed or not. When the
+deployment decrypts HTTPS, each request inside such a connection is recorded as
+Connector Access too. A rule that requires sign-in is satisfied once, when the
+connection opens; a rule that denies applies to every request.
+
+The table above is about flows an enrolled device sends through its tunnel. Two
+cases stay with the rules that decided them before, while the posture is OBSERVE:
+
+- A lateral protocol (SSH, RDP, SMB and similar) to a private address that no
+  Connector route carries is decided by the Internet Access rules.
+- A browser that reaches a published application through the Portal, without an
+  enrolled device, is admitted only by that application's access policy. Observing
+  never opens a published application to an unidentified visitor.
+
+From PARTIAL ENFORCE on, Connector Access rules decide both.
+
+Two things to check before moving a posture toward enforcement:
+
+- **A rule matches a flow by the destination the device sent.** A rule whose destination is a
+  published application matches flows that name the application's host. A device that
+  reaches the same application by address is a different observed flow; it is matched by
+  a rule whose destination is the Site's network, or by adopting that flow from the
+  Observations tab. The confirmation shown before FULL ENFORCE counts the observed flows no
+  rule covers; they will be denied.
+- **A decision is made when a connection opens.** Changing the posture or a rule does not close
+  connections that are already open; a browser may keep using one for a while. Test a change
+  with a new connection.
+
 **FULL ENFORCE does not turn a Warn rule into a blocking rule.** Review both the
 posture banner and each rule's stage. A rule's Active/Disabled status is another
 independent setting. Lower priority numbers are evaluated first.

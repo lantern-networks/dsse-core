@@ -451,6 +451,22 @@ func connectorApplicationReturnTo(r *http.Request) (string, bool) {
 }
 
 func connectorForApplication(ctx context.Context, r *http.Request, registry connectorRegistryStore, catalog appcatalog.RuntimeStore, tenantID, applicationID string) (model.ConnectorRegistration, bool, error) {
+	return connectorForApplicationPreferring(ctx, r, registry, catalog, tenantID, applicationID, nil)
+}
+
+// connectorForApplicationPreferring answers with a connector that fronts the application, and among several
+// that do, with the first one `reachable` says this node can reach now.
+//
+// A site usually has more than one connector, and the registry keeps the registration of one that has stopped
+// until an administrator removes it: it is not "offline" there, only silent. Taking whichever registration the
+// list gave first could therefore answer with the stopped one while its neighbour, connected and fronting the same application,
+// was never looked at — "Test reachability" said the tunnel was not connected, and a browser request for the
+// application was sent down a path with nothing on it.
+//
+// When none is reachable an eligible one is still the answer, so the caller reports what is wrong with
+// a named connector instead of "no connector". A connector the request names itself is never traded for
+// another. A nil `reachable` expresses no preference.
+func connectorForApplicationPreferring(ctx context.Context, r *http.Request, registry connectorRegistryStore, catalog appcatalog.RuntimeStore, tenantID, applicationID string, reachable func(model.ConnectorRegistration) bool) (model.ConnectorRegistration, bool, error) {
 	// An explicit disabled catalog entry overrides both enumerated connector apps
 	// and published-group fallback. Keep absent catalog entries compatible with
 	// existing file-defined applications.
@@ -492,15 +508,20 @@ func connectorForApplication(ctx context.Context, r *http.Request, registry conn
 	if err != nil {
 		return model.ConnectorRegistration{}, false, err
 	}
+	var fronting []model.ConnectorRegistration
 	for _, conn := range connectors {
 		if connectorRouteUnavailable(conn) {
 			continue
 		}
 		for _, candidate := range conn.ApplicationIDs {
 			if candidate == applicationID {
-				return conn, true, nil
+				fronting = append(fronting, conn)
+				break
 			}
 		}
+	}
+	if conn, ok := firstReachableConnector(fronting, reachable); ok {
+		return conn, true, nil
 	}
 	// Connector-group fallback (no explicit connector_id): a connector-discovered private app fronts behind a
 	// connector GROUP, not an enumerated application_ids list. The approve-private-app path stamps the published
@@ -509,16 +530,62 @@ func connectorForApplication(ctx context.Context, r *http.Request, registry conn
 	// fronts it. Fail-closed: requires a published entry with a non-empty group AND a live connector in exactly
 	// that group.
 	if group := publishedConnectorGroupForApplication(ctx, catalog, tenantID, applicationID); group != "" {
+		var inGroup []model.ConnectorRegistration
 		for _, conn := range connectors {
 			if connectorRouteUnavailable(conn) {
 				continue
 			}
 			if strings.TrimSpace(conn.ConnectorGroupID) == group {
-				return conn, true, nil
+				inGroup = append(inGroup, conn)
 			}
+		}
+		if conn, ok := firstReachableConnector(inGroup, reachable); ok {
+			return conn, true, nil
 		}
 	}
 	return model.ConnectorRegistration{}, false, nil
+}
+
+// firstReachableConnector is the first candidate `reachable` accepts, else the first candidate.
+func firstReachableConnector(candidates []model.ConnectorRegistration, reachable func(model.ConnectorRegistration) bool) (model.ConnectorRegistration, bool) {
+	if len(candidates) == 0 {
+		return model.ConnectorRegistration{}, false
+	}
+	if reachable != nil {
+		for _, conn := range candidates {
+			if reachable(conn) {
+				return conn, true
+			}
+		}
+	}
+	return candidates[0], true
+}
+
+// connectorWorthPreferring says whether, among several connectors that front an application, this is one to
+// choose first. It is the answer the connector list gives for "online" (adminConnectorOnline), from the same
+// facts in the same order, so the reachability test and the Sites screen cannot disagree about which
+// connector is alive:
+//
+//   - a tunnel this node holds;
+//   - else the recent report of the Edge that holds its tunnel (tunnel_reported_at, within two minutes);
+//   - else a recent heartbeat.
+//
+// ★ THE HEARTBEAT ALONE WAS THE FIRST VERSION, AND IT DID NOT HOLD (walked on three Regions, 2026-11-14). The
+// node answering for another Region had both connectors' heartbeats six minutes old — its copy of the
+// registry is not refreshed for heartbeats — so both looked stopped, neither was preferred, and it chose the
+// stopped one 16 times in 30. The same node's connector list was right, because it reads the tunnel reports.
+func connectorWorthPreferring(conn model.ConnectorRegistration, tunnelHeldHere bool, now time.Time) bool {
+	if tunnelHeldHere {
+		return true
+	}
+	if reported := connectorTunnelReported(conn.Metadata, now); reported != nil && *reported {
+		return true
+	}
+	heartbeat, err := time.Parse(time.RFC3339, strings.TrimSpace(conn.LastHeartbeatAt))
+	if err != nil {
+		return false
+	}
+	return !heartbeat.Add(adminSiteHeartbeatFreshness).Before(now)
 }
 
 func connectorRouteUnavailable(conn model.ConnectorRegistration) bool {
@@ -566,14 +633,11 @@ func connectorRegistrationsForTenantWithContext(ctx context.Context, registry co
 	return connectorRegistrationsForTenant(registry, tenantID), nil
 }
 
-// connector ROUTE layer (reachable_routes), among the tenant's LIVE connectors — the destination-driven
-// counterpart of connectorForApplication. namespace is the flow's site / virtual-network context (used only for
-// IP routes). Reachability only: policy still authorizes the flow separately. Returns ok=false when no live
-// connector fronts the destination (fail-closed — no implicit reach).
-func connectorForDestination(ctx context.Context, registry connectorRegistryStore, tenantID, destination, namespace string) (model.ConnectorRegistration, bool, error) {
+// liveConnectorRoutes is the tenant's LIVE connectors with their EFFECTIVE routes: what the route layer reads.
+func liveConnectorRoutes(ctx context.Context, registry connectorRegistryStore, tenantID string) ([]model.ConnectorRegistration, error) {
 	connectors, err := connectorRegistrationsForTenantWithContext(ctx, registry, tenantID)
 	if err != nil {
-		return model.ConnectorRegistration{}, false, err
+		return nil, err
 	}
 	live := make([]model.ConnectorRegistration, 0, len(connectors))
 	for _, conn := range connectors {
@@ -584,7 +648,18 @@ func connectorForDestination(ctx context.Context, registry connectorRegistryStor
 	// Admin route governance: the route layer sees only the EFFECTIVE routes — self-declared CIDRs the operator
 	// HELD are dropped, admin-authored CIDRs are added. Nil (unset) is the identity. See
 	// docs/connector_network_route_advertisement_design.md.
-	live = connectorRouteGov.Apply(tenantID, live)
+	return connectorRouteGov.Apply(tenantID, live), nil
+}
+
+// connector ROUTE layer (reachable_routes), among the tenant's LIVE connectors — the destination-driven
+// counterpart of connectorForApplication. namespace is the flow's site / virtual-network context (used only for
+// IP routes). Reachability only: policy still authorizes the flow separately. Returns ok=false when no live
+// connector fronts the destination (fail-closed — no implicit reach).
+func connectorForDestination(ctx context.Context, registry connectorRegistryStore, tenantID, destination, namespace string) (model.ConnectorRegistration, bool, error) {
+	live, err := liveConnectorRoutes(ctx, registry, tenantID)
+	if err != nil {
+		return model.ConnectorRegistration{}, false, err
+	}
 	id, ok := connector.ResolveConnectorForDestination(destination, namespace, live)
 	if !ok {
 		return model.ConnectorRegistration{}, false, nil

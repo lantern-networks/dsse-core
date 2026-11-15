@@ -272,7 +272,11 @@ func repairInterceptionRootViewsLocked(certPath string, pair persistedIntercepti
 					return modeErr
 				}
 			}
-			if bytes.Equal(got, view.data) && validateNetworkExtensionLabTLSSecretFileMode(view.path) == nil {
+			// An intact view is left alone. The certificate is public and is commonly installed 0644 and
+			// mounted read-only; holding it to the key's 0600 made every restart of an Edge that had started
+			// once "repair" an intact certificate, and the rewrite of a read-only mount failed the start —
+			// for as long as the container lived.
+			if bytes.Equal(got, view.data) && (!view.secret || validateNetworkExtensionLabTLSSecretFileMode(view.path) == nil) {
 				continue
 			}
 		}

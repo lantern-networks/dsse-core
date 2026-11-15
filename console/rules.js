@@ -717,7 +717,10 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
   let savePending = false, writeAttempted = false;
   let savedOk = false; // set true on a successful save so onCancelled (below) does NOT fire on close
   let idx, editorTenant;
-  try { [idx, editorTenant] = await Promise.all([catalogIndex(), ruleEditorTenant()]); }
+  // The rules already written, to choose where a new one starts. A list that cannot be read changes only
+  // the number first shown in the priority field.
+  let rulesNow = [];
+  try { [idx, editorTenant, rulesNow] = await Promise.all([catalogIndex(), ruleEditorTenant(), existing ? [] : loadList("/admin/rules").catch(() => [])]); }
   catch (e) {
     // A caller may have created a draft endpoint for this editor. If the editor never
     // opens, its normal onClose cleanup cannot run.
@@ -739,7 +742,7 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
         ? bl({ en: "New Connector Access rule", ja: "新しいコネクタ経由アクセスルール" })
         : bl({ en: "New internet access rule", ja: "新しいインターネットアクセスルール" }));
 
-  const prioF = uiField({ name: "prio", label: bl({ en: "Priority (lower wins)", ja: "優先度(小さいほど優先)" }), type: "number", value: existing && existing.priority != null ? existing.priority : 100 });
+  const prioF = uiField({ name: "prio", label: bl({ en: "Priority (lower wins)", ja: "優先度(小さいほど優先)" }), type: "number", value: existing && existing.priority != null ? existing.priority : ruleDefaultPriority(rulesNow, plane) });
   const nameF = uiField({ name: "name", label: bl({ en: "Name (optional)", ja: "名前(任意)" }), value: existing ? (existing.name || "") : "", placeholder: bl({ en: "e.g. Allow Finance → ERP", ja: "例: 経理 → ERP を許可" }) });
 
   // Source / Destination subject pickers — every group AND every endpoint (operator + built-in catalog) is
@@ -758,8 +761,8 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
   // the synced directory (department = the Keycloak group; a person's stable id is the subject). This lets the
   // operator pick a WHOLE group (idgroup:) OR drill in and pick INDIVIDUAL people (iduser:) — multi-select at
   // either level. Source-only — the Destination stays device/endpoint.
-  const src = subjectPicker(bl({ en: "Source (who — people, devices, or agents)", ja: "送信元(誰 — 人・デバイス・エージェント)" }), subjects, { identityGroups: true, agents: plane === "egress", onAgentChange: () => syncAgent() });
-  const dst = subjectPicker(bl({ en: "Destination (where)", ja: "宛先(どこ)" }), subjects);
+  const src = subjectPicker(bl({ en: "Source (who — people, devices, or agents)", ja: "送信元(誰 — 人・デバイス・エージェント)" }), ruleSourceSubjects(subjects, existing && existing.source), { identityGroups: true, agents: plane === "egress", onAgentChange: () => syncAgent() });
+  const dst = subjectPicker(bl({ en: "Destination (where)", ja: "宛先(どこ)" }), subjects, { addServer: true });
   if (existing) { src.setSelected(existing.source); dst.setSelected(existing.destination); }
   // Load the IdP identity drill-down (groups→members) LAZILY. The editor must open IMMEDIATELY, so a slow or
   // unreachable directory (control plane) can NEVER block it — blocking here made "add a Source" appear
@@ -1116,14 +1119,16 @@ function subjectPicker(labelText, subjects, opts) {
     });
   };
 
-  anyCb.addEventListener("change", () => {
+  // What "Any" being on or off does to every other control of the picker, in one place.
+  const applyAny = () => {
     const on = anyCb.checked;
     search.disabled = on;
     rows.forEach((r) => { r.cb.disabled = on; });
     if (idInput) idInput.disabled = on;
     picker.classList.toggle("any-on", on);
     updateSummary();
-  });
+  };
+  anyCb.addEventListener("change", applyAny);
 
   // addSubjectRow renders one selectable subject — a catalog device/group, or an added identity group.
   const addSubjectRow = (s) => {
@@ -1277,6 +1282,55 @@ function subjectPicker(labelText, subjects, opts) {
     picker.appendChild(panel);
   }
 
+  // "+ Add server" (destination only): a destination that is not in the list yet is made here, with the two
+  // fields the Groups & Services page asks for, and comes back selected. A first rule used to stop at this
+  // picker: its destination had to be created on another page before the rule could name it.
+  if (opts.addServer) {
+    const toggle = el("button", { class: "ui-btn ui-btn-sm subject-add-toggle", type: "button", text: bl({ en: "＋ Add server ▾", ja: "＋ サーバを追加 ▾" }) });
+    const nameIn = el("input", { class: "ui-input", type: "text", placeholder: bl({ en: "Name, e.g. prod database", ja: "名前（例: 本番DB）" }) });
+    const addrIn = el("input", { class: "ui-input", type: "text", placeholder: bl({ en: "IP, network range, or domain", ja: "IP・ネットワーク範囲・ドメイン" }) });
+    const addBtn = el("button", { class: "ui-btn ui-btn-sm", type: "button", text: bl({ en: "Add", ja: "追加" }) });
+    const problem = el("div", { class: "ui-field-hint subject-add-problem", style: "color:#a52434" });
+    const addNow = async () => {
+      const alias = nameIn.value.trim(), address = addrIn.value.trim();
+      problem.textContent = "";
+      if (!alias || !address) { problem.textContent = bl({ en: "Enter a name and an address.", ja: "名前とアドレスを入力してください。" }); return; }
+      // Said here in the reader's language; the server checks the same thing and its answer is final.
+      if (!ruleAddressLooksLikeOne(address)) {
+        problem.textContent = bl({
+          en: "Give an IP address (10.0.0.10), a network range (10.0.0.0/24), a host name (db.example.com) or a wildcard for the names beneath one (*.example.com).",
+          ja: "アドレスには、IP（10.0.0.10）、ネットワーク範囲（10.0.0.0/24）、ホスト名（db.example.com）、その配下すべてを表すワイルドカード（*.example.com）のいずれかを入力してください。" });
+        return;
+      }
+      addBtn.disabled = true;
+      try {
+        const r = await apiFetch("POST", "/admin/assets/endpoints", { alias, address, kind: "network", source: "manual", steered: false });
+        if (!r.ok || !r.body || !r.body.id) {
+          problem.textContent = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status);
+          return;
+        }
+        const made = r.body;
+        const cb = checks[made.id] || addSubjectRow({ id: made.id, label: made.alias || alias, kind: "endpoint", what: ruleEndpointWhat(made), address: made.address || address });
+        // Adding a server here is choosing it. With "Any" on, the new row showed as checked while the rule
+        // would still have been saved as "Any" — the picker's answer and its appearance disagreed (review,
+        // 2026-11-14). Choosing a destination turns "Any" off, as checking a row by hand requires.
+        if (anyCb.checked) { anyCb.checked = false; applyAny(); }
+        cb.checked = true;
+        nameIn.value = ""; addrIn.value = "";
+        updateSummary(); applyFilter();
+        if (opts.onServerAdded) opts.onServerAdded(made);
+      } catch (e) { problem.textContent = String(e); }
+      finally { addBtn.disabled = false; }
+    };
+    addBtn.addEventListener("click", addNow);
+    addrIn.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); addNow(); } });
+    const panel = el("div", { class: "subject-add-panel" }, [el("div", { class: "subject-idadd" }, [nameIn, addrIn, addBtn]), problem]);
+    panel.style.display = "none";
+    toggle.addEventListener("click", () => { const open = panel.style.display === "none"; panel.style.display = open ? "" : "none"; toggle.textContent = bl({ en: "＋ Add server " + (open ? "▴" : "▾"), ja: "＋ サーバを追加 " + (open ? "▴" : "▾") }); });
+    picker.appendChild(toggle);
+    picker.appendChild(panel);
+  }
+
   search.addEventListener("input", applyFilter);
   updateSummary();
   picker.appendChild(anyRow);
@@ -1316,6 +1370,34 @@ function subjectPicker(labelText, subjects, opts) {
 // anybody reads, and the members are named in the row's own description.
 // ruleEndpointWhat says what a catalogue endpoint stands for, from what made it: a published application, a
 // device, or a network address an administrator named.
+// ruleSourceSubjects is what the Source picker offers: devices, and the groups an administrator made of them.
+// A server, a network or a built-in destination group is somewhere traffic goes, not somebody it comes from;
+// a rule with one as its source matches no device, and the list offered every one of them. Anything an
+// existing rule already names as its source stays in the list, so editing that rule cannot drop it unseen.
+function ruleSourceSubjects(subjects, alreadySelected) {
+  const keep = new Set(Array.isArray(alreadySelected) ? alreadySelected : []);
+  return subjects.filter((s) => keep.has(s.id) || (s.kind === "group" ? !s.builtIn : s.what === "device"));
+}
+
+// ruleDefaultPriority is the number a new rule's priority field starts at: ahead of every rule already written
+// for the same kind of access. A new rule used to start at 100 — the priority of the rule a new organization
+// begins with, "everything allowed" — so a rule saved as offered was listed after it and never decided anything.
+function ruleDefaultPriority(rules, plane) {
+  const taken = (Array.isArray(rules) ? rules : []).filter((r) => r && r.plane === plane && Number.isFinite(Number(r.priority))).map((r) => Number(r.priority));
+  if (!taken.length) return 100;
+  return Math.max(1, Math.min(...taken) - 10);
+}
+
+// ruleAddressLooksLikeOne is the Console's own first look at an address a rule could match. It lets anything
+// with a colon through as a possible IPv6 address; the server is the one that decides.
+function ruleAddressLooksLikeOne(address) {
+  const a = String(address || "");
+  if (!a || /\s/.test(a)) return false;
+  if (a.includes(":")) return /^[0-9A-Fa-f:.]+(\/\d{1,3})?$/.test(a);
+  if (/^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/.test(a)) return true;
+  return a.length <= 253 && /^(\*\.)?([A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$/.test(a);
+}
+
 function ruleEndpointWhat(e) {
   if (!e) return "endpoint";
   if (e.source === "application") return "application";

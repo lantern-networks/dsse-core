@@ -334,3 +334,46 @@ func TestRootPairSealMigrationInterruptedAfterKeyViewKeepsIdentity(t *testing.T)
 		t.Fatal("sealed authoritative snapshot loaded without its KEK")
 	}
 }
+
+// An Edge that has started once holds the root snapshot. On its next start — a container restart, a host
+// reboot — an intact public certificate view, installed 0644 and mounted read-only, is not rewritten.
+// Rewriting it failed with "device or resource busy" on every start, and the Edge never came back.
+func TestRootPairRestartLeavesAnIntactReadOnlyCertificateViewAlone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "root.pem")
+	material, err := GenerateNetworkExtensionLabTLSRootMaterial(time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteNetworkExtensionLabTLSPersistentRootMaterial(path, material); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writes := 0
+	io := interceptionRootPairIO{
+		write: func(name string, data []byte, mode os.FileMode) error {
+			writes++
+			return errors.New("device or resource busy")
+		},
+		syncDir: durablefile.SyncDir,
+	}
+	loaded, reused, err := readInterceptionRootPairLocked(path, time.Now, io)
+	if err != nil || !reused || !bytes.Equal(loaded.Cert.Raw, material.Cert.Raw) {
+		t.Fatalf("restart with an intact 0644 certificate: reused=%v err=%v", reused, err)
+	}
+	if writes != 0 {
+		t.Fatalf("an intact view was rewritten %d times", writes)
+	}
+
+	// A damaged certificate view is still repaired from the snapshot.
+	if err := os.WriteFile(path, []byte("damaged"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readInterceptionRootPairLocked(path, time.Now, productionInterceptionRootPairIO); err != nil {
+		t.Fatalf("repair of a damaged view: %v", err)
+	}
+	if got, _ := os.ReadFile(path); !bytes.Equal(got, material.CertPEM) {
+		t.Fatal("a damaged certificate view was not repaired")
+	}
+}

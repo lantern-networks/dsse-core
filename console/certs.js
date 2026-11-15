@@ -1485,9 +1485,11 @@ function tenantDeviceAuthorityControl(host) {
   });
 }
 
-// tenantInterceptionControl is whose root this organization's traffic is inspected under. The new one is
-// handed over out of band — this deployment never holds the root key — so there is nothing here to create,
-// only a change to complete or take back.
+// tenantInterceptionControl is whose root this organization's traffic is inspected under. Whether the
+// organization brought the root or this deployment made it, only the issuing tier's key is kept here: a
+// brought root's key never arrives, and a made root's key signs the issuing CA once and is not stored
+// (mintTenantInterceptionAuthority returns no root key). The idle text says that for both, and does not say
+// the root was "handed over", which is false for a root made here.
 function tenantInterceptionControl(host) {
   if (pkiDeploymentAct()) return el("div", { style: "display:none" });
   const st = _pkiInterceptionAuthority || {};
@@ -1509,8 +1511,8 @@ function tenantInterceptionControl(host) {
           : pkiWaitingFor((ready.does_not_hold || []).concat(ready.never_reported || []),
               bl({ en: "Waiting for devices to trust the new root.",
                    ja: "端末が新しい根を信頼するのを待っています。" })))
-      : bl({ en: "Nothing is waiting. A new root is handed over out of band; this deployment never holds its key.",
-             ja: "待機中のものはありません。新しい根は別経路で渡され、この配備が鍵を持つことはありません。" }),
+      : bl({ en: "Nothing is waiting. This deployment holds the issuing key under this root, and does not keep the root's own key.",
+             ja: "待機中のものはありません。この配備が持つのは、この根の下の発行用の鍵です。根そのものの鍵は保存しません。" }),
     actions: staged
       ? [
           mayPromote ? {

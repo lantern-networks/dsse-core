@@ -51,3 +51,27 @@ func TestASeveralMachineDeploymentsStoreIsStillAsked(t *testing.T) {
 		t.Fatalf("a several-machine deployment took the one-machine exemption: %+v", got)
 	}
 }
+
+// One Region with one control-plane host and the Edges on machines of their own (one-region-multi-edge) is three
+// machines and one authority by declaration. Installed on three machines, every step ran and -verify failed it on
+// this check for being that shape.
+func TestAProfileWithOneAuthorityHostIsNotAskedToSurviveLosingAPlace(t *testing.T) {
+	dir := t.TempDir()
+	env := strings.Join([]string{
+		"DSSE_TOPOLOGY_PROFILE='one-region-multi-edge'",
+		"DSSE_ETCD_CLIENT_SCHEME='https'",
+		"DSSE_ETCD_HOSTS=\"'cp-a.example.test:12379'\"",
+		"DSSE_REGION_ENDPOINTS='region-a=https://agents.region-a.example.test'",
+		edgeBackendsKey + "='edge-a-1.example.test:443,edge-a-2.example.test:443'",
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "deployment.env"), []byte(env), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if deploymentIsASingleMachine(dir) {
+		t.Fatal("the fixture reads as one machine; the test proves nothing about the profile")
+	}
+	got := verifyTheStoreCanLoseAPlace(dir, readDeploymentEnv(dir))
+	if len(got) != 1 || !got[0].ok || got[0].name != "the consensus store spans places" || !strings.Contains(got[0].note, "one control-plane host") {
+		t.Fatalf("the one-authority profile was failed for being that shape: %+v", got)
+	}
+}

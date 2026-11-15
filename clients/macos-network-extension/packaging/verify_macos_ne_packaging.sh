@@ -90,6 +90,13 @@ check_entitlement_app_id "$app/Contents/MacOS/$(defaults read "$app/Contents/Inf
 check_entitlement_app_id "$sysext/Contents/MacOS/$(defaults read "$sysext/Contents/Info.plist" CFBundleExecutable)" "$sysext_id"
 ok "entitlements present and reference the correct bundle ids"
 
+# --- check 3b: the extension declares both of its providers ---
+for kind in app-proxy dns-proxy; do
+	cls="$(plutil -extract "NetworkExtension.NEProviderClasses.com\.apple\.networkextension\.$kind" raw -o - "$sysext/Contents/Info.plist" 2>/dev/null || true)"
+	[ -n "$cls" ] || fail "the extension declares no $kind provider class"
+done
+ok "the extension declares its App Proxy and DNS Proxy providers"
+
 # --- check 4: signatures structurally valid ---
 codesign --verify --strict "$sysext" 2>/dev/null || fail "codesign --verify failed for the extension"
 codesign --verify --strict "$app" 2>/dev/null || fail "codesign --verify failed for the app"
@@ -129,6 +136,12 @@ check_bundle_profile() {
 	case "$signed" in
 	*"<string>$granted</string>"*) : ;;
 	*) fail "$3 is signed with an App Proxy entitlement the profile does not grant (profile grants '$granted') — this signs and verifies but will NOT activate" ;;
+	esac
+	granted_dns="$(dsse_profile_ne_dnsproxy "$tmp/$3.plist" || true)"
+	[ -n "$granted_dns" ] || fail "$3 profile grants no DNS Proxy entitlement"
+	case "$signed" in
+	*"<string>$granted_dns</string>"*) : ;;
+	*) fail "$3 is not signed with the DNS Proxy entitlement its profile grants ('$granted_dns') — the Mac's DNS would not reach the Edge" ;;
 	esac
 
 	# The leaf that signed it must be one the profile authorises. By FINGERPRINT: two identities in this

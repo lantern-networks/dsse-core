@@ -52,6 +52,10 @@ import (
 type connectorDepartureLog struct {
 	mu   sync.Mutex
 	left map[string]time.Time
+	// quiet is, for a connector whose last wait ended with nothing learned, when a refusal may next start
+	// another, and fruitless how many such waits in a row there have been. See unreachable.
+	quiet     map[string]time.Time
+	fruitless map[string]int
 	// news is closed and replaced every time something that can change a reach decision happens: a pull from
 	// the control plane finished, or a connector's tunnel arrived here. Waiters look again; most will find
 	// nothing new and wait for the next.
@@ -67,7 +71,8 @@ type connectorDepartureLog struct {
 
 func newConnectorDepartureLog(window, firstHurry time.Duration) *connectorDepartureLog {
 	return &connectorDepartureLog{
-		left: map[string]time.Time{}, news: make(chan struct{}), hurry: make(chan struct{}, 1),
+		left: map[string]time.Time{}, quiet: map[string]time.Time{}, fruitless: map[string]int{},
+		news: make(chan struct{}), hurry: make(chan struct{}, 1),
 		window: window, firstHurry: firstHurry, now: time.Now,
 	}
 }
@@ -91,6 +96,58 @@ func (d *connectorDepartureLog) departed(connectorID string) {
 	go d.hurryLearning(id, at)
 }
 
+// unreachable records that a flow found no way to a connector, on a node that did not see it leave — a node
+// that was restarted, or one in another Region. That is treated as a departure seen now: the control plane is
+// asked early where the connector is, and flows for it are held for the same window.
+//
+// ★ A CONNECTOR THAT IS SIMPLY GONE MUST NOT TURN TRAFFIC INTO QUESTIONS. Nothing will be learned about it, and
+// flows for what it fronts keep arriving. So a wait that ends with nothing learned is followed by a quiet time
+// in which refusals for that connector start nothing — one window after the first, doubling each time, at most
+// an hour — and they are refused at once, as before this existed. Learning where it is, or its tunnel arriving
+// here, ends the quiet. The early questions therefore follow how often connectors move, never how much traffic
+// a dead one is sent.
+func (d *connectorDepartureLog) unreachable(connectorID string) {
+	id := strings.TrimSpace(connectorID)
+	if d == nil || id == "" {
+		return
+	}
+	at := d.now()
+	d.mu.Lock()
+	if since, waiting := d.left[id]; waiting {
+		if at.Sub(since) < d.window {
+			d.mu.Unlock()
+			return
+		}
+		d.endedWithNothingLocked(id, since.Add(d.window))
+	}
+	if until, quiet := d.quiet[id]; quiet && at.Before(until) {
+		d.mu.Unlock()
+		return
+	}
+	d.left[id] = at
+	d.mu.Unlock()
+	go d.hurryLearning(id, at)
+}
+
+// maxQuietAfterFruitlessWaits bounds the doubling. It is not a limit on traffic: it is how long this node
+// goes without asking about a connector that has answered nothing for an hour.
+const maxQuietAfterFruitlessWaits = time.Hour
+
+// endedWithNothingLocked closes a wait that learned nothing and starts the quiet that follows it. The CALLER
+// holds d.mu.
+func (d *connectorDepartureLog) endedWithNothingLocked(id string, endedAt time.Time) {
+	delete(d.left, id)
+	d.fruitless[id]++
+	quiet := d.window
+	for i := 1; i < d.fruitless[id] && quiet < maxQuietAfterFruitlessWaits; i++ {
+		quiet *= 2
+	}
+	if quiet > maxQuietAfterFruitlessWaits {
+		quiet = maxQuietAfterFruitlessWaits
+	}
+	d.quiet[id] = endedAt.Add(quiet)
+}
+
 // arrived records that a tunnel for the connector registered here again: there is nothing left to wait for.
 func (d *connectorDepartureLog) arrived(connectorID string) {
 	d.settle(connectorID)
@@ -109,6 +166,8 @@ func (d *connectorDepartureLog) settle(connectorID string) {
 	}
 	d.mu.Lock()
 	delete(d.left, id)
+	delete(d.quiet, id)
+	delete(d.fruitless, id)
 	d.mu.Unlock()
 	d.announce()
 }
@@ -167,7 +226,7 @@ func (d *connectorDepartureLog) await(ctx context.Context, connectorID string) b
 	}
 	remaining := at.Add(d.window).Sub(d.now())
 	if remaining <= 0 {
-		delete(d.left, id)
+		d.endedWithNothingLocked(id, at.Add(d.window))
 		d.mu.Unlock()
 		return false
 	}
@@ -179,6 +238,12 @@ func (d *connectorDepartureLog) await(ctx context.Context, connectorID string) b
 	case <-news:
 		return true
 	case <-timer.C:
+		// The wait is over and nothing was learned. Say so once, whichever waiting flow gets here first.
+		d.mu.Lock()
+		if recorded, still := d.left[id]; still && recorded.Equal(at) {
+			d.endedWithNothingLocked(id, at.Add(d.window))
+		}
+		d.mu.Unlock()
 		return false
 	case <-ctx.Done():
 		return false
@@ -190,6 +255,10 @@ func (d *connectorDepartureLog) await(ctx context.Context, connectorID string) b
 type tunnelsThatRememberDepartures struct {
 	*tunnel.Manager
 	departures *connectorDepartureLog
+}
+
+func (t tunnelsThatRememberDepartures) NoteConnectorUnreachable(connectorID string) {
+	t.departures.unreachable(connectorID)
 }
 
 func (t tunnelsThatRememberDepartures) AwaitConnectorMove(ctx context.Context, connectorID string) bool {

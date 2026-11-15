@@ -404,7 +404,7 @@ func adminSurfaceOnlyMiddleware(next http.Handler) http.Handler {
 		// each organization's short-lived server material from its control plane, over the connection it
 		// already authenticates on. Adding it here rather than to the admin surface keeps it out of the admin
 		// API — it is a machine route, not something an administrator calls.
-		if isAdminSurfacePath(r.URL.Path) || r.URL.Path == "/healthz" || r.URL.Path == "/metrics" || r.URL.Path == "/leader" || r.URL.Path == "/audit-ingest" || r.URL.Path == "/auth-flow-results" || r.URL.Path == "/auth-flow-results/query" || r.URL.Path == "/fleet-capabilities/report" || r.URL.Path == "/tenant-edge-material" || r.URL.Path == "/tenant-inspection-crl" {
+		if isAdminSurfacePath(r.URL.Path) || r.URL.Path == "/healthz" || r.URL.Path == "/metrics" || r.URL.Path == "/leader" || r.URL.Path == "/audit-ingest" || r.URL.Path == auditIngestBatchPath || r.URL.Path == "/auth-flow-results" || r.URL.Path == "/auth-flow-results/query" || r.URL.Path == "/fleet-capabilities/report" || r.URL.Path == "/tenant-edge-material" || r.URL.Path == "/tenant-inspection-crl" {
 			next.ServeHTTP(w, r)
 			return
 		}

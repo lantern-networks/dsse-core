@@ -399,6 +399,7 @@ POST /admin/upstream-tls
 POST /admin/vlan-boundary-policies
 POST /admin/vlan-objects
 POST /audit-ingest
+POST /audit-ingest/batch
 POST /auth-flow-results
 POST /auth-flow-results/query
 POST /auth/events

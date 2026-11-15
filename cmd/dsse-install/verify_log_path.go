@@ -46,6 +46,8 @@ func verifyLogPath(client *http.Client, edgeAdmin, cpAdmin, token string) []veri
 				Delivering   bool   `json:"delivering"`
 				Endpoint     string `json:"endpoint"`
 				Pending      int64  `json:"pending"`
+				Shipped      int64  `json:"shipped"`
+				Batches      int64  `json:"batches"`
 				Refused      int64  `json:"refused"`
 				Dropped      int64  `json:"dropped"`
 				LastError    string `json:"last_error"`
@@ -73,8 +75,11 @@ func verifyLogPath(client *http.Client, edgeAdmin, cpAdmin, token string) []veri
 					body.AuditShipping.Endpoint, body.AuditShipping.Refused, body.AuditShipping.Dropped)})
 		default:
 			out = append(out, verifyResult{ok: true, name: "what this Edge records is reaching the authority",
-				note: fmt.Sprintf("delivering to %s, %d shipped, none pending", body.AuditShipping.Endpoint,
-					body.AuditShipping.Pending)})
+				// The count shown is what was shipped (it used to print the pending count under that word), and
+				// how many requests carried more than one record: zero batches beside a rising count means the
+				// control plane is not answering the batch route and every record is travelling alone.
+				note: fmt.Sprintf("delivering to %s, %d shipped (%d request(s) carried several records), %d pending",
+					body.AuditShipping.Endpoint, body.AuditShipping.Shipped, body.AuditShipping.Batches, body.AuditShipping.Pending)})
 		}
 	}
 

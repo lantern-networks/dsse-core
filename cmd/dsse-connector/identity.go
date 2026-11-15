@@ -256,6 +256,10 @@ func connectorIdentityCheckInterval(notBefore, notAfter time.Time) time.Duration
 const (
 	connectorEnrolmentPropagationWait = 3 * time.Minute
 	connectorEnrolmentRetryEvery      = 10 * time.Second
+	// The whole of obtaining the identity at start-up: the wait above, and room for the attempt that is in
+	// flight when it ends. The caller used to allow 60 seconds, so a first run logged "waiting up to 3m0s"
+	// and was cancelled a third of the way through it, reporting a deadline instead of what it waited for.
+	connectorIdentityStartupTimeout = connectorEnrolmentPropagationWait + 30*time.Second
 )
 
 // renewConnectorIdentityLoop keeps the connector's certificate alive for as long as the process runs. It never

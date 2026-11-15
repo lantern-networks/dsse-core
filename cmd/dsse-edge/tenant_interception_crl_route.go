@@ -13,6 +13,21 @@ import (
 	"github.com/lantern-networks/dsse-core/tenantca"
 )
 
+// tenantInterceptionCRLOriginsFlag is where this deployment publishes revocation lists: the HTTP origins an
+// interception authority made here for an organization names in its certificates. Empty, and such an authority
+// names none.
+var tenantInterceptionCRLOriginsFlag = flag.String("tenant-interception-crl-origins", "", "comma-separated public HTTP origins (http://crl.example.com) at which this deployment publishes revocation lists; an interception authority made here for an organization names them. Empty names none")
+
+func tenantInterceptionCRLOrigins() []string {
+	var out []string
+	for _, origin := range strings.Split(*tenantInterceptionCRLOriginsFlag, ",") {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			out = append(out, origin)
+		}
+	}
+	return out
+}
+
 func registerInspectionCRLListenerFlag() *string {
 	return flag.String("inspection-crl-listen", "", "optional plaintext HTTP listener serving only signed interception CRL DER; expose it through an independent read-only CRL entry")
 }

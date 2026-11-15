@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Darwin
 
 //  W4 (NE side, DNS): the user-space DNS proxy. The endpoint's system resolver is pointed at this
@@ -38,16 +39,35 @@ public final class DsseDNSTunnelProxy: @unchecked Sendable {
     // forwardQuery POSTs a raw DNS query (application/dns-message) to the Edge over the (T) tunnel and
     // returns the raw DNS response, or nil on failure (the caller drops the datagram — fail closed).
     public func forwardQuery(_ query: Data, completion: @escaping @Sendable (Data?) -> Void) {
+        forwardQuery(query) { response, _ in completion(response) }
+    }
+
+    // forwardQuery with the reason a query went unanswered: "http_<status>", "error_<domain>_<code>" or "empty".
+    // Non-secret by construction: a status code or an error domain and code, never a URL, name or body.
+    public func forwardQuery(_ query: Data, outcome: @escaping @Sendable (Data?, String) -> Void) {
         var req = URLRequest(url: dnsURL)
         req.httpMethod = "POST"
         req.setValue("application/dns-message", forHTTPHeaderField: "content-type")
         req.httpBody = query
-        session.dataTask(with: req) { data, resp, _ in
-            guard let http = resp as? HTTPURLResponse, http.statusCode == 200, let data, !data.isEmpty else {
-                completion(nil)
+        session.dataTask(with: req) { data, resp, error in
+            if let error {
+                let ns = error as NSError
+                outcome(nil, "error_\(ns.domain)_\(ns.code)")
                 return
             }
-            completion(data)
+            guard let http = resp as? HTTPURLResponse else {
+                outcome(nil, "no_http_response")
+                return
+            }
+            guard http.statusCode == 200 else {
+                outcome(nil, "http_\(http.statusCode)")
+                return
+            }
+            guard let data, !data.isEmpty else {
+                outcome(nil, "empty")
+                return
+            }
+            outcome(data, "ok")
         }.resume()
     }
 
@@ -103,5 +123,236 @@ public final class DsseDNSTunnelProxy: @unchecked Sendable {
                 }
             }
         }
+    }
+}
+
+/// DNS queries to the Edge over NWConnection, built by makeTunnelParameters like the device's tunnel: the same
+/// identity, the same pinned anchors, the organization's transport name in the ClientHello.
+///
+/// Not URLSession. On macOS a URLSession over TLS 1.3 never surfaces the Edge's request for the device's
+/// certificate, completes the handshake presenting none, and the Edge refuses it — measured on the first Mac
+/// to run the DNS proxy: every query failed NSURLErrorDomain -1200 and the Edge counted none.
+///
+/// And not a connection per query. A Mac asks for names in bursts — at start-up, on a network change, when a
+/// browser opens — and a TLS handshake per name starved itself: 80 lookups at once, almost none answered
+/// within their five seconds, on a Mac whose Edge answered each in 12 ms. Queries share a few connections that
+/// stay open; each carries one request at a time and the next waits its turn.
+public final class DsseDNSOverNWForwarder: @unchecked Sendable {
+    private let channels: [DsseDNSKeptConnection]
+    private let lock = NSLock()
+    private var next = 0
+
+    public init(security: DsseTransportSecurity, dnsOverTunnelPath: String = "/steer/dns-query", timeout: TimeInterval = 5,
+                connections: Int = 4) {
+        var p = dnsOverTunnelPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if p.isEmpty { p = "/steer/dns-query" }
+        if !p.hasPrefix("/") { p = "/" + p }
+        channels = (0..<max(1, connections)).map { _ in
+            DsseDNSKeptConnection(security: security, path: p, timeout: timeout)
+        }
+    }
+
+    /// outcome receives the answer, or nil and a non-secret reason: "http_<status>", "error_<what>" or "empty".
+    public func forwardQuery(_ query: Data, outcome: @escaping @Sendable (Data?, String) -> Void) {
+        lock.lock()
+        let channel = channels[next % channels.count]
+        next = (next + 1) % channels.count
+        lock.unlock()
+        channel.submit(query, outcome: outcome)
+    }
+
+    public func close() {
+        for c in channels { c.close() }
+    }
+}
+
+/// One kept-open HTTP/1.1 connection to the Edge carrying DNS queries one after another.
+final class DsseDNSKeptConnection: @unchecked Sendable {
+    private struct Job {
+        let query: Data
+        let outcome: @Sendable (Data?, String) -> Void
+        var attempts = 0
+    }
+
+    private let security: DsseTransportSecurity
+    private let path: String
+    private let timeout: TimeInterval
+    private let queue = DispatchQueue(label: "dsse.dns-kept-connection")
+    private var connection: NWConnection?
+    private var ready = false
+    private var carried = 0              // requests answered on the current connection
+    private var pending: [Job] = []
+    private var busy = false
+    private var generation = 0
+    private var buffer = Data()
+    private var connectWaiter: ((Bool) -> Void)?
+
+    init(security: DsseTransportSecurity, path: String, timeout: TimeInterval) {
+        self.security = security
+        self.path = path
+        self.timeout = timeout
+    }
+
+    func submit(_ query: Data, outcome: @escaping @Sendable (Data?, String) -> Void) {
+        queue.async {
+            self.pending.append(Job(query: query, outcome: outcome))
+            self.pump()
+        }
+    }
+
+    func close() {
+        queue.async { self.drop() }
+    }
+
+    private func pump() {
+        guard !busy, !pending.isEmpty else { return }
+        busy = true
+        generation += 1
+        let gen = generation
+        queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            guard let self, self.busy, self.generation == gen else { return }
+            self.finish(nil, "error_timed_out_after_\(Int(self.timeout))s", retryable: false)
+        }
+        connect(gen) { [weak self] ok in
+            guard let self, self.busy, self.generation == gen else { return }
+            guard ok else { self.finish(nil, "error_connect", retryable: false); return }
+            self.send(gen)
+        }
+    }
+
+    private func answerConnect(_ ok: Bool) {
+        let waiter = connectWaiter
+        connectWaiter = nil
+        waiter?(ok)
+    }
+
+    private func connect(_ gen: Int, _ done: @escaping (Bool) -> Void) {
+        if let connection, ready, connection.state == .ready { done(true); return }
+        drop()
+        guard security.port > 0, security.port <= Int(UInt16.max), let port = NWEndpoint.Port(rawValue: UInt16(security.port)) else {
+            done(false); return
+        }
+        connectWaiter = done
+        let parameters = DsseTransportTLS.makeTunnelParameters(security: security, serverNameOverride: security.controlServerName)
+        let c = NWConnection(host: NWEndpoint.Host(security.host), port: port, using: parameters)
+        connection = c
+        c.stateUpdateHandler = { [weak self, weak c] state in
+            guard let self, let c, self.connection === c else { return }
+            switch state {
+            case .ready:
+                self.ready = true
+                self.answerConnect(true)
+            case .failed, .cancelled, .waiting:
+                self.ready = false
+                self.connection = nil
+                c.cancel()
+                if self.connectWaiter != nil { self.answerConnect(false) }
+                else if self.busy { self.finish(nil, "error_connection_lost", retryable: self.buffer.isEmpty) }
+            default:
+                break
+            }
+        }
+        c.start(queue: queue)
+    }
+
+    private func send(_ gen: Int) {
+        guard let c = connection, let job = pending.first else { finish(nil, "error_connect", retryable: false); return }
+        let hostHeader = security.controlServerName ?? security.host
+        var request = Data(("POST \(path) HTTP/1.1\r\nHost: \(hostHeader)\r\nContent-Type: application/dns-message\r\n"
+            + "Content-Length: \(job.query.count)\r\n\r\n").utf8)
+        request.append(job.query)
+        buffer = Data()
+        c.send(content: request, completion: .contentProcessed { [weak self] error in
+            guard let self, self.busy, self.generation == gen else { return }
+            if error != nil { self.finish(nil, "error_send", retryable: true); return }
+            self.receive(c, gen)
+        })
+    }
+
+    private func receive(_ c: NWConnection, _ gen: Int) {
+        c.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+            guard let self, self.busy, self.generation == gen else { return }
+            if let data, !data.isEmpty { self.buffer.append(data) }
+            switch Self.parse(self.buffer) {
+            case .answer(let status, let body, let keepAlive):
+                if !keepAlive { self.drop() }
+                if status != 200 { self.finish(nil, "http_\(status)", retryable: false) }
+                else if body.isEmpty { self.finish(nil, "empty", retryable: false) }
+                else { self.finish(body, "ok", retryable: false) }
+            case .malformed:
+                self.finish(nil, "error_response_unusable", retryable: false)
+            case .incomplete:
+                if error != nil || isComplete { self.finish(nil, "error_connection_closed", retryable: self.buffer.isEmpty) }
+                else { self.receive(c, gen) }
+            }
+        }
+    }
+
+    /// retryable: the failure came from the connection, before any byte of an answer. A connection the Edge
+    /// closed while it sat idle fails exactly this way on its next use, so the query is sent once more on a
+    /// fresh one instead of being answered SERVFAIL for the Edge's housekeeping.
+    private func finish(_ answer: Data?, _ reason: String, retryable: Bool) {
+        guard busy, !pending.isEmpty else { return }
+        generation += 1
+        busy = false
+        if answer == nil {
+            let reused = carried > 0
+            drop()
+            if retryable, reused, pending[0].attempts == 0 {
+                pending[0].attempts = 1
+                pump()
+                return
+            }
+        } else {
+            carried += 1
+        }
+        let job = pending.removeFirst()
+        job.outcome(answer, reason)
+        pump()
+    }
+
+    private func drop() {
+        ready = false
+        carried = 0
+        connectWaiter = nil
+        if let c = connection {
+            connection = nil
+            c.stateUpdateHandler = nil
+            c.cancel()
+        }
+    }
+
+    enum Parsed: Equatable {
+        case incomplete
+        case malformed
+        case answer(status: Int, body: Data, keepAlive: Bool)
+    }
+
+    /// One HTTP/1.1 response with a Content-Length, as the Edge writes a DNS answer. Anything else is malformed:
+    /// this is not a general HTTP client, and guessing where a response ends would hand one query another's answer.
+    static func parse(_ raw: Data) -> Parsed {
+        guard let headEnd = raw.range(of: Data("\r\n\r\n".utf8)) else {
+            return raw.count > 16384 ? .malformed : .incomplete
+        }
+        guard let head = String(data: raw[raw.startIndex..<headEnd.lowerBound], encoding: .utf8) else { return .malformed }
+        let lines = head.components(separatedBy: "\r\n")
+        let statusParts = lines[0].split(separator: " ")
+        guard statusParts.count >= 2, statusParts[0].hasPrefix("HTTP/1."), let status = Int(statusParts[1]) else { return .malformed }
+        var length: Int?
+        var keepAlive = true
+        for line in lines.dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[line.startIndex..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            if name == "content-length" { length = Int(value) }
+            if name == "connection", value.lowercased() == "close" { keepAlive = false }
+            if name == "transfer-encoding" { return .malformed }
+        }
+        guard let length, length >= 0, length <= 65535 + 1024 else { return .malformed }
+        let bodyStart = headEnd.upperBound
+        let have = raw.endIndex - bodyStart
+        if have < length { return .incomplete }
+        if have > length { return .malformed }
+        return .answer(status: status, body: Data(raw[bodyStart..<raw.endIndex]), keepAlive: keepAlive)
     }
 }

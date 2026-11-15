@@ -678,6 +678,7 @@ func registerTenantInterceptionAuthorityAdminRoute(mux *http.ServeMux,
 			// So: sending nothing means "make one for this organization". It goes through Import like any
 			// other, so there is one set of checks and one shape in the store.
 			minted := false
+			var sealedRootCRL []byte
 			rootPEM, issuingPEM, issuingKeyPEM := body.RootPEM, body.IssuingCertPEM, body.IssuingKeyPEM
 			if strings.TrimSpace(rootPEM) == "" && strings.TrimSpace(issuingPEM) == "" &&
 				strings.TrimSpace(issuingKeyPEM) == "" {
@@ -699,7 +700,7 @@ func registerTenantInterceptionAuthorityAdminRoute(mux *http.ServeMux,
 					}
 				}
 				var mintErr error
-				rootPEM, issuingPEM, issuingKeyPEM, mintErr = mintTenantInterceptionAuthority(tenant, name, time.Now())
+				rootPEM, issuingPEM, issuingKeyPEM, sealedRootCRL, mintErr = mintTenantInterceptionAuthorityPublishingAt(tenant, name, time.Now(), tenantInterceptionCRLOrigins())
 				if mintErr != nil {
 					writeError(w, http.StatusInternalServerError, mintErr)
 					return
@@ -709,7 +710,13 @@ func registerTenantInterceptionAuthorityAdminRoute(mux *http.ServeMux,
 					"authority its Edges sign that organization's traffic under, and every Edge takes the same "+
 					"one", tenant, name)
 			}
-			row, err := authority.Import(tenant, rootPEM, issuingPEM, issuingKeyPEM, body.RootCRL)
+			var row *storedTenantInterceptionIssuer
+			var err error
+			if minted {
+				row, err = authority.ImportMadeHere(tenant, rootPEM, issuingPEM, issuingKeyPEM, sealedRootCRL)
+			} else {
+				row, err = authority.Import(tenant, rootPEM, issuingPEM, issuingKeyPEM, body.RootCRL)
+			}
 			if err != nil {
 				writeError(w, http.StatusBadRequest, err)
 				return

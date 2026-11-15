@@ -382,19 +382,54 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 			return
 		}
 		profile := edgeplane.ApplicationRouteProfileFor(applicationID, merged)
-		conn, connectorFound, err := connectorForApplication(r.Context(), r, registry, applicationCatalogStore, tenantID, applicationID)
+		// The organization's boundary is read once, when the first candidate is weighed, and a failure to read
+		// it is reported as before: only when a connector was found.
+		var (
+			allowedRegions []string
+			residencyRead  bool
+			residencyErr   error
+		)
+		readResidency := func() {
+			if residencyRead {
+				return
+			}
+			residencyRead = true
+			if tenantModelStore == nil {
+				return
+			}
+			tenant, err := tenantModelStore.Get(r.Context(), tenantID)
+			if err != nil {
+				residencyErr = err
+				return
+			}
+			allowedRegions = tenant.AllowedRegions
+		}
+		// Among the connectors fronting the application, test the one a flow would be carried by: the same
+		// resolution, tunnel here or relay to its Region, that ConnectorProbeSession uses below.
+		conn, connectorFound, err := connectorForApplicationPreferring(r.Context(), r, registry, applicationCatalogStore, tenantID, applicationID,
+			func(candidate model.ConnectorRegistration) bool {
+				readResidency()
+				if residencyErr != nil {
+					return false
+				}
+				session, _ := edgeplane.ConnectorProbeSession(candidate, profile.Destination, evaluator.EdgeRegionID,
+					allowedRegions, config.MeshEligible, tunnelManager, config.PeerEdges)
+				if session == nil {
+					return false
+				}
+				_, heldHere := tunnelManager.Get(candidate.ID)
+				return connectorWorthPreferring(candidate, heldHere, time.Now().UTC())
+			})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		var allowedRegions []string
-		if connectorFound && tenantModelStore != nil {
-			tenant, err := tenantModelStore.Get(r.Context(), tenantID)
-			if err != nil {
+		if connectorFound {
+			readResidency()
+			if residencyErr != nil {
 				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant residency state is unavailable"))
 				return
 			}
-			allowedRegions = tenant.AllowedRegions
 		}
 		var (
 			session         *tunnel.Session

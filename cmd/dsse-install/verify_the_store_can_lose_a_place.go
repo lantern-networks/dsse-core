@@ -88,6 +88,21 @@ func verifyTheStoreCanLoseAPlace(dir string, env map[string]string) []verifyResu
 	// all multi-machine, so nothing noticed until the single-machine one was walked again. The test for "one
 	// machine" is deploymentIsASingleMachine, which the doorway check beside this one already uses; the old
 	// condition stays only for a store this walk could not ask anyway.
+	// ★ AND SO IS A PROFILE THAT DECLARES ONE AUTHORITY HOST. Installed on three machines,
+	// one-region-multi-edge ran every step and -verify ended "1 of 53 checks failed" on this check. That profile is one control-plane host with the Edge tier spread behind it; it has three machines,
+	// so it is not "one machine", and its store has one voting member because that is the shape. The check
+	// beside this one already answers the profile's authority and doorway as not applicable; this one failed it.
+	if readDeploymentEnv(dir)["DSSE_TOPOLOGY_PROFILE"] == "one-region-multi-edge" {
+		return []verifyResult{{
+			ok:   true,
+			name: "the consensus store spans places",
+			note: "one-region-multi-edge keeps its authority and its state on one control-plane host — that is " +
+				"the shape it was installed in, not a fault — so there is no place its store can lose and the " +
+				"question this asks does not apply. Losing that host stops administration and enrolment until " +
+				"it returns, and what the Edges hold is what they go on enforcing. A layout with three voting " +
+				"store members is what survives losing one",
+		}}
+	}
 	if deploymentIsASingleMachine(dir) || !strings.EqualFold(strings.TrimSpace(env["DSSE_ETCD_CLIENT_SCHEME"]), "https") || len(hosts) == 0 {
 		return []verifyResult{{
 			ok:   true,

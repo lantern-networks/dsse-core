@@ -100,6 +100,22 @@ func BasesFromPoints(points []string, tenant string, issuer *x509.Certificate) (
 }
 
 func ParseAndValidate(der []byte, issuer *x509.Certificate, now time.Time) (*x509.RevocationList, error) {
+	return parseAndValidate(der, issuer, now, false)
+}
+
+// ParseAndValidateSealed validates a list an issuer signed once, in the moment before its key was given up.
+//
+// A root made for an organization by the deployment keeps no key: only the issuing authority beneath it is
+// held. Nothing can sign for that root again, so the one list it leaves says "nothing beneath me is revoked"
+// for as long as the issuing authority lives, and the way to withdraw that authority is to replace the root.
+// Such a list may outlast MaxValidity. It may hold no entry — a sealed list that revokes would be a list
+// somebody else wrote — and the caller must know from its own records that the root's key was not kept: a
+// list an organization sends for a root whose key it holds is never accepted on these terms.
+func ParseAndValidateSealed(der []byte, issuer *x509.Certificate, now time.Time) (*x509.RevocationList, error) {
+	return parseAndValidate(der, issuer, now, true)
+}
+
+func parseAndValidate(der []byte, issuer *x509.Certificate, now time.Time, sealed bool) (*x509.RevocationList, error) {
 	if len(der) == 0 || len(der) > MaxDERBytes || issuer == nil {
 		return nil, fmt.Errorf("missing or oversized CRL")
 	}
@@ -113,11 +129,14 @@ func ParseAndValidate(der []byte, issuer *x509.Certificate, now time.Time) (*x50
 	if !bytes.Equal(list.RawIssuer, issuer.RawSubject) || !bytes.Equal(list.AuthorityKeyId, issuer.SubjectKeyId) {
 		return nil, fmt.Errorf("CRL issuer identity mismatch")
 	}
-	if now.Before(issuer.NotBefore) || !now.Before(issuer.NotAfter) || list.ThisUpdate.After(now.Add(time.Minute)) || !list.NextUpdate.After(now) || !list.NextUpdate.After(list.ThisUpdate) || list.NextUpdate.Sub(list.ThisUpdate) > MaxValidity || list.NextUpdate.After(issuer.NotAfter) {
+	if now.Before(issuer.NotBefore) || !now.Before(issuer.NotAfter) || list.ThisUpdate.After(now.Add(time.Minute)) || !list.NextUpdate.After(now) || !list.NextUpdate.After(list.ThisUpdate) || (!sealed && list.NextUpdate.Sub(list.ThisUpdate) > MaxValidity) || list.NextUpdate.After(issuer.NotAfter) {
 		return nil, fmt.Errorf("CRL or issuer is stale, future, or exceeds its validity bound")
 	}
 	if list.Number == nil || list.Number.Sign() <= 0 {
 		return nil, fmt.Errorf("CRL number must be positive")
+	}
+	if sealed && len(list.RevokedCertificateEntries) != 0 {
+		return nil, fmt.Errorf("a sealed CRL revokes nothing; this one names %d certificate(s)", len(list.RevokedCertificateEntries))
 	}
 	seen := map[string]bool{}
 	for _, entry := range list.RevokedCertificateEntries {
@@ -241,4 +260,28 @@ func CheckChain(chain []*x509.Certificate, lists map[string][]byte, now time.Tim
 		}
 	}
 	return nil
+}
+
+// SignSealed signs the one list of an issuer whose key is about to be given up: empty, numbered 1, and valid
+// until `until`. See ParseAndValidateSealed.
+func SignSealed(issuer *x509.Certificate, key crypto.Signer, now, until time.Time) ([]byte, error) {
+	if issuer == nil || key == nil || !until.After(now) || until.After(issuer.NotAfter) {
+		return nil, fmt.Errorf("invalid sealed CRL parameters")
+	}
+	keyDER, err := x509.MarshalPKIXPublicKey(key.Public())
+	if err != nil {
+		return nil, err
+	}
+	issuerDER, err := x509.MarshalPKIXPublicKey(issuer.PublicKey)
+	if err != nil || !bytes.Equal(keyDER, issuerDER) {
+		return nil, fmt.Errorf("CRL signing key does not belong to issuer")
+	}
+	der, err := x509.CreateRevocationList(rand.Reader, &x509.RevocationList{Number: big.NewInt(1), ThisUpdate: now.UTC(), NextUpdate: until.UTC()}, issuer, key)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = ParseAndValidateSealed(der, issuer, now); err != nil {
+		return nil, err
+	}
+	return der, nil
 }

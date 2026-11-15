@@ -16,7 +16,7 @@ def unexpected_files(root, app_id, app_exec, extension_exec):
         f"{app}/Resources/lantern.icns",
     }
     for name in ("dsse-updater", "dsse-profileverify", "dsse-verify-install",
-                 "dsse-uninstall", "set-gui-trust-environment"):
+                 "dsse-uninstall", "dsse-steering", "set-gui-trust-environment"):
         allowed.add(f"Library/Application Support/Dsse/bin/{name}")
     for bundle, executable in ((app, app_exec), (extension, extension_exec)):
         for name in ("Info.plist", "_CodeSignature/CodeResources", "embedded.provisionprofile",

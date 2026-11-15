@@ -159,7 +159,7 @@ func main() {
 		if strings.TrimSpace(*stateDir) == "" || lerr != nil || !ok {
 			return false, nil // no state-dir, or nothing enrolled: the explicit flags are the whole story
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), connectorIdentityStartupTimeout)
 		defer cancel()
 		bootstrap := *connectorBootstrapSecret
 		if st.DoorListWithdrawn {

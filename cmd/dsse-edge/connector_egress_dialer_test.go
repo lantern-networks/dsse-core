@@ -162,6 +162,64 @@ func TestConnectorEgressDialerRoutesIPLiteralThroughConnector(t *testing.T) {
 	}
 }
 
+// An HTTPS flow opened to an address a connector carries, whose TLS names a host no connector declares, goes
+// through that connector to the address. Looking only at the name dialled it directly, which reaches nothing.
+func TestConnectorEgressDialerRoutesAnUndeclaredNameByItsRegisteredAddress(t *testing.T) {
+	manager := tunnel.NewManager()
+	edgeRaw, connectorRaw := net.Pipe()
+	defer edgeRaw.Close()
+	defer connectorRaw.Close()
+	session, _ := manager.Register("conn-ip", "tun-ip", tunnel.NewInProcessConn(edgeRaw, true))
+	go session.Run()
+	startFakeConnectorEcho(tunnel.NewInProcessConn(connectorRaw, false))
+
+	reg := connector.NewRegistry()
+	if _, err := reg.Register(model.ConnectorRegistration{
+		ID:              "conn-ip",
+		TenantID:        "tenant-a",
+		Status:          "active",
+		PrivateBaseURL:  "https://internal.invalid",
+		ReachableRoutes: model.ConnectorReachableRoutes{CIDRs: []string{"10.55.1.16/28"}},
+	}, time.Date(2026, 11, 15, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("register connector: %v", err)
+	}
+	direct := &recordingDirectDialer{conn: &nopReadWriteCloser{}}
+	dialer := edgeplane.ConnectorEgressDialer{ResolveConnector: connectorDestinationResolver(reg), Tunnels: manager, TenantID: "tenant-a", Direct: direct}
+
+	conn, err := dialer.OpenTCPConnection(context.Background(), edgeplane.NetworkExtensionRuntimeCopyTCPRoute{
+		Host: "10.55.1.31", Port: 443, SNI: "files.hq.example", TenantID: "tenant-a",
+	})
+	if err != nil {
+		t.Fatalf("OpenTCPConnection: %v", err)
+	}
+	defer conn.Close()
+	if direct.called {
+		t.Fatal("an address a connector carries must not be dialled directly because its TLS names an undeclared host")
+	}
+	if _, err := conn.Write([]byte("tls")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := make([]byte, 3)
+	if err := readFull(conn, got, 2*time.Second); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(got) != "TLS" {
+		t.Fatalf("echo = %q, want TLS", got)
+	}
+
+	// A public address with an undeclared name is still the internet's.
+	direct2 := &recordingDirectDialer{conn: &nopReadWriteCloser{}}
+	dialer.Direct = direct2
+	if _, err := dialer.OpenTCPConnection(context.Background(), edgeplane.NetworkExtensionRuntimeCopyTCPRoute{
+		Host: "203.0.113.10", Port: 443, SNI: "www.example.com", TenantID: "tenant-a",
+	}); err != nil {
+		t.Fatalf("OpenTCPConnection public: %v", err)
+	}
+	if !direct2.called {
+		t.Fatal("a public address must be dialled directly")
+	}
+}
+
 // TestConnectorEgressDialerFallsBackToDirect proves the self-gating safety property: a destination fronted by NO
 // connector route direct-dials exactly as before.
 func TestConnectorEgressDialerFallsBackToDirect(t *testing.T) {

@@ -289,7 +289,7 @@ func (r *Resolver) HandleQueryForTenant(ctx context.Context, tenantID string, ra
 					Header: dnsmessage.ResourceHeader{Name: q.Questions[0].Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 60},
 					Body:   &dnsmessage.AResource{A: *a},
 				}}
-				r.conntrack.Record(dns.ObservationRequest{TenantID: tenantID, FQDN: qname, ResolvedIPs: []string{sinkIP}, TTLSeconds: 60}, now)
+				r.conntrack.RecordEdgeAnswer(dns.ObservationRequest{TenantID: tenantID, FQDN: qname, ResolvedIPs: []string{sinkIP}, TTLSeconds: 60}, now)
 				r.auditOf(qname, qtype, "sinkhole", false)
 				return packResponse(q, dnsmessage.RCodeSuccess, ans)
 			}
@@ -308,7 +308,7 @@ func (r *Resolver) HandleQueryForTenant(ctx context.Context, tenantID string, ra
 					Header: dnsmessage.ResourceHeader{Name: q.Questions[0].Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 60},
 					Body:   &dnsmessage.AResource{A: *a},
 				}}
-				r.conntrack.Record(dns.ObservationRequest{TenantID: tenantID, FQDN: qname, ResolvedIPs: []string{ip}, TTLSeconds: 60}, now)
+				r.conntrack.RecordEdgeAnswer(dns.ObservationRequest{TenantID: tenantID, FQDN: qname, ResolvedIPs: []string{ip}, TTLSeconds: 60}, now)
 				r.auditOf(qname, qtype, "stub", false)
 				return packResponse(q, dnsmessage.RCodeSuccess, ans)
 			}
@@ -356,8 +356,32 @@ func (r *Resolver) HandleQueryForTenant(ctx context.Context, tenantID string, ra
 		}
 	}
 	// D1: conntrack from the response's A/AAAA records.
+	//
+	// ★ THE NAME IS REMEMBERED FOR AS LONG AS THE DEVICE MAY USE THE ADDRESS (found on a Windows walk,
+	// 2026-11-14). This recorded every answer for five minutes while handing the device the upstream's
+	// lifetime — an hour, for the name on that walk. The device stopped asking, kept connecting to the
+	// address, and five minutes later its connections arrived with no name: a rule written for the
+	// application no longer matched, and under full enforcement a private application was refused every
+	// few minutes for as long as the device's cache lasted.
+	//
+	// Two things now hold together. The answer the device is given lives no longer than
+	// dns.ConntrackDefaultTTLSeconds, so a device asks again at least that often — which is also what brings
+	// the name back after this Edge restarts or the device moves to another Edge that never saw the question.
+	// And the name is kept for the lifetime the device was actually given, plus a margin for a connection
+	// opened at the last moment.
 	if ips := ExtractResolvedIPs(resp); len(ips) > 0 {
-		r.conntrack.Record(dns.ObservationRequest{TenantID: tenantID, FQDN: qname, ResolvedIPs: ips, TTLSeconds: dns.ConntrackDefaultTTLSeconds}, now)
+		lifetime := longestAddressLifetime(resp)
+		if shorter, ok := withAddressLifetimeAtMost(resp, uint32(dns.ConntrackDefaultTTLSeconds)); ok {
+			resp = shorter
+			if lifetime > uint32(dns.ConntrackDefaultTTLSeconds) {
+				lifetime = uint32(dns.ConntrackDefaultTTLSeconds)
+			}
+		}
+		remember := int(lifetime) + nameMemoryMarginSeconds
+		if remember < dns.ConntrackDefaultTTLSeconds {
+			remember = dns.ConntrackDefaultTTLSeconds
+		}
+		r.conntrack.RecordEdgeAnswer(dns.ObservationRequest{TenantID: tenantID, FQDN: qname, ResolvedIPs: ips, TTLSeconds: remember}, now)
 	}
 	r.auditOf(qname, qtype, decision, echStripped)
 	return resp, nil
@@ -404,6 +428,71 @@ func packResponse(q dnsmessage.Message, rcode dnsmessage.RCode, answers []dnsmes
 }
 
 // ExtractResolvedIPs returns the A/AAAA addresses in a DNS response.
+// Record types that sign the whole message (RFC 8945 TSIG, RFC 2931 SIG(0)).
+const (
+	dnsTypeSIG  dnsmessage.Type = 24
+	dnsTypeTSIG dnsmessage.Type = 250
+)
+
+// nameMemoryMarginSeconds is how much longer than the device's own cache the name for an address is kept: a
+// connection opened in the cache's last second still has a name when it reaches the decision.
+const nameMemoryMarginSeconds = 60
+
+// longestAddressLifetime is the longest TTL among the address records of an answer, in seconds.
+func longestAddressLifetime(raw []byte) uint32 {
+	var m dnsmessage.Message
+	if err := m.Unpack(raw); err != nil {
+		return 0
+	}
+	var longest uint32
+	for _, rr := range m.Answers {
+		switch rr.Body.(type) {
+		case *dnsmessage.AResource, *dnsmessage.AAAAResource:
+			if rr.Header.TTL > longest {
+				longest = rr.Header.TTL
+			}
+		}
+	}
+	return longest
+}
+
+// withAddressLifetimeAtMost returns the answer with no address record living longer than limit seconds.
+// ok is false when nothing could be changed safely — the answer could not be read or written back — and the
+// original is then returned untouched; the caller remembers the name for the answer's own lifetime instead.
+func withAddressLifetimeAtMost(raw []byte, limit uint32) (out []byte, ok bool) {
+	var m dnsmessage.Message
+	if err := m.Unpack(raw); err != nil {
+		return raw, false
+	}
+	// A message signed as a whole is handed over as it arrived. TSIG (and SIG(0)) authenticate every byte of
+	// the message, the lifetimes included; changing one and keeping the signature makes a correct answer fail
+	// its check at the client that asked for it to be signed (review, 2026-11-14). The caller then remembers
+	// the name for the lifetime the answer really carries.
+	for _, rr := range m.Additionals {
+		if rr.Header.Type == dnsTypeTSIG || rr.Header.Type == dnsTypeSIG {
+			return raw, false
+		}
+	}
+	changed := false
+	for i := range m.Answers {
+		switch m.Answers[i].Body.(type) {
+		case *dnsmessage.AResource, *dnsmessage.AAAAResource:
+			if m.Answers[i].Header.TTL > limit {
+				m.Answers[i].Header.TTL = limit
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return raw, true
+	}
+	packed, err := m.Pack()
+	if err != nil {
+		return raw, false
+	}
+	return packed, true
+}
+
 func ExtractResolvedIPs(raw []byte) []string {
 	var m dnsmessage.Message
 	if err := m.Unpack(raw); err != nil {

@@ -21,7 +21,7 @@ async function ewObservations(section) {
   const cov = typeof conv.coverage_percent === "number" ? conv.coverage_percent.toFixed(0) : "0";
   section.appendChild(el("p", { class: "ui-view-desc", text: bl({
     en: obs.length + " observed lateral flows · " + (conv.covered_flows || 0) + " covered by rules (" + cov + "%) · " + (conv.uncovered_flows || 0) + " uncovered. Adopt the uncovered flows into rules; when uncovered reaches 0 it is safe to disable Allow-all.",
-    ja: "観測した横方向フロー " + obs.length + " 件 · ルールでカバー " + (conv.covered_flows || 0) + " (" + cov + "%) · 未カバー " + (conv.uncovered_flows || 0) + "。未カバーをルール化し、0 になれば Allow-all を無効化しても安全。",
+    ja: "観測した横方向フロー " + obs.length + " 件 · ルールでカバー " + (conv.covered_flows || 0) + " (" + cov + "%) · 未カバー " + (conv.uncovered_flows || 0) + "。未カバーをルール化し、0 になれば完全強制にしても安全。",
   }) }));
   if (!obs.length) { section.appendChild(emptyBox(bl({ en: "No lateral flows observed yet.", ja: "まだ横方向フローは観測されていません。" }))); return; }
 
@@ -31,7 +31,7 @@ async function ewObservations(section) {
   // Covered flows already have a rule (no button). See adoptFlowIntoRule.
   const uncoveredCount = obs.filter((o) => !o.covered).length;
   section.appendChild(el("p", { class: "ui-view-desc", text: uncoveredCount
-    ? bl({ en: uncoveredCount + " uncovered flow(s). Click Adopt to open a pre-filled rule (Source = Any, Allow) for review, then Save.", ja: "未カバー " + uncoveredCount + " 件。Adopt を押すと事前入力済みルール(送信元=Any・許可)が開くので、確認・調整して保存してください。" })
+    ? bl({ en: uncoveredCount + " uncovered flow(s). Click Adopt to open a pre-filled rule (Source = Any, Allow) for review, then Save.", ja: "未カバー " + uncoveredCount + " 件。「ルール化 →」を押すと事前入力済みルール(送信元=すべて・許可)が開くので、確認・調整して保存してください。" })
     : bl({ en: "All observed flows are already covered by rules.", ja: "観測フローはすべてルールでカバー済みです。" }) }));
 
   const rows = obs.map((o) => {

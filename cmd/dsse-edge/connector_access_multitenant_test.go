@@ -23,11 +23,12 @@ func TestConnectorAccessUsesVerifiedFlowTenantOnSharedEdge(t *testing.T) {
 		TenantID: "customer", Destination: "10.200.0.11", DestinationPort: 18082,
 		Protocol: "tcp", ConnectorRouteVerified: true, ActorType: "human",
 	}
-	if got := runtimeEvaluatorForTenant(base, store, "customer").Evaluate(request); got.Decision != "deny" || got.PolicyID != "east_west_policy" {
+	if got := runtimeEvaluatorForTenant(base, store, "customer").Evaluate(request); got.Decision != "deny" || got.PolicyID != "deny-private-app" || !decision.IsConnectorAccessDecision(got) {
+		// The row names the rule that decided, and says Connector Access made the decision.
 		t.Fatalf("customer Connector Access rule must deny on a shared Edge: %+v", got)
 	}
 	request.DestinationPort = 18081
-	if got := runtimeEvaluatorForTenant(base, store, "customer").Evaluate(request); got.Decision != "allow" {
+	if got := runtimeEvaluatorForTenant(base, store, "customer").Evaluate(request); got.Decision != "allow" || got.PolicyID != decision.EastWestPolicyClassID {
 		t.Fatalf("unmatched private app remains allowed in partial mode: %+v", got)
 	}
 	request.TenantID = "node"

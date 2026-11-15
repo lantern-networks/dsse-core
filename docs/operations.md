@@ -168,11 +168,73 @@ This interrupts that machine's services. On a three-region deployment, maintain 
 operate on one region at a time and restore its health before proceeding. Follow the
 actual project name on each host. `down -v` deletes volumes and is not a restart procedure.
 
-Before a service upgrade, retain the old revision and images, preserve recoverable state,
-and review changes to configuration and storage. This release permits incompatible changes
-without a migration path; replacing an image with an older one is not guaranteed to undo
-a state migration. Validate the target revision on a separate lab before changing a fleet.
-After a change, repeat fleet and endpoint checks plus allowed/denied traffic tests.
+### Moving a machine to another release
+
+`dsse-install -upgrade` moves the machine it runs on to the release whose installer and
+manifest you downloaded. Run it with that release's installer:
+
+```sh
+dsse-install -upgrade -dir "$DSSE_DIR" -release-manifest release-manifest.json
+```
+
+It does four things, in order:
+
+| Step | What it does |
+|---|---|
+| 1 | Writes the release's image references into `deployment.env`, records them in the stored plan, and regenerates the files the installer derives (the Compose file, launch scripts, front-door configuration). It prints the files it changed |
+| 2 | Fetches the release's images. Nothing that is running is touched yet; if the fetch fails, the previous files are put back |
+| 3 | Replaces this machine's services and waits until they run. Devices and connectors attached to this machine are disconnected while this happens and reconnect by themselves |
+| 4 | On a one-machine deployment, runs the deployment check (`-verify`). On a deployment of several machines it prints the check to run after the last machine |
+
+Authorities, certificates, secrets and stored data are not changed. The files the command
+replaced are kept in `$DSSE_DIR/upgrade-kept/<time>-from-<previous revision>/`; that
+directory is private because the kept `deployment.env` holds secrets.
+
+If the command stops after step 1 — step 3 or 4 failed, or the command was interrupted —
+correct the cause and run the same command again. While an upgrade is unfinished the
+machine holds `$DSSE_DIR/upgrade-unfinished.json`; a second run reads it, runs the
+remaining steps, and removes it when the last one passes. The command says a machine
+already runs the release, and changes and restarts nothing, only when the files are the
+release's, no upgrade is recorded as unfinished, and the machine's services are all
+running.
+
+What is interrupted while step 3 runs:
+
+- A one-machine deployment stops entirely until its services are back. In our lab that
+  took under a minute for 300 connected devices.
+- On a deployment of several regions, devices attached to the region being upgraded
+  reconnect within about half a minute; devices attached to other regions stay connected.
+- Connectors attached to the region being upgraded move to another region within
+  seconds. The other regions hold traffic for the private applications behind them
+  until they learn where the connectors moved — a few seconds in our lab — and then
+  carry it. An Edge still running a release older than this one refuses that traffic
+  until its next configuration poll instead, about half a minute.
+
+On a deployment of several machines, run the same command on each machine, one machine at
+a time, and let each machine's services come back before starting the next. Each machine
+needs the installer and the manifest. Finish with the `-verify` command the founding
+machine prints.
+
+To return a machine to the previous release, copy the kept files back over the ones in
+`$DSSE_DIR` and start the services again with the project name the command printed:
+
+```sh
+cd "$DSSE_DIR"
+cp -p upgrade-kept/<time>-from-<previous revision>/* .
+docker compose -p <project> --env-file deployment.env up -d
+```
+
+Returning to older images does not undo a change a newer release made to stored data. The
+command refuses a release whose PostgreSQL major version differs from the deployment's:
+that is a migration of the data, which it does not perform.
+
+`-up` installs a deployment and does not upgrade one: run over a directory that already
+holds a deployment, it stops and names this command.
+
+Before an upgrade, preserve recoverable state and read the release's notes for changes to
+configuration and storage: an experimental release may change stored data without a path
+back. Validate the target release on a separate lab before changing a fleet. After a change,
+repeat fleet and endpoint checks plus allowed/denied traffic tests.
 Use [Agent updates](agent-updates.md) for endpoint packages and signed manifests.
 
 ## Backups and recovery preparation

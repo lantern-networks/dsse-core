@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/deploymentcrl"
@@ -20,6 +22,55 @@ import (
 func writeDeploymentCRLServices(dir string, rootFingerprint string, origins []string) error {
 	return writeDeploymentCRLServicesAt(dir, rootFingerprint, origins,
 		"/var/lib/dsse-deployment-crl", "/usr/local/bin/dsse-deployment-crl", "/etc/systemd/system", 0)
+}
+
+// deploymentCRLHTTPListen is the plan's deployment_crl_http_listen while a plan is being installed.
+func deploymentCRLHTTPListen() (string, error) {
+	if mintingPlan == nil || strings.TrimSpace(mintingPlan.DeploymentCRLHTTPListen) == "" {
+		return "", nil
+	}
+	listen := strings.TrimSpace(mintingPlan.DeploymentCRLHTTPListen)
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil || net.ParseIP(host) == nil {
+		return "", fmt.Errorf("deployment_crl_http_listen must be an IP address and a port, like 0.0.0.0:80; got %q", listen)
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return "", fmt.Errorf("deployment_crl_http_listen has no usable port: %q", listen)
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+// deploymentCRLFrontUnits is the optional front end on the founding machine: a socket systemd holds on the
+// plan's address, and systemd's own proxy handing each connection to the loopback publisher. The publisher
+// keeps its unprivileged, keyless, loopback-only shape; nothing here reads a key or a file.
+func deploymentCRLFrontUnits(id, base, listen string) (socketName, serviceName, socketBody, serviceBody string) {
+	socketName, serviceName = base+"-front.socket", base+"-front.service"
+	socketBody = fmt.Sprintf(`[Unit]
+Description=HTTP entrance for DSSE deployment CRLs of %s
+
+[Socket]
+ListenStream=%s
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target
+`, id, listen)
+	serviceBody = fmt.Sprintf(`[Unit]
+Description=Hands DSSE deployment CRL requests of %s to the keyless publisher
+Requires=%s-publish.service
+After=%s-publish.service
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:18081
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+`, id, base, base)
+	return
 }
 
 // The private deployment tree is deliberately owned by the human installer.
@@ -71,6 +122,9 @@ func writeDeploymentCRLServicesAt(dir string, rootFingerprint string, origins []
 	publishCommand := strings.Join([]string{
 		systemdArg(bin), "-dir", systemdArg(runtimeDir), "-mode serve -origins",
 		systemdArg(strings.Join(origins, ",")), "-listen 127.0.0.1:18081",
+		// The same entrance answers for the lists of an organization's interception authority made here:
+		// those are served by the control plane, which this machine publishes on loopback 18080.
+		"-inspection-crl-upstream 127.0.0.1:18080",
 	}, " ")
 	renewUnit := fmt.Sprintf(`[Unit]
 Description=DSSE deployment CRL signer for %s
@@ -127,17 +181,36 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 [Install]
 WantedBy=multi-user.target
 `, id, base, publicBinds.String(), publishCommand, systemdArg(filepath.Join(absolute, "authority")))
-	installBody := deploymentCRLActivationScript(absolute, stageBase, stage, bin, unitDir, stageUID, publicFiles,
-		[]string{renewService, timer, publishService})
-	for _, item := range []struct {
+	units := []string{renewService, timer, publishService}
+	files := []struct {
 		name, body string
 		mode       os.FileMode
 	}{
 		{renewService, renewUnit, 0o644},
 		{timer, timerBody, 0o644},
 		{publishService, publishUnit, 0o644},
-		{"install-deployment-crl-services.sh", installBody, 0o755},
-	} {
+	}
+	listen, err := deploymentCRLHTTPListen()
+	if err != nil {
+		return err
+	}
+	if listen != "" {
+		socketName, serviceName, socketBody, serviceBody := deploymentCRLFrontUnits(id, base, listen)
+		units = append(units, serviceName, socketName)
+		files = append(files, struct {
+			name, body string
+			mode       os.FileMode
+		}{serviceName, serviceBody, 0o644}, struct {
+			name, body string
+			mode       os.FileMode
+		}{socketName, socketBody, 0o644})
+	}
+	installBody := deploymentCRLActivationScript(absolute, stageBase, stage, bin, unitDir, stageUID, publicFiles, units)
+	files = append(files, struct {
+		name, body string
+		mode       os.FileMode
+	}{"install-deployment-crl-services.sh", installBody, 0o755})
+	for _, item := range files {
 		if err := os.WriteFile(filepath.Join(absolute, item.name), []byte(item.body), item.mode); err != nil {
 			return err
 		}
@@ -153,7 +226,10 @@ func deploymentCRLActivationScript(source, stageBase, stage, bin, unitDir string
 	fmt.Fprintf(&b, "source=%s\nstage_base=%s\nstage=%s\nbin=%s\nunit_dir=%s\nstage_uid=%d\n",
 		shellQuote(source), shellQuote(stageBase), shellQuote(stage), shellQuote(bin), shellQuote(unitDir), stageUID)
 	b.WriteString("test \"$(id -u)\" -eq \"$stage_uid\" || { echo 'Run activation as the service administrator' >&2; exit 1; }\n")
-	b.WriteString("test -d \"$source\" && test ! -L \"$source\" && test \"$(stat -c %a \"$source\")\" -eq 700 || exit 1\n")
+	// The deployment directory is 0755 when the installer made it and 0700 when an operator did; what matters
+	// is that nobody but its owner can replace what is in it. The keys inside are checked one by one below.
+	b.WriteString("test -d \"$source\" && test ! -L \"$source\" || exit 1\n")
+	b.WriteString("source_mode=$(stat -c %a \"$source\")\ntest \"$((0$source_mode & 022))\" -eq 0 || exit 1\n")
 	b.WriteString("issuer_uid=$(stat -c %u \"$source\")\n")
 	b.WriteString("test -d \"$source/authority\" && test ! -L \"$source/authority\" && test \"$(stat -c %u \"$source/authority\")\" -eq \"$issuer_uid\" && test \"$(stat -c %a \"$source/authority\")\" -eq 700 || exit 1\n")
 	b.WriteString("test -d \"$source/deployment-crl\" && test ! -L \"$source/deployment-crl\" && test \"$(stat -c %u \"$source/deployment-crl\")\" -eq \"$issuer_uid\" || exit 1\n")
@@ -217,8 +293,20 @@ func deploymentCRLActivationScript(source, stageBase, stage, bin, unitDir string
 		fmt.Fprintf(&b, "install -m 0644 %s %s\n", shellQuote(filepath.Join(source, name)), shellQuote(filepath.Join(unitDir, name)))
 	}
 	fmt.Fprintf(&b, "systemctl daemon-reload\nsystemctl start %s\nsystemctl enable --now %s %s\n", units[0], units[1], units[2])
+	if len(units) > 4 {
+		// units[4] is the front socket; its service is started by the first connection.
+		fmt.Fprintf(&b, "systemctl enable --now %s\n", units[4])
+	}
 	b.WriteString("echo 'Issuer renewal and local keyless publication active. Verify every public HTTP CDP with dsse-install -preflight before starting nodes.'\n")
-	return b.String()
+	// A check that fails says which one. The script exits on the first failure, and until it named the line a
+	// failure looked like a script that printed nothing and had done nothing.
+	lines := strings.Split(b.String(), "\n")
+	for i, line := range lines {
+		if strings.HasSuffix(line, "|| exit 1") {
+			lines[i] = strings.TrimSuffix(line, "exit 1") + fmt.Sprintf("{ echo \"install-deployment-crl-services.sh: the check on line %d did not hold\" >&2; exit 1; }", i+1)
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func systemdArg(s string) string {

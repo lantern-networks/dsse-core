@@ -65,6 +65,17 @@ dsse_profile_ne_appproxy() {
 	esac
 }
 
+# dsse_profile_ne_dnsproxy <plist> — the DNS Proxy value THIS profile grants, by the same rule as App Proxy:
+# Developer ID grants "dns-proxy-systemextension", Development grants "dns-proxy".
+dsse_profile_ne_dnsproxy() {
+	vals="$(plutil -extract 'Entitlements.com\.apple\.developer\.networking\.networkextension' json -o - "$1" 2>/dev/null)" || return 1
+	case "$vals" in
+	*'"dns-proxy-systemextension"'*) echo "dns-proxy-systemextension" ;;
+	*'"dns-proxy"'*) echo "dns-proxy" ;;
+	*) return 1 ;;
+	esac
+}
+
 # dsse_profile_app_group <plist> — the explicitly-named app group, ignoring the "<TEAM>.*" wildcard.
 #
 # Both forms are granted (measured), and the wildcard would satisfy any string — including a typo. Returning the

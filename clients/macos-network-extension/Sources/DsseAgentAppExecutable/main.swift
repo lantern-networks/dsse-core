@@ -2,6 +2,7 @@ import AppKit
 import DsseAppProxyProviderSkeleton
 import DsseNetworkExtensionContract
 import Foundation
+import Security
 @preconcurrency import NetworkExtension
 import OSLog
 import SystemExtensions
@@ -50,6 +51,7 @@ private func dsseResolveSystemExtensionBundleID() -> String {
 private let dsseSystemExtensionBundleID = dsseResolveSystemExtensionBundleID()
 private let dsseAgentConfigPath = "/Library/Application Support/Dsse/agent_config.json"
 private let dsseTransparentProxyManagerDescription = "Dsse Transparent Proxy"
+private let dsseDNSProxyManagerDescription = "Dsse DNS Proxy"
 private let activationDiagnosticHoldSeconds = 15
 private let runtimeGateRestartPollSeconds = 1
 private let runtimeGateRestartMaxPolls = 8
@@ -87,6 +89,8 @@ final class DsseNetworkExtensionManagerConfigurator: @unchecked Sendable {
     // watchdogHandleUnexpectedStop: it reloads preferences and restarts ONLY while isEnabled is still true, so an
     // operator/watchdog `--disable` is never resurrected. Restarts are capped to avoid a crash-loop hot restart.
     private var watchdogArmed = false
+    private var startWasAttempted = false
+    private var startRetries = 0
     private var watchdogRestartAttempts = 0
     private var lastWatchdogRestart = Date.distantPast
 
@@ -131,6 +135,11 @@ final class DsseNetworkExtensionManagerConfigurator: @unchecked Sendable {
                         completion(loadError)
                         return
                     }
+                    self.setDNSProxy(enabled: true) { dnsError in
+                        // The flows are steered either way; a DNS proxy that could not be saved is logged and
+                        // retried at the next launch, and the device's DNS stays where it was meanwhile.
+                        log("DNS proxy enable completed error=\(dnsError.map { nonsecretErrorDetail($0) } ?? "none")")
+                    }
                     self.startRuntimeGate(manager: manager, completion: completion)
                 }
             }
@@ -146,6 +155,17 @@ final class DsseNetworkExtensionManagerConfigurator: @unchecked Sendable {
     /// session watched a live Mac lose all connectivity when the NE could not carry traffic — leaving the
     /// config installed at uninstall time is that failure, made permanent.
     func remove(completion: @escaping @Sendable (Error?) -> Void) {
+        removeDNSProxy { dnsError in
+            if let dnsError {
+                log("DNS proxy removal failed: \(nonsecretErrorDetail(dnsError))")
+                completion(dnsError)
+                return
+            }
+            self.removeTransparentProxy(completion: completion)
+        }
+    }
+
+    private func removeTransparentProxy(completion: @escaping @Sendable (Error?) -> Void) {
         log("loading NETransparentProxyManager preferences for removal")
         NETransparentProxyManager.loadAllFromPreferences { managers, error in
             if let error {
@@ -190,6 +210,132 @@ final class DsseNetworkExtensionManagerConfigurator: @unchecked Sendable {
     // NetworkExtension management entitlement. Idempotent: a no-op if no managed
     // configuration is present. NOTE: this only clears isEnabled — for uninstall use `remove` above.
     func disable(completion: @escaping @Sendable (Error?) -> Void) {
+        setDNSProxy(enabled: false) { dnsError in
+            log("DNS proxy disable completed error=\(dnsError.map { nonsecretErrorDetail($0) } ?? "none")")
+            self.disableTransparentProxy { proxyError in
+                completion(proxyError ?? dnsError)
+            }
+        }
+    }
+
+    /// Turn steering back on after `--disable`, from the command line, and say whether it came up.
+    ///
+    /// `--disable` had no opposite. The resident app does nothing when it is opened again, so the only way back
+    /// was to quit it and launch it — which nothing on the Mac says.
+    ///
+    /// It enables the configuration that is already installed and starts it; it installs nothing. The start is
+    /// submitted again while the tunnel has not connected, for the same reason the resident app retries one.
+    func enable(completion: @escaping @Sendable (Error?) -> Void) {
+        NETransparentProxyManager.loadAllFromPreferences { managers, error in
+            if let error {
+                completion(error)
+                return
+            }
+            let matched = (managers ?? []).first { manager in
+                (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == dsseSystemExtensionBundleID
+            }
+            guard let manager = matched else {
+                log("no Dsse transparent proxy configuration is installed; open the app (or install the package) first")
+                completion(NSError(domain: "DsseAgent", code: 1))
+                return
+            }
+            manager.isEnabled = true
+            manager.saveToPreferences { saveError in
+                if let saveError {
+                    completion(saveError)
+                    return
+                }
+                manager.loadFromPreferences { loadError in
+                    if let loadError {
+                        completion(loadError)
+                        return
+                    }
+                    self.setDNSProxy(enabled: true) { dnsError in
+                        log("DNS proxy enable completed error=\(dnsError.map { nonsecretErrorDetail($0) } ?? "none")")
+                        DispatchQueue.main.async {
+                            self.startUntilConnected(manager: manager, attempt: 1, dnsError: dnsError, completion: completion)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func startUntilConnected(manager: NETransparentProxyManager, attempt: Int, dnsError: Error?,
+                                     completion: @escaping @Sendable (Error?) -> Void) {
+        switch manager.connection.status {
+        case .connected:
+            completion(dnsError)
+            return
+        case .disconnected, .invalid:
+            if attempt > 10 {
+                log("enable: the tunnel did not connect after \(attempt - 1) attempts")
+                completion(NSError(domain: "DsseAgent", code: 2))
+                return
+            }
+            submitStartVPNTunnel(manager: manager) { _ in }
+        default:
+            break   // connecting / reasserting / disconnecting: wait
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(3)) {
+            self.startUntilConnected(manager: manager, attempt: attempt + 1, dnsError: dnsError, completion: completion)
+        }
+    }
+
+    // The Mac's DNS goes to the Edge through the extension's DNS proxy provider while steering is on. It is
+    // enabled and disabled with the transparent proxy, and removed with it.
+    func setDNSProxy(enabled requested: Bool, completion: @escaping @Sendable (Error?) -> Void) {
+        // The provider carries DNS only on macOS 15 and later. A DNS proxy the system hands queries to and the
+        // provider cannot carry does not fall back to the Mac's resolvers — the queries are dropped. So on
+        // earlier systems it is never enabled, and one an earlier build enabled is turned off.
+        var enabled = requested
+        if #unavailable(macOS 15.0) {
+            if requested { log("DNS proxy: not enabled on this macOS (needs 15 or later); name lookups stay with the Mac's resolvers") }
+            enabled = false
+        }
+        let manager = NEDNSProxyManager.shared()
+        manager.loadFromPreferences { loadError in
+            if let loadError {
+                completion(loadError)
+                return
+            }
+            if !enabled && manager.providerProtocol == nil {
+                completion(nil)
+                return
+            }
+            let providerProtocol = (manager.providerProtocol as? NEDNSProxyProviderProtocol) ?? NEDNSProxyProviderProtocol()
+            providerProtocol.providerBundleIdentifier = dsseSystemExtensionBundleID
+            manager.providerProtocol = providerProtocol
+            manager.localizedDescription = dsseDNSProxyManagerDescription
+            manager.isEnabled = enabled
+            manager.saveToPreferences { saveError in
+                completion(saveError)
+            }
+        }
+    }
+
+    private func removeDNSProxy(completion: @escaping @Sendable (Error?) -> Void) {
+        let manager = NEDNSProxyManager.shared()
+        manager.loadFromPreferences { loadError in
+            if let loadError {
+                completion(loadError)
+                return
+            }
+            guard manager.providerProtocol != nil else {
+                log("no Dsse DNS proxy configuration present; nothing to remove")
+                completion(nil)
+                return
+            }
+            manager.removeFromPreferences { removeError in
+                if removeError == nil {
+                    log("DNS proxy configuration REMOVED (DNS returns to the system resolvers)")
+                }
+                completion(removeError)
+            }
+        }
+    }
+
+    private func disableTransparentProxy(completion: @escaping @Sendable (Error?) -> Void) {
         log("loading NETransparentProxyManager preferences for disable")
         NETransparentProxyManager.loadAllFromPreferences { managers, error in
             if let error {
@@ -243,10 +389,14 @@ final class DsseNetworkExtensionManagerConfigurator: @unchecked Sendable {
                 // Healthy: arm the watchdog and clear the crash-loop counter.
                 self.watchdogArmed = true
                 self.watchdogRestartAttempts = 0
+            case .connecting:
+                self.startWasAttempted = true
             case .disconnected, .invalid:
                 // Only after a successful connect — never during the initial configure/start sequence.
                 if self.watchdogArmed {
                     self.watchdogHandleUnexpectedStop(manager: manager)
+                } else if self.startWasAttempted {
+                    self.retryAStartThatDidNotTake(manager: manager)
                 }
             default:
                 break
@@ -254,6 +404,35 @@ final class DsseNetworkExtensionManagerConfigurator: @unchecked Sendable {
         }
 
         restartRuntimeGateIfNeeded(manager: manager, completion: completion)
+    }
+
+    // ★ A START THAT DID NOT TAKE IS TRIED AGAIN. A tunnel that goes connecting -> disconnected without ever
+    // connecting was refused by the system — measured on a real Mac when the start was submitted while the
+    // system extension was still coming up (NEAgentErrorDomain 2). Nothing retried it: the app stayed resident,
+    // the proxy stayed down, and every connection left the Mac directly with nothing on screen. The watchdog
+    // above does not cover it because it arms only after a first connect.
+    //
+    // Like the watchdog it reloads preferences first and does nothing when isEnabled is false, so a `--disable`
+    // is never undone, and it stops after a few attempts.
+    private func retryAStartThatDidNotTake(manager: NETransparentProxyManager) {
+        guard startRetries < 6 else {
+            log("start retry: the tunnel did not start after \(startRetries) attempts — leaving it down; this Mac is NOT steered")
+            return
+        }
+        startRetries += 1
+        let attempt = startRetries
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(3)) { [weak self] in
+            manager.loadFromPreferences { loadError in
+                guard let self, loadError == nil, manager.isEnabled, !self.watchdogArmed else { return }
+                switch manager.connection.status {
+                case .disconnected, .invalid:
+                    log("start retry: the tunnel went down before it ever connected — attempt \(attempt) via startVPNTunnel")
+                    DispatchQueue.main.async { self.submitStartVPNTunnel(manager: manager) { _ in } }
+                default:
+                    break
+                }
+            }
+        }
     }
 
     // Restart the provider after an UNEXPECTED stop, but only if it is still supposed to be running. Reloading
@@ -403,6 +582,7 @@ final class DsseSystemExtensionRequestDelegate: NSObject, OSSystemExtensionReque
     /// deactivation, and its activation path RE-CONFIGURES the NE manager — which on an uninstall would put the
     /// transparent-proxy configuration straight back after we just removed it. This flag keeps them apart.
     private var isUninstalling = false
+    private var activeExtensionIsAlreadyThisOne = false
 
     func submitActivationRequest() {
         let request = OSSystemExtensionRequest.activationRequest(
@@ -440,6 +620,15 @@ final class DsseSystemExtensionRequestDelegate: NSObject, OSSystemExtensionReque
         actionForReplacingExtension existing: OSSystemExtensionProperties,
         withExtension replacement: OSSystemExtensionProperties
     ) -> OSSystemExtensionRequest.ReplacementAction {
+        if existing.bundleVersion == replacement.bundleVersion
+            && existing.bundleShortVersion == replacement.bundleShortVersion {
+            // Every launch of this app asks for activation. Replacing an extension with itself stops and
+            // restarts a healthy provider — a gap in steering on every login — and the start submitted right
+            // after it is the one the system refuses. The running extension is already this one.
+            log("the active System Extension is already \(existing.bundleShortVersion)/\(existing.bundleVersion); not replacing it")
+            activeExtensionIsAlreadyThisOne = true
+            return .cancel
+        }
         log("replacing existing System Extension \(existing.bundleVersion) with \(replacement.bundleVersion)")
         return .replace
     }
@@ -474,6 +663,12 @@ final class DsseSystemExtensionRequestDelegate: NSObject, OSSystemExtensionReque
             }
             return
         }
+        if activeExtensionIsAlreadyThisOne {
+            // The request was cancelled by this app, above, because there was nothing to replace.
+            activeExtensionIsAlreadyThisOne = false
+            configureNetworkExtensionManagerThenStayResident(reason: "already_active")
+            return
+        }
         scheduleTerminationAfterDiagnosticHold(reason: "activation_failed")
     }
 
@@ -505,7 +700,7 @@ let disableConfigurator = DsseNetworkExtensionManagerConfigurator()
 // this binary as root, was told "nothing to disable / error=none", and would then have deactivated the
 // extension and deleted the app — stranding a configuration that captures every flow with no provider to
 // carry it and no remaining way to remove it. See DsseNetworkConfigurationScope.
-for scopedCommand in ["--uninstall", "--disable"] where CommandLine.arguments.contains(scopedCommand) {
+for scopedCommand in ["--uninstall", "--disable", "--enable"] where CommandLine.arguments.contains(scopedCommand) {
     var consoleStat = stat()
     let consoleOwner: uid_t? = stat("/dev/console", &consoleStat) == 0 ? consoleStat.st_uid : nil
     if let refusal = DsseNetworkConfigurationScope.refusalWhenNotTheConsoleUser(
@@ -516,6 +711,45 @@ for scopedCommand in ["--uninstall", "--disable"] where CommandLine.arguments.co
         log(refusal)
         FileHandle.standardError.write(Data((refusal + "\n").utf8))
         exit(2)
+    }
+}
+
+// ★ TURNING STEERING OFF NEEDS AN ADMINISTRATOR. `--disable` and `--uninstall` take this device out from under
+// its organization's policy, and both ran for anyone logged in. Now: an approval root left moments ago (the
+// uninstaller and the steering switch, which are run with sudo), or an administrator's authentication in the
+// system's own dialog. `--enable` needs neither.
+private func administratorAuthenticated(prompt: String) -> Bool {
+    var ref: AuthorizationRef?
+    guard AuthorizationCreate(nil, nil, [], &ref) == errAuthorizationSuccess, let ref else { return false }
+    defer { AuthorizationFree(ref, [.destroyRights]) }
+    return kAuthorizationRightExecute.withCString { name in
+        var item = AuthorizationItem(name: name, valueLength: 0, value: nil, flags: 0)
+        return withUnsafeMutablePointer(to: &item) { itemPointer in
+            var rights = AuthorizationRights(count: 1, items: itemPointer)
+            return prompt.withCString { promptPointer in
+                var promptItem = AuthorizationItem(name: kAuthorizationEnvironmentPrompt, valueLength: strlen(promptPointer),
+                                                   value: UnsafeMutableRawPointer(mutating: promptPointer), flags: 0)
+                return withUnsafeMutablePointer(to: &promptItem) { promptItemPointer in
+                    var environment = AuthorizationEnvironment(count: 1, items: promptItemPointer)
+                    let flags: AuthorizationFlags = [.interactionAllowed, .extendRights, .destroyRights]
+                    return AuthorizationCopyRights(ref, &rights, &environment, flags, nil) == errAuthorizationSuccess
+                }
+            }
+        }
+    }
+}
+
+for guarded in ["--uninstall", "--disable"] where CommandLine.arguments.contains(guarded) {
+    if DsseAdministratorApproval.rootApproved(command: guarded) {
+        log("\(guarded): approved by root")
+    } else if administratorAuthenticated(prompt: "Lantern DSSE: an administrator must approve turning this Mac's steering off.") {
+        log("\(guarded): approved by an administrator's authentication")
+    } else {
+        let refusal = "\(guarded) REFUSED: turning this Mac's steering off needs an administrator. "
+            + "Run it with sudo:  sudo \"/Library/Application Support/Dsse/bin/dsse-steering\" off   "
+            + "(or, to remove the agent:  sudo \"/Library/Application Support/Dsse/bin/dsse-uninstall\")"
+        log(refusal)
+        exit(7)
     }
 }
 
@@ -552,6 +786,17 @@ if CommandLine.arguments.contains("--uninstall") {
             log("disable completed error=\(error.map { nonsecretErrorDetail($0) } ?? "none")")
             DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(2)) {
                 if error != nil { exit(5) }
+                NSApplication.shared.terminate(nil)
+            }
+        }
+    }
+} else if CommandLine.arguments.contains("--enable") {
+    log("DsseAgent --enable invoked; enabling the installed transparent proxy and DNS proxy")
+    DispatchQueue.main.async {
+        disableConfigurator.enable { error in
+            log("enable completed error=\(error.map { nonsecretErrorDetail($0) } ?? "none")")
+            DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(1)) {
+                if error != nil { exit(6) }
                 NSApplication.shared.terminate(nil)
             }
         }

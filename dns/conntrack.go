@@ -50,11 +50,18 @@ type ConntrackStore struct {
 	entries  map[string]conntrackEntry
 	order    []string
 	capacity int
+	// byName answers the other question: which addresses this Edge gave a tenant's devices for a name. It is
+	// kept apart from entries on purpose. entries holds ONE name per address — the latest asked — and several
+	// names commonly share one address; an index that followed entries forgot every earlier name the moment a
+	// later one was resolved to the same address.
+	byName        map[string]map[string]time.Time
+	nameOrder     []string
+	nameAddresses int
 }
 
 // NewConntrackStore returns an empty conntrack with the default capacity.
 func NewConntrackStore() *ConntrackStore {
-	return &ConntrackStore{entries: map[string]conntrackEntry{}, capacity: conntrackDefaultCapacity}
+	return &ConntrackStore{entries: map[string]conntrackEntry{}, capacity: conntrackDefaultCapacity, byName: map[string]map[string]time.Time{}}
 }
 
 func conntrackKey(tenantID, ip string) string {
@@ -64,6 +71,18 @@ func conntrackKey(tenantID, ip string) string {
 // Record folds a DNS resolution observation into the conntrack (one entry per resolved IP) with a
 // TTL, bounded FIFO. Returns the number of entries recorded.
 func (s *ConntrackStore) Record(req ObservationRequest, now time.Time) int {
+	return s.record(req, now, false)
+}
+
+// RecordEdgeAnswer records an answer THIS EDGE'S RESOLVER gave a tenant's devices. Besides the address-to-name
+// entry every observation makes, it is remembered by name, and only these are: LookupAddresses decides where a
+// named flow goes, and an observation reported from outside — a device or a connector saying "this name is at
+// that address" — is not this Edge's answer and must never become one.
+func (s *ConntrackStore) RecordEdgeAnswer(req ObservationRequest, now time.Time) int {
+	return s.record(req, now, true)
+}
+
+func (s *ConntrackStore) record(req ObservationRequest, now time.Time, edgeAnswer bool) int {
 	fqdn := strings.TrimSpace(req.FQDN)
 	if fqdn == "" || len(req.ResolvedIPs) == 0 {
 		return 0
@@ -86,6 +105,9 @@ func (s *ConntrackStore) Record(req ObservationRequest, now time.Time) int {
 			s.order = append(s.order, key)
 		}
 		s.entries[key] = conntrackEntry{fqdn: fqdn, appID: strings.TrimSpace(req.ApplicationID), expiresAt: exp}
+		if edgeAnswer {
+			s.indexLocked(req.TenantID, fqdn, ip, exp, now)
+		}
 		n++
 	}
 	if s.capacity > 0 {
@@ -94,11 +116,109 @@ func (s *ConntrackStore) Record(req ObservationRequest, now time.Time) int {
 			s.order = s.order[1:]
 			delete(s.entries, oldest)
 		}
+		s.boundNameIndexLocked()
 		if len(s.order) > 2*s.capacity {
 			s.order = append([]string(nil), s.order...)
 		}
 	}
 	return n
+}
+
+func nameKey(tenantID, fqdn string) string {
+	return strings.TrimSpace(tenantID) + "|" + strings.TrimSuffix(strings.ToLower(strings.TrimSpace(fqdn)), ".")
+}
+
+func (s *ConntrackStore) indexLocked(tenantID, fqdn, ip string, exp, now time.Time) {
+	if s.byName == nil {
+		s.byName = map[string]map[string]time.Time{}
+	}
+	k := nameKey(tenantID, fqdn)
+	set := s.byName[k]
+	if set == nil {
+		set = map[string]time.Time{}
+		s.byName[k] = set
+		s.nameOrder = append(s.nameOrder, k)
+	}
+	// What has lapsed for this name goes now, not when somebody next asks for it.
+	for other, until := range set {
+		if !now.Before(until) {
+			delete(set, other)
+			s.nameAddresses--
+		}
+	}
+	if _, had := set[ip]; !had {
+		s.nameAddresses++
+	}
+	if exp.After(set[ip]) {
+		set[ip] = exp
+	}
+}
+
+// boundNameIndexLocked holds the name index to the same capacity as the address entries, counted in ADDRESSES:
+// a single name with many answers is as large as many names with one. The oldest names go first, and a name
+// larger than the whole capacity loses addresses until it fits. The order list never outgrows the names it
+// orders.
+func (s *ConntrackStore) boundNameIndexLocked() {
+	if s.capacity <= 0 {
+		return
+	}
+	for s.nameAddresses > s.capacity && len(s.nameOrder) > 1 {
+		oldest := s.nameOrder[0]
+		s.nameOrder = s.nameOrder[1:]
+		s.nameAddresses -= len(s.byName[oldest])
+		delete(s.byName, oldest)
+	}
+	if s.nameAddresses > s.capacity && len(s.nameOrder) == 1 {
+		set := s.byName[s.nameOrder[0]]
+		for ip := range set {
+			if s.nameAddresses <= s.capacity {
+				break
+			}
+			delete(set, ip)
+			s.nameAddresses--
+		}
+	}
+	if len(s.nameOrder) > 2*len(s.byName)+16 {
+		live := s.nameOrder[:0]
+		seen := map[string]struct{}{}
+		for _, k := range s.nameOrder {
+			if _, ok := s.byName[k]; ok {
+				if _, dup := seen[k]; !dup {
+					seen[k] = struct{}{}
+					live = append(live, k)
+				}
+			}
+		}
+		s.nameOrder = append([]string(nil), live...)
+	}
+}
+
+// LookupAddresses returns the addresses this Edge's resolver answered a tenant's devices with for a name and
+// that have not lapsed, in no particular order. An address another name was later resolved to is still an
+// answer for this one. Observations reported from outside are never returned.
+func (s *ConntrackStore) LookupAddresses(tenantID, fqdn string, now time.Time) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := nameKey(tenantID, fqdn)
+	var out []string
+	for ip, exp := range s.byName[k] {
+		if !now.Before(exp) {
+			delete(s.byName[k], ip)
+			s.nameAddresses--
+			continue
+		}
+		out = append(out, ip)
+	}
+	if set, ok := s.byName[k]; ok && len(set) == 0 {
+		delete(s.byName, k)
+		for i, name := range s.nameOrder {
+			if name == k {
+				s.nameOrder = append(s.nameOrder[:i], s.nameOrder[i+1:]...)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // LookupFQDN returns the recorded FQDN (and optional app id) for a tenant's resolved IP, if present

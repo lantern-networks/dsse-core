@@ -8,6 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"github.com/lantern-networks/dsse-core/inspectioncrl"
 	"math/big"
 	"strings"
 	"time"
@@ -59,9 +60,24 @@ const (
 // Interception Root" is exactly that. The tenant id goes in the subject too, because display names are not
 // unique and the id is.
 func mintTenantInterceptionAuthority(tenant, displayName string, now time.Time) (rootPEM, issuingPEM, issuingKeyPEM string, err error) {
+	rootPEM, issuingPEM, issuingKeyPEM, _, err = mintTenantInterceptionAuthorityPublishingAt(tenant, displayName, now, nil)
+	return
+}
+
+// mintTenantInterceptionAuthorityPublishingAt is the same, for a deployment that publishes revocation lists
+// at crlOrigins. The issuing certificate then names where its own status is published, and the root signs
+// the one list it will ever sign — sealed, empty, valid for as long as the issuing certificate — before its
+// key is dropped at the end of this function. With no origins nothing names a list and none is made.
+func mintTenantInterceptionAuthorityPublishingAt(tenant, displayName string, now time.Time, crlOrigins []string) (rootPEM, issuingPEM, issuingKeyPEM string, sealedRootCRL []byte, err error) {
+	rootPEM, issuingPEM, issuingKeyPEM, sealedRootCRL, err = mintTenantInterceptionAuthorityWith(tenant, displayName, now, crlOrigins)
+	return
+}
+
+func mintTenantInterceptionAuthorityWith(tenant, displayName string, now time.Time, crlOrigins []string) (rootPEM, issuingPEM, issuingKeyPEM string, sealedRootCRL []byte, err error) {
+	fail := func(e error) (string, string, string, []byte, error) { return "", "", "", nil, e }
 	tenant = strings.TrimSpace(tenant)
 	if tenant == "" {
-		return "", "", "", fmt.Errorf("an organization must be named")
+		return fail(fmt.Errorf("an organization must be named"))
 	}
 	name := strings.TrimSpace(displayName)
 	if name == "" {
@@ -71,11 +87,11 @@ func mintTenantInterceptionAuthority(tenant, displayName string, now time.Time) 
 
 	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return "", "", "", fmt.Errorf("generate the organization's root key: %w", err)
+		return fail(fmt.Errorf("generate the organization's root key: %w", err))
 	}
 	rootSerial, err := mintSerial()
 	if err != nil {
-		return "", "", "", err
+		return fail(err)
 	}
 	rootTemplate := &x509.Certificate{
 		SerialNumber: rootSerial,
@@ -97,20 +113,20 @@ func mintTenantInterceptionAuthority(tenant, displayName string, now time.Time) 
 	}
 	rootDER, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, &rootKey.PublicKey, rootKey)
 	if err != nil {
-		return "", "", "", fmt.Errorf("create the organization's root: %w", err)
+		return fail(fmt.Errorf("create the organization's root: %w", err))
 	}
 	root, err := x509.ParseCertificate(rootDER)
 	if err != nil {
-		return "", "", "", fmt.Errorf("parse the organization's root: %w", err)
+		return fail(fmt.Errorf("parse the organization's root: %w", err))
 	}
 
 	issuingKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return "", "", "", fmt.Errorf("generate the issuing key: %w", err)
+		return fail(fmt.Errorf("generate the issuing key: %w", err))
 	}
 	issuingSerial, err := mintSerial()
 	if err != nil {
-		return "", "", "", err
+		return fail(err)
 	}
 	issuingTemplate := &x509.Certificate{
 		SerialNumber: issuingSerial,
@@ -130,19 +146,37 @@ func mintTenantInterceptionAuthority(tenant, displayName string, now time.Time) 
 		// mints material that passes its own check rather than a special case around it.
 		MaxPathLen: 1,
 	}
+	if len(crlOrigins) > 0 {
+		points, pointErr := inspectioncrl.URLs(crlOrigins, tenant, root)
+		if pointErr != nil {
+			return fail(fmt.Errorf("the deployment's revocation origins cannot name this organization's lists: %w", pointErr))
+		}
+		issuingTemplate.CRLDistributionPoints = points
+	}
 	issuingDER, err := x509.CreateCertificate(rand.Reader, issuingTemplate, root, &issuingKey.PublicKey, rootKey)
 	if err != nil {
-		return "", "", "", fmt.Errorf("sign the issuing authority: %w", err)
+		return fail(fmt.Errorf("sign the issuing authority: %w", err))
 	}
 	issuingKeyDER, err := x509.MarshalECPrivateKey(issuingKey)
 	if err != nil {
-		return "", "", "", fmt.Errorf("encode the issuing key: %w", err)
+		return fail(fmt.Errorf("encode the issuing key: %w", err))
 	}
 
+	if len(crlOrigins) > 0 {
+		issuing, parseErr := x509.ParseCertificate(issuingDER)
+		if parseErr != nil {
+			return fail(fmt.Errorf("parse the issuing authority: %w", parseErr))
+		}
+		// The last thing this root's key does.
+		sealedRootCRL, err = inspectioncrl.SignSealed(root, rootKey, createdAt, issuing.NotAfter)
+		if err != nil {
+			return fail(fmt.Errorf("seal the root's revocation list: %w", err))
+		}
+	}
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER})),
 		string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: issuingDER})),
 		string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: issuingKeyDER})),
-		nil
+		sealedRootCRL, nil
 }
 
 func mintSerial() (*big.Int, error) {

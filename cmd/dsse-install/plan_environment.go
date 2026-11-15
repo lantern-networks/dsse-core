@@ -55,6 +55,11 @@ func (p *Plan) MachineEnvironment(machineName string) (map[string]string, error)
 	// The plan already holds both: the name the operator wrote and the name TLS verifies. This carries them
 	// onto the machine so the machine can say them.
 	env["DSSE_NODE_NAME"] = strings.TrimSpace(machine.Name)
+	// Where this deployment publishes revocation lists, for the control plane: an interception authority it
+	// makes for an organization names these origins in its certificates.
+	if len(p.DeploymentCRLOrigins) > 0 {
+		env["DSSE_DEPLOYMENT_CRL_ORIGINS"] = strings.Join(p.DeploymentCRLOrigins, ",")
+	}
 	if r := strings.TrimSpace(machine.Reachable); r != "" {
 		env["DSSE_NODE_ADDRESS"] = r
 	} else if len(machine.Addresses) > 0 {

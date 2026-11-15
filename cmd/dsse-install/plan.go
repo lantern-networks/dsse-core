@@ -37,6 +37,10 @@ type Plan struct {
 	// origin before endpoint enrollment; omitted origins retain legacy material
 	// and fail the online-revocation release gate.
 	DeploymentCRLOrigins []string `json:"deployment_crl_origins,omitempty"`
+	// DeploymentCRLHTTPListen, when set (for example "0.0.0.0:80"), has the founding machine itself accept
+	// plain HTTP there and hand it to the keyless publisher on loopback. Leave it empty when a load balancer
+	// or another front end routes the declared origins to the publisher.
+	DeploymentCRLHTTPListen string `json:"deployment_crl_http_listen,omitempty"`
 	// Profile selects a topology whose placement cannot be inferred from the number of regions.
 	// An absent profile retains the meaning of existing plans.
 	Profile            string `json:"profile,omitempty"`

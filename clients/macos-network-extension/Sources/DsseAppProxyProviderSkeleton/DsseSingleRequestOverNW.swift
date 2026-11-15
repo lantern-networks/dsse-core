@@ -53,7 +53,8 @@ public enum DsseSingleRequestOverNW {
     public static func request(method: String, host: String, port: Int, serverName: String?, path: String,
                                body: Data, security: DsseTransportSecurity, timeout: TimeInterval,
                                identityOverride: SecIdentity? = nil,
-                               presentClientIdentity: Bool = true) throws -> Response {
+                               presentClientIdentity: Bool = true,
+                               contentType: String = "application/json") throws -> Response {
         guard port > 0, port <= Int(UInt16.max), let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
             throw DsseSingleRequestError.badEndpoint("port \(port)")
         }
@@ -71,7 +72,7 @@ public enum DsseSingleRequestOverNW {
         // connection would be two security postures.
         var head = "\(method) \(path) HTTP/1.1\r\nHost: \(hostHeader)\r\n"
         if !body.isEmpty {
-            head += "Content-Type: application/json\r\nContent-Length: \(body.count)\r\n"
+            head += "Content-Type: \(contentType)\r\nContent-Length: \(body.count)\r\n"
         }
         head += "Connection: close\r\n\r\n"
         var requestBytes = Data(head.utf8)

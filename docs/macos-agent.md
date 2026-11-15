@@ -134,7 +134,8 @@ installer's explicit `/usr/bin/python3` dependency.
 
 The package derives the configuration, enrols the device, installs the agent and updater,
 and requests system-extension activation. Complete any system-extension and network
-configuration approvals macOS presents. On recent macOS versions, Network Extensions
+configuration approvals macOS presents: the extension adds a transparent proxy for the
+device's connections and a DNS proxy for its name lookups. On recent macOS versions, Network Extensions
 are under **System Settings → General → Login Items & Extensions**; the location can vary.
 
 ```sh
@@ -163,6 +164,19 @@ and check the actual browser's IPv4 fallback.
 The installation-time `install_state.json` can contain a pending approval recorded before
 activation completed. Use current `systemextensionsctl` output and the runtime verifier
 to establish the present state.
+
+## Name lookups
+
+While the agent is steering, every DNS query the Mac makes is answered by its Edge over the
+device's authenticated transport, whichever resolver the Mac's network settings name. The
+queried names do not leave the Mac in plain text, and names that only a Site resolves — the
+names an organization registers on its Sites — resolve on the Mac. Address answers live at
+most five minutes. A query the Edge does not answer fails; it is not sent to the local
+resolver instead. This needs macOS 15 or later; on macOS 13 and 14 the Mac's own resolvers
+still answer its name lookups.
+
+Names that only another network service on the Mac resolves, such as a separate VPN's
+internal domain, are not resolved by the Edge.
 
 ## The part that decides whether it works: trust
 
@@ -234,24 +248,30 @@ For reassignment, coordinate removal of the old enrolment and a fresh install wi
 new organization's material. Verify that a new identity has been provisioned; reusing
 residual identity files can cause the same refusal again.
 
-## Restore normal networking
+## Turning steering off and on
 
-Before retiring a deployment, disable the installed transparent proxy from the logged-in
-Mac user account. This operation works without the deployment. Run it **without sudo**:
+Turning steering off takes this Mac out from under its organization's policy, so it needs an
+administrator. This works without the deployment:
 
 ```sh
-"/Applications/LanternDsseAgent.app/Contents/MacOS/LanternDsseAgent" --disable
+sudo "/Library/Application Support/Dsse/bin/dsse-steering" off
 ```
 
-Wait for `disable completed error=none`. The app stops the tunnel and saves the proxy
-configuration as disabled so its connection watchdog does not restart it. This keeps
-the app, enrolment, and trust material installed; it is not an uninstall or a device
-revocation. Verify ordinary browsing after the command completes. If an error is reported,
-keep the installed app and include the full output when requesting help.
+It stops the tunnel, saves the proxy configuration as disabled so the resident app does not
+restart it, and turns off the DNS proxy, so connections and name lookups return to the Mac's own
+network. The app, the enrolment and the trust material stay installed; it is not an uninstall or
+a device revocation. Do this before retiring a deployment. To turn steering back on:
 
-The preference belongs to the logged-in user's session. Running a separate root copy
-is not a substitute for disabling that user's proxy. Deactivating or uninstalling the
-system extension is a separate operation that can require OS approval or a restart.
+```sh
+sudo "/Library/Application Support/Dsse/bin/dsse-steering" on
+```
+
+It reports whether the tunnel connected. The app's own `--disable` asks for an administrator's
+name and password in the system dialog and is refused without one; `--enable` needs neither.
+Both belong to the logged-in user's session and are refused when run as root directly.
+
+A person with administrator rights on the Mac can still remove a proxy configuration in System
+Settings. Preventing that takes device management (MDM), not this package.
 
 ## Removing it
 
@@ -264,10 +284,17 @@ deactivate the extension. If that fails, it stops before deleting the app needed
 recovery. Resolve approval or a pending OS restart and retry; do not manually delete the
 app while its proxy configuration remains active.
 
-The uninstaller removes the app and its extension but leaves the deployment
-configuration in `/Library/Application Support/Dsse`, including the signed
-`install_profile.json`, `agent_config.json`, `enrolment_token.txt` and
-`profile_signing_key.txt`, and the package receipt stays registered with `pkgutil`.
+The uninstaller removes the app, its extension and both proxy configurations, but leaves
+the deployment configuration in `/Library/Application Support/Dsse`, including the signed
+`install_profile.json`, `agent_config.json` and `profile_signing_key.txt`, and the package
+receipt stays registered with `pkgutil`. The device's key leaves with the extension, so the
+uninstaller renames the enrolment token the Mac used to `enrolment_token.retired-<time>.txt`.
+
+To install on the same Mac again, allow the device to enrol again in the Console (or remove
+it), make a new enrolment token, and put `enrolment_token.txt` in the same folder as the
+package. Without one the installer refuses, and says so in the terminal it was run from: a
+Mac installed with nothing to enrol with would steer its traffic to a deployment that
+refuses it.
 These name the deployment the Mac belonged to. Before installing for another
 deployment or organization, or when the Mac leaves DSSE, remove them after confirming
 they are the old deployment's.
@@ -298,12 +325,9 @@ revocation.
   `systemextensionsctl list`, complete the requested restart, and verify before retrying.
 - Activating an already-running app with `open -a` does not prove the newly installed
   executable has started. Check the installed version and current extension state.
-- Same-version activation can report completion before the Network Extension runtime
-  becomes available. If approval is complete but steering has not started, fully quit
-  and reopen LanternDsseAgent once, then repeat the local runtime and inspected-traffic
-  checks. This workaround was observed to restore startup; an activation callback or
-  package receipt alone does not establish a working connection. If it still fails,
-  retain the logs for diagnosis instead of repeatedly reinstalling.
+- A tunnel that does not start is tried again a few times by the resident app. If steering has
+  still not started, the app's log says so; this Mac is then not steered. Retain the logs for
+  diagnosis instead of repeatedly reinstalling.
 - Repeated provider crashes can exhaust the watchdog's retry window. Inspect agent and
   extension logs and current state; a successful package receipt does not prove provider health.
 - VM traffic on the endpoint may escape host steering. Review the device configuration's

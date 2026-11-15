@@ -69,3 +69,44 @@ test('switching tenant while considering an elevation does not grant it or repla
   assert.equal(result.status, 403);
   assert.deepEqual(calls, [{url: '/admin/test-operation', tenant: 'tenant-a'}]);
 });
+
+// Found on a Windows walk (2026-11-14): "Ask for 20 minutes" was granted, and in the same instant the act was
+// refused again — in English — for want of the time just granted. The node that carries out the act hears of the
+// grant a moment after the node that made it.
+test('an act refused again in the moment after its time was granted is asked again, and no second grant is taken', async () => {
+  const calls = [];
+  let offers = 0;
+  const refusal = {status: 403, ok: false, text: async () => JSON.stringify({error: 'this act needs time', elevation_required: {tenant_id: 'tenant-a'}})};
+  const context = vm.createContext({
+    localStorage: {getItem: () => ''},
+    setTimeout: (fn) => fn(),
+    offerOperatorElevation: async () => { offers++; return true; },
+    fetch: async (url) => {
+      calls.push(url);
+      // refused, then (after the grant) refused twice more while the grant travels, then carried out
+      return calls.length <= 3 ? refusal : {status: 200, ok: true, text: async () => '{"made":true}'};
+    },
+  });
+  vm.runInContext(app.slice(app.indexOf('const CP_AUTHORED_WRITES = ['), app.indexOf('// offerOperatorElevation asks')) +
+    '\noperateTenant = "tenant-a";', context);
+  const result = await context.apiFetch('POST', '/admin/test-operation', {enabled: true});
+  assert.equal(result.status, 200);
+  assert.equal(calls.length, 4);
+  assert.equal(offers, 1, 'the operator is asked for time once');
+});
+
+test('a node that keeps refusing after the grant is believed after a few seconds', async () => {
+  let calls = 0, offers = 0;
+  const context = vm.createContext({
+    localStorage: {getItem: () => ''},
+    setTimeout: (fn) => fn(),
+    offerOperatorElevation: async () => { offers++; return true; },
+    fetch: async () => { calls++; return {status: 403, ok: false, text: async () => JSON.stringify({error: 'no', elevation_required: {tenant_id: 'tenant-a'}})}; },
+  });
+  vm.runInContext(app.slice(app.indexOf('const CP_AUTHORED_WRITES = ['), app.indexOf('// offerOperatorElevation asks')) +
+    '\noperateTenant = "tenant-a";', context);
+  const result = await context.apiFetch('POST', '/admin/test-operation', {enabled: true});
+  assert.equal(result.status, 403);
+  assert.equal(offers, 1);
+  assert.ok(calls >= 3 && calls <= 8, 'bounded: ' + calls + ' calls');
+});

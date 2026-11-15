@@ -107,6 +107,8 @@ const _LA_REASON = {
   east_west_policy_deny: { en: "Denied by a connector-access rule", ja: "コネクタ経由アクセスのルールで拒否" },
   east_west_grant_satisfied: { en: "Allowed by an access approval", ja: "アクセス承認で許可" },
   east_west_device_attested: { en: "Allowed for a verified device", ja: "確認済みの端末として許可" },
+  east_west_observe: { en: "Observed and allowed (connector access is not enforcing yet)", ja: "観察中のため許可(コネクタ経由アクセスは未強制)" },
+  east_west_connection_authenticated: { en: "Sign-in was completed when the connection opened", ja: "接続を開いたときに本人確認済み" },
   east_west_unmatched_allow: { en: "No rule matched (partial enforcement allows it)", ja: "合致ルールなし(部分強制のため許可)" },
   server_initiated_default_deny: { en: "Server-initiated: denied, no exception applies", ja: "受信接続(サーバ発): 例外なしで拒否" },
   server_initiated_invalid_exception: { en: "Server-initiated: denied, the exception is invalid", ja: "受信接続(サーバ発): 例外が無効のため拒否" },
@@ -416,7 +418,7 @@ function laReasonCell(row) {
   const saidWhy = Boolean(reason && !laReasonIsGenericSentence(reason));
   if (saidWhy) line.push(el("span", { text: laReasonSentence(row, reason), title: reason }));
   const pid = laVal(row, "policy_id");
-  if (pid) line.push(el("span", { class: "ui-view-desc", title: bl({ en: "Matched policy", ja: "合致ポリシー" }), text: "▸ " + pid }));
+  if (pid) line.push(el("span", { class: "ui-view-desc", title: bl({ en: "Matched rule", ja: "合致ルール" }) + ": " + pid, text: "▸ " + laRuleLabel(pid) }));
   // ★ AN ALLOWED ROW SAID NOTHING AND A DENIED ROW BESIDE IT SAID WHY (acceptance C, fourth walk, 2026-11-08). The
   // generic "allowed by policy" was hidden as filler, while "denied by policy" — just as generic — was shown, and
   // the drawer of the same allowed row said "allowed by policy". When nothing more specific remains, the row says
@@ -1057,6 +1059,14 @@ async function laLoadStream(host, filterHost, summaryHost, append) {
     _laAdminDir = directory;
   }
   if (!current()) return;
+  // The names belong to one search of one organization: a new search forgets them, and they are read when a
+  // rule id first appears, which may be on a later page.
+  if (!append) { _laRuleNames = Object.create(null); _laRuleNamesRead = false; }
+  if (!_laRuleNamesRead && !deploymentAudit && _laRows.some((row) => laVal(row, "policy_id"))) {
+    const names = await laLoadRuleNames();
+    if (!current()) return;
+    _laRuleNames = names; _laRuleNamesRead = true;
+  }
   if (summaryHost) {
     laSummary(summaryHost, _laRows, _laStream);
     if (_laFilters.edge_region_id) summaryHost.appendChild(el("p", { class: "ui-view-desc", text: laRegionCoverageText(coverage) }));
@@ -1093,7 +1103,7 @@ const _LA_GROUPS = [
   { title: { en: "Authentication & authorization", ja: "認証・認可" }, keys: ["session_id", "auth_time", "authentication_event_id", "delegated_access_grant_id", "human_approval_event_id", "agent_task_session_id", "reauthentication_reason", "authentication_max_age_seconds"] },
   { title: { en: "Device", ja: "デバイス" }, keys: ["device_id", "source_ip", "source_port", "posture", "trust_state"] },
   { title: { en: "Destination", ja: "宛先" }, keys: ["application_id", "destination", "request_method", "request_path", "destination_ip", "destination_port", "fqdn", "sni", "protocol", "service_family"] },
-  { title: { en: "Decision & policy", ja: "判断・ポリシー" }, keys: ["decision", "reason", "reason_codes", "policy_id", "policy_bundle_id", "policy_bundle_version", "matched_conditions", "cache_status", "bypass", "action", "result", "event_type", "target_type", "target_id"] },
+  { title: { en: "Decision & policy", ja: "判断・ポリシー" }, keys: ["decision", "reason", "reason_codes", "policy_id", "matched_conditions", "cache_status", "bypass", "action", "result", "event_type", "target_type", "target_id"] },
   { title: { en: "Risk", ja: "リスク" }, keys: ["risk_state_id", "risk_state_severity", "risk_recommended_action"] },
   { title: { en: "Inspection", ja: "検査" }, keys: ["inspection_profile_id", "inspection_mode", "inspection_route_category", "data_classification"] },
   { title: { en: "Agent / tool", ja: "エージェント・ツール" }, keys: ["tool_id", "tool_action_type", "context_boundary_id", "mcp_server_id", "runtime_environment_id"] },
@@ -1168,10 +1178,50 @@ const _LA_FIELD = {
   runtime_environment_id: { en: "Runtime environment", ja: "実行環境" },
 };
 // Policy ids the product writes itself rather than an operator authoring them. Shown by name, with the id kept as
-// the tooltip; an operator's own rule ids are shown as they are.
+// the tooltip; an operator's own rule ids are shown as they are. A connector-access row carries this one only
+// when no single rule decided — the flow was observed, or nothing matched; a row a rule decided carries the
+// rule's own id and is shown by the rule's name.
 const _LA_BUILTIN_POLICY = {
   east_west_policy: { en: "Connector-access rules", ja: "コネクタ経由アクセスのルール" },
 };
+// A log row names the rule that decided by the id the Edge enforces it under, which is not what the administrator
+// called it: an east-west rule keeps its own id, an egress rule becomes "rule-egress-<rule id><suffix>". The rules
+// of the organization on screen are read for each search and the row shows the rule's name, keeping the id as
+// the tooltip. A rule without a name, a rule since deleted, or a list that could not be read leaves the id as it
+// is — and so does an id that two rules could both have produced: a rule id may itself end in what looks like a
+// suffix, and a log must not name the wrong rule.
+let _laRuleNames = Object.create(null);
+let _laRuleNamesRead = false;
+// What the compiler appends to an egress rule's id: which destination, then which source, then which transport.
+const _LA_EGRESS_SUFFIX = /^-(?:any|nomatch|\d+-(?:fqdn|sni))(?:-s\d+)?(?:-[a-z0-9]+)?$/;
+function laRuleLabel(pid) {
+  const id = String(pid == null ? "" : pid);
+  if (_LA_BUILTIN_POLICY[id]) return bl(_LA_BUILTIN_POLICY[id]);
+  if (_laRuleNames[id]) return laRuleNameForReader(_laRuleNames[id]);
+  const prefix = "rule-egress-";
+  if (!id.startsWith(prefix)) return id;
+  const rest = id.slice(prefix.length);
+  const from = Object.keys(_laRuleNames).filter((ruleID) => rest.startsWith(ruleID) && _LA_EGRESS_SUFFIX.test(rest.slice(ruleID.length)));
+  return from.length === 1 ? laRuleNameForReader(_laRuleNames[from[0]]) : id;
+}
+// The rule a new organization starts with has a name the server wrote in English. The rule list shows it in
+// the reader's language (ruleDisplayName, rules.js); the log showed the same rule under its English name.
+function laRuleNameForReader(name) {
+  return typeof ruleDisplayName === "function" ? ruleDisplayName(name) : name;
+}
+async function laLoadRuleNames() {
+  const names = Object.create(null);
+  try {
+    const r = await apiFetch("GET", "/admin/rules");
+    if (r.ok && Array.isArray(r.body)) {
+      for (const rule of r.body) {
+        // A rule without a name is kept too, under its own id: it can be the one a compiled id came from.
+        if (rule && typeof rule.id === "string" && rule.id) names[rule.id] = (typeof rule.name === "string" && rule.name.trim()) || rule.id;
+      }
+    }
+  } catch (_) { /* the recorded id stays on the row */ }
+  return names;
+}
 function laFieldLabel(k) { return _LA_FIELD[k] ? bl(_LA_FIELD[k]) : String(k).replace(/_/g, " "); }
 // The server writes a decision's reason as an English sentence, for logs and exports. On the screen the
 // row's reason codes say the same thing in the reader's language; the server's sentence stays as the tooltip.
@@ -1198,7 +1248,7 @@ function laFieldRow(k, v, row) {
   else if (k === "reason" && typeof v === "string") node = el("span", { text: laReasonSentence(row, v), title: v });
   else if (k === "reason_codes" && Array.isArray(v)) node = el("span", { style: "display:flex;gap:4px;flex-wrap:wrap" }, v.map(laReasonChip));
   else if (k === "source_ip") node = el("span", { text: laSrcIp({ source_ip: v }) });
-  else if (k === "policy_id" && _LA_BUILTIN_POLICY[v]) node = el("span", { text: bl(_LA_BUILTIN_POLICY[v]), title: String(v) });
+  else if (k === "policy_id" && laRuleLabel(v) !== String(v)) node = el("span", { text: laRuleLabel(v), title: String(v) });
   else node = el("span", { text: Array.isArray(v) ? v.join(", ") : String(v) });
   return el("div", { style: "display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--ui-border,#eee)" }, [
     el("span", { class: "ui-view-desc", style: "min-width:180px;flex:none", text: laFieldLabel(k), title: k }), node,
@@ -1211,7 +1261,8 @@ function laRelatedSummary(s, r) {
   if (s === "inspection_events") return [laPretty(laVal(r, "finding_type", "event_type")), laVal(r, "inspection_mode"), laVal(r, "severity")].filter(Boolean).join(" · ") || "—";
   // ★ A RELATED RECORD READ "actor_type=human" (2026-11-08, acceptance C): the field's wire name and its stored
   // value, beside a drawer that names the same field and value in the reader's words. The summary uses them too.
-  return Object.keys(r).slice(0, 3).map((k) => laFieldLabel(k) + ": " + laRelatedValue(k, r[k])).join(" · ") || "—";
+  // A field with no value is not shown: "Acting non-human identity: " with nothing after it says nothing.
+  return Object.keys(r).filter((k) => laRelatedValue(k, r[k]) !== "").slice(0, 3).map((k) => laFieldLabel(k) + ": " + laRelatedValue(k, r[k])).join(" · ") || "—";
 }
 function laRelatedValue(k, v) {
   if (k === "actor_type" && typeof v === "string" && _LA_ACTOR_TYPE[v]) return bl(_LA_ACTOR_TYPE[v]);

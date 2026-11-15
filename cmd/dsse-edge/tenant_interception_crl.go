@@ -20,7 +20,9 @@ type interceptionDelegation struct {
 	LeafCRL   []byte `json:"leaf_crl,omitempty"`
 }
 
-func authorityCRLBases(root, issuing *x509.Certificate, tenant string, der []byte, now time.Time) ([]string, error) {
+// rootKeyNotKept (the last argument) is true for an authority this deployment made and whose root key it did
+// not keep: its root list is the sealed one. See inspectioncrl.ParseAndValidateSealed.
+func authorityCRLBases(root, issuing *x509.Certificate, tenant string, der []byte, now time.Time, rootKeyNotKept bool) ([]string, error) {
 	if len(der) == 0 {
 		if len(issuing.CRLDistributionPoints) > 0 {
 			return nil, fmt.Errorf("CDP-bearing delegation requires signed root CRL")
@@ -31,7 +33,7 @@ func authorityCRLBases(root, issuing *x509.Certificate, tenant string, der []byt
 	if err != nil {
 		return nil, err
 	}
-	list, err := inspectioncrl.ParseAndValidate(der, root, now)
+	list, err := validRootCRL(der, root, now, rootKeyNotKept)
 	if err != nil {
 		return nil, err
 	}
@@ -43,8 +45,16 @@ func authorityCRLBases(root, issuing *x509.Certificate, tenant string, der []byt
 	return bases, nil
 }
 
-func authorityCRLBase(root, issuing *x509.Certificate, tenant string, der []byte, now time.Time) (string, error) {
-	bases, err := authorityCRLBases(root, issuing, tenant, der, now)
+// validRootCRL validates a root's list on the terms that root was set up under.
+func validRootCRL(der []byte, root *x509.Certificate, now time.Time, rootKeyNotKept bool) (*x509.RevocationList, error) {
+	if rootKeyNotKept {
+		return inspectioncrl.ParseAndValidateSealed(der, root, now)
+	}
+	return inspectioncrl.ParseAndValidate(der, root, now)
+}
+
+func authorityCRLBase(root, issuing *x509.Certificate, tenant string, der []byte, now time.Time, rootKeyNotKept bool) (string, error) {
+	bases, err := authorityCRLBases(root, issuing, tenant, der, now, rootKeyNotKept)
 	if err != nil || len(bases) == 0 {
 		return "", err
 	}
@@ -88,7 +98,7 @@ func signIssuingCRL(row *storedTenantInterceptionIssuer, now time.Time, force bo
 	if err != nil {
 		return err
 	}
-	if _, err = authorityCRLBase(root, issuing, row.TenantID, row.RootCRL, now); err != nil {
+	if _, err = authorityCRLBase(root, issuing, row.TenantID, row.RootCRL, now, row.RootKeyNotKept); err != nil {
 		return err
 	}
 	var number = big.NewInt(1)
@@ -192,7 +202,7 @@ func (a *tenantInterceptionAuthority) recordDelegation(ctx context.Context, tena
 	if err != nil {
 		return err
 	}
-	if _, err = authorityCRLBase(root, issuer, row.TenantID, row.RootCRL, a.now()); err != nil {
+	if _, err = authorityCRLBase(root, issuer, row.TenantID, row.RootCRL, a.now(), row.RootKeyNotKept); err != nil {
 		return err
 	}
 	if !cert.IsCA || cert.MaxPathLen != 0 || !cert.MaxPathLenZero || cert.NotAfter.After(issuer.NotAfter) || cert.NotAfter.After(root.NotAfter) {
@@ -253,6 +263,10 @@ func (a *tenantInterceptionAuthority) updateRootCRL(ctx context.Context, tenant 
 	}
 	if !ok || row.CRLBaseURL == "" {
 		return fmt.Errorf("CRL-enabled authority required")
+	}
+	if row.RootKeyNotKept {
+		return fmt.Errorf("this organization's root was made by the deployment and its key was not kept, so no " +
+			"new list can be signed for it. To withdraw its issuing authority, replace the root")
 	}
 	root, err := parseFirstCertificatePEM([]byte(row.RootPEM))
 	if err != nil {
@@ -338,14 +352,16 @@ func (a *tenantInterceptionAuthority) crlStatus(ctx context.Context, tenant, fp 
 	if err != nil || len(bases) == 0 || bases[0] != row.CRLBaseURL {
 		return inspectionCRLStatus{}, fmt.Errorf("CRL distribution origins differ from the committed authority")
 	}
-	if _, err = inspectioncrl.ParseAndValidate(row.RootCRL, root, a.now()); err != nil {
+	if _, err = validRootCRL(row.RootCRL, root, a.now(), row.RootKeyNotKept); err != nil {
 		return inspectionCRLStatus{}, err
 	}
+	rootList := false
 	status := inspectionCRLStatus{Tenant: row.TenantID, BaseURL: row.CRLBaseURL, BaseURLs: bases}
 	switch fp {
 	case inspectioncrl.Fingerprint(root):
 		status.IssuerPEM = row.RootPEM
 		status.DER = row.RootCRL
+		rootList = true
 	case inspectioncrl.Fingerprint(issuing):
 		status.IssuerPEM = row.IssuingCertPEM
 		status.ChainPEM = row.RootPEM
@@ -363,7 +379,12 @@ func (a *tenantInterceptionAuthority) crlStatus(ctx context.Context, tenant, fp 
 	if err != nil {
 		return inspectionCRLStatus{}, err
 	}
-	if _, err = inspectioncrl.ParseAndValidate(status.DER, issuer, a.now()); err != nil {
+	if rootList {
+		_, err = validRootCRL(status.DER, issuer, a.now(), row.RootKeyNotKept)
+	} else {
+		_, err = inspectioncrl.ParseAndValidate(status.DER, issuer, a.now())
+	}
+	if err != nil {
 		return inspectionCRLStatus{}, err
 	}
 	return status, nil

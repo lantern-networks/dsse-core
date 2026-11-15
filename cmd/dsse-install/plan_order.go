@@ -317,8 +317,8 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 	if len(p.DeploymentCRLOrigins) > 0 {
 		status := PlanStep{
 			Machine: minting.Name,
-			Do:      fmt.Sprintf("sudo %s/install-deployment-crl-services.sh", dir),
-			Needs:   "the reviewed dsse-deployment-crl host binary installed at /usr/local/bin; public HTTP origins in deployment_crl_origins routed to the keyless publisher's loopback 127.0.0.1:18081 before -start-node",
+			Do:      deploymentCRLStepCommand(dir),
+			Needs:   deploymentCRLStepNeeds(p),
 			Why:     "The issuer's signed 24-hour CRLs must renew before expiry while the HTTP publisher has no signing keys. The next node's preflight retrieves every issuer-bound URL and rejects missing, stale, redirected or revoked status.",
 		}
 		steps[1].Needs += "; the signed deployment CRL publisher and its renewal timer active, with every declared public CDP reachable"

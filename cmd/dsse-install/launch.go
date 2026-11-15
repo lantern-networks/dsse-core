@@ -475,6 +475,7 @@ exec "$DSSE_EDGE_BINARY" -control-plane \
   -tenant-transport-authority-store=postgres \
   -tenant-interception-authority-store=postgres \
   -inspection-crl-listen="${DSSE_INSPECTION_CRL_LISTEN:-:8088}" \
+  -tenant-interception-crl-origins="${DSSE_DEPLOYMENT_CRL_ORIGINS:-}" \
   -agent-updates-store=postgres \
   -agent-rollout-store=postgres \
   -steer-exclusion-store=postgres \

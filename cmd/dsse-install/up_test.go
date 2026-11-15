@@ -85,7 +85,8 @@ func TestUpUnderstandsTheOrderOfEveryPublishedTopology(t *testing.T) {
 }
 
 // With -ssh, what runs is the printed order itself, command for command; the only differences are the two
-// values the order leaves to the reader, the credentials capture, and the ssh in front of another machine's line.
+// values the order leaves to the reader, the credentials capture, the ssh in front of another machine's line, and
+// the removal of the package -up copied to that machine.
 func TestUpOverSSHRunsThePrintedOrderCommandForCommand(t *testing.T) {
 	for name, plan := range samplePlans(t) {
 		dir := filepath.Join(t.TempDir(), "d")
@@ -114,8 +115,15 @@ func TestUpOverSSHRunsThePrintedOrderCommandForCommand(t *testing.T) {
 			got := rec.ran[i]
 			switch {
 			case s.Machine != minting:
+				// The order's command, and then the package -up copied there is removed: it carries that
+				// machine's identity and the fleet credential, and nothing needs it once the machine started.
+				if m := scpStep.FindStringSubmatch(order[i-1].Do); m != nil {
+					want = "( " + want + " ) && rm -f " + shellQuote(m[1])
+				} else {
+					t.Errorf("%s step %d: another machine's command does not follow the copy of its package", name, i+1)
+				}
 				if !strings.HasPrefix(got, "ssh '") || !strings.HasSuffix(got, " "+shellQuote(want)) {
-					t.Errorf("%s step %d: another machine's command must run there over ssh, unchanged:\n got %s\nwant ssh <host> %s", name, i+1, got, shellQuote(want))
+					t.Errorf("%s step %d: another machine's command must run there over ssh, as the order prints it:\n got %s\nwant ssh <host> %s", name, i+1, got, shellQuote(want))
 				}
 			case strings.Contains(want, "-bootstrap-admin"):
 				if !strings.Contains(want, got) || strings.Contains(got, ">") {

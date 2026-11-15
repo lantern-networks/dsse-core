@@ -110,3 +110,36 @@ func TransportServerNameFromContext(ctx context.Context) string {
 	name, _ := ctx.Value(transportServerNameContextKey{}).(string)
 	return name
 }
+
+// WithConnectorAccessAtOpen records that the flow a decrypted request was read out of was decided by Connector
+// Access when it opened, and let through.
+//
+// A flow to a registered network is Connector Access, and what is inside it is too. The handler on the far
+// side of decryption builds a fresh decision request for every HTTP request, and without this it could not
+// know which plane the connection belonged to: it asked the Internet Access rules, so one visit to a private
+// application was decided twice, by two planes, and its access-log rows named an Internet Access rule.
+func WithConnectorAccessAtOpen(ctx context.Context) context.Context {
+	return WithConnectorAccessAtOpenAfterSignIn(ctx, "")
+}
+
+// WithConnectorAccessAtOpenAfterSignIn is WithConnectorAccessAtOpen for a flow that was let through only after
+// the sign-in a rule asks for was completed; signInDoneForRule is that rule's id.
+func WithConnectorAccessAtOpenAfterSignIn(ctx context.Context, signInDoneForRule string) context.Context {
+	return context.WithValue(ctx, connectorAccessAtOpenContextKey{}, connectorAccessAtOpen{signInDoneForRule: strings.TrimSpace(signInDoneForRule)})
+}
+
+// ConnectorAccessAtOpenFromContext reports whether WithConnectorAccessAtOpen marked this request's flow.
+func ConnectorAccessAtOpenFromContext(ctx context.Context) bool {
+	_, ok := ctx.Value(connectorAccessAtOpenContextKey{}).(connectorAccessAtOpen)
+	return ok
+}
+
+// ConnectorSignInDoneForRuleFromContext is the rule whose sign-in the flow completed before it opened, or "".
+func ConnectorSignInDoneForRuleFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(connectorAccessAtOpenContextKey{}).(connectorAccessAtOpen)
+	return v.signInDoneForRule
+}
+
+type connectorAccessAtOpen struct{ signInDoneForRule string }
+
+type connectorAccessAtOpenContextKey struct{}

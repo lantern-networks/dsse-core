@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
+	"net/netip"
+	"regexp"
 )
 
 // ErrPersistence means storage did not confirm the candidate. The previous
@@ -178,8 +180,38 @@ func (s *Store) UpsertEndpointContext(ctx context.Context, e Endpoint) (Endpoint
 			n.generation++
 			return saved, nil
 		}
+		// An address an administrator types is checked when it is new or changed. A record that already holds
+		// something else can still be renamed.
+		if e.Kind == KindNetwork && strings.TrimSpace(e.Address) != "" && (!found || current.Address != e.Address) {
+			if err := ValidateNetworkAddress(e.Address); err != nil {
+				return Endpoint{}, err
+			}
+		}
 		return n.upsertEndpoint(e)
 	})
+}
+
+// networkNamePattern is a host name, optionally a wildcard for the names beneath it.
+var networkNamePattern = regexp.MustCompile(`^(\*\.)?([A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$`)
+
+// ValidateNetworkAddress accepts what a rule can match a destination by: an IP address, a network range, a
+// host name, or a wildcard for the names beneath one. Anything else — a sentence, a URL, a name with a port
+// — used to be stored as it was typed and produced a destination no flow could ever be.
+func ValidateNetworkAddress(address string) error {
+	a := strings.TrimSpace(address)
+	if a != address || a == "" {
+		return fmt.Errorf("the address %q has spaces around it or is empty", address)
+	}
+	if _, err := netip.ParseAddr(a); err == nil {
+		return nil
+	}
+	if _, err := netip.ParsePrefix(a); err == nil {
+		return nil
+	}
+	if len(a) <= 253 && networkNamePattern.MatchString(a) {
+		return nil
+	}
+	return fmt.Errorf("%q is not an address a rule can match: give an IP address (10.0.0.10), a network range (10.0.0.0/24), a host name (db.example.com) or a wildcard for the names beneath one (*.example.com)", address)
 }
 
 func (s *Store) UpsertGroup(g Group) (Group, error) {

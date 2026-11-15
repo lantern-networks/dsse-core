@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,10 +21,24 @@ import (
 // tenant_id, so a tenant can never read or mutate another tenant's Sites.
 type postgresAdminSiteStore struct {
 	db *sql.DB
-	// lastGeneration is the last value successfully read from the shared sequence. It is what
+	// lastGeneration is the last generation this process published for the Site catalogue. It is what
 	// ConfigGeneration falls back to when the database cannot be reached, so a blip cannot make the bundle's
 	// version go backwards and freeze every Edge's configuration.
 	lastGeneration atomic.Uint64
+	// ★★★ THE SEQUENCE IS NOT MONOTONIC ACROSS A CHANGE OF PRIMARY (2026-11-15, measured on a three-region
+	// rolling upgrade). PostgreSQL ships a sequence to its replicas logged ahead — about thirty-two values past
+	// the one in use — so a replica that is promoted carries on from the logged value, and the old primary,
+	// when it leads again, carries on from the value it really had. The primary moved a -> b -> c -> a; this
+	// process read 52 while b led and 19 once a led again, and remembering the larger number froze the Site
+	// catalogue's term: Sites created, rotated or deleted after the upgrade reached no Edge (no connector could
+	// enrol, and a deleted Site's bootstrap secret stayed accepted) until thirty-odd more Site writes or an
+	// unrelated change moved the bundle. The generation an Edge compares is this PROCESS's number (the epoch
+	// beside it changes with the process), so it has to move whenever the counter moves, in either direction:
+	// rawSeen/lastRaw/offset turn the counter into that.
+	generationMu sync.Mutex
+	rawSeen      bool
+	lastRaw      uint64
+	offset       uint64
 }
 
 var _ adminSiteStore = (*postgresAdminSiteStore)(nil)
@@ -172,18 +187,44 @@ func (p *postgresAdminSiteStore) ConfigGenerationChecked(parent context.Context)
 	if n < 0 {
 		n = 0
 	}
-	return p.rememberGeneration(uint64(n)), nil
+	return p.observeReadGeneration(uint64(n)), nil
 }
 
-func (p *postgresAdminSiteStore) rememberGeneration(n uint64) uint64 {
-	for {
-		old := p.lastGeneration.Load()
-		if n <= old || p.lastGeneration.CompareAndSwap(old, n) {
-			if old > n {
-				return old
-			}
-			return n
-		}
+// observeReadGeneration turns a counter value read under the Site writers' lock into this process's
+// generation. Reads are serialised with commits, so on one primary they never go backwards; a value lower than
+// the last one read means the primary changed (see the struct), and the generation moves on past everything
+// already published instead of waiting for the counter to catch up.
+func (p *postgresAdminSiteStore) observeReadGeneration(raw uint64) uint64 {
+	p.generationMu.Lock()
+	defer p.generationMu.Unlock()
+	last := p.lastGeneration.Load()
+	switch {
+	case p.rawSeen && raw < p.lastRaw:
+		p.offset = last + 1 - raw
+	case raw+p.offset < last:
+		// Nothing read yet in this process, but a generation is already published: keep it, move from it.
+		p.offset = last - raw
+	}
+	p.rawSeen, p.lastRaw = true, raw
+	out := raw + p.offset
+	if out > last {
+		p.lastGeneration.Store(out)
+		return out
+	}
+	return last
+}
+
+// observeWrittenGeneration records the value a committed Site write drew. Writers finish in any order, so a
+// smaller value here is a slower writer and not a change of primary: it may only move the generation forward.
+func (p *postgresAdminSiteStore) observeWrittenGeneration(n uint64) {
+	p.generationMu.Lock()
+	defer p.generationMu.Unlock()
+	if p.rawSeen && n <= p.lastRaw {
+		return
+	}
+	p.rawSeen, p.lastRaw = true, n
+	if out := n + p.offset; out > p.lastGeneration.Load() {
+		p.lastGeneration.Store(out)
 	}
 }
 
@@ -304,7 +345,7 @@ func (p *postgresAdminSiteStore) Upsert(ctx context.Context, site adminSiteModel
 	if err := tx.Commit(); err != nil {
 		return adminSiteModel{}, fmt.Errorf("%w: %v", errAdminSitePersistence, err)
 	}
-	p.rememberGeneration(generation)
+	p.observeWrittenGeneration(generation)
 	return saved, nil
 }
 
@@ -334,7 +375,7 @@ func (p *postgresAdminSiteStore) Delete(ctx context.Context, tenantID, siteID st
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("%w: %v", errAdminSitePersistence, err)
 	}
-	p.rememberGeneration(generation)
+	p.observeWrittenGeneration(generation)
 	return nil
 }
 

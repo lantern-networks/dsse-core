@@ -249,7 +249,7 @@ func connectorEgressSessionFor(conn model.ConnectorRegistration, destination, lo
 	case ReachDenyOutOfBoundary:
 		// ★ RESIDENCY IS NEVER ASKED AROUND. The sibling below is asked before REFUSING for want of a route;
 		// it is not asked when the refusal is a boundary the organization drew.
-		return nil, fmt.Errorf("connector %s is in region %q outside the tenant's residency boundary", conn.ID, dec.Region)
+		return nil, fmt.Errorf("connector %s is in region %q %w", conn.ID, dec.Region, errConnectorOutsideResidencyBoundary)
 	default: // ReachHairpin
 		// ★★★ ASK THE SIBLING BEFORE REFUSING, BECAUSE IT IS THE ONLY PARTY THAT KNOWS (2026-09-02, measured:
 		// a customer's estate refused for two minutes by one Edge while the connector was attached to the
@@ -307,6 +307,17 @@ func (d ConnectorEgressDialer) OpenTCPConnection(ctx context.Context, route Netw
 		destination = strings.TrimSpace(route.Host)
 	}
 	conn, ok, err := d.ResolveConnector(ctx, tenantID, destination, "")
+	// A name no connector declares, on a flow whose ADDRESS a connector carries, is that address's flow: the
+	// device reached a registered network. Looking only at the name sent it out directly, where an Edge outside
+	// the private network reaches nothing. The address is the one the flow was opened to, which the decision
+	// already judged; the connector is asked for the address and the TLS above it keeps the name.
+	if err == nil && !ok {
+		if host := strings.TrimSpace(route.Host); host != "" && host != destination && net.ParseIP(host) != nil {
+			if byAddress, routed, aerr := d.ResolveConnector(ctx, tenantID, host, ""); aerr == nil && routed {
+				conn, ok, destination = byAddress, true, host
+			}
+		}
+	}
 	if err != nil {
 		// ★★★ "COULD NOT ASK" IS NOT "NO CONNECTOR FRONTS THIS" (2026-08-26). Both fell through to a direct
 		// dial in silence, and for an INTERNAL destination a direct dial from an Edge reaches nothing — so the
@@ -424,10 +435,22 @@ func (d ConnectorEgressDialer) OpenTCPConnection(ctx context.Context, route Netw
 func (d ConnectorEgressDialer) openThroughFirstReachable(ctx context.Context, candidates []model.ConnectorRegistration,
 	conn model.ConnectorRegistration, destination string, port int, tenantID string, allowedRegions []string) (net.Conn, model.ConnectorRegistration, error) {
 	var err error
+	// A refusal for want of a route may be a catalogue that is behind; a boundary the organization drew is not.
+	var wantedARoute []string
+	defer func() {
+		if noter, ok := d.Tunnels.(ConnectorUnreachableNoter); ok {
+			for _, id := range wantedARoute {
+				noter.NoteConnectorUnreachable(id)
+			}
+		}
+	}()
 	for _, candidate := range candidates {
 		s, serr := d.connectorEgressSession(candidate, destination, allowedRegions)
 		if serr != nil {
 			err = serr
+			if !errors.Is(serr, errConnectorOutsideResidencyBoundary) {
+				wantedARoute = append(wantedARoute, candidate.ID)
+			}
 			log.Printf("connector_candidate_unreachable host=%q connector=%q connector_region=%q this_region=%q: %v",
 				destination, candidate.ID, ConnectorRegionForLog(candidate), d.LocalRegion, serr)
 			continue
@@ -436,9 +459,15 @@ func (d ConnectorEgressDialer) openThroughFirstReachable(ctx context.Context, ca
 		for _, session := range sessions {
 			c, oerr := openConnectorTunnelTCPConn(ctx, session, destination, port, tenantID)
 			if oerr == nil {
+				wantedARoute = nil // the flow is carried; nothing is in doubt
 				return c, candidate, nil
 			}
 			err = oerr
+			// Over a peer link this node cannot tell "the connector is no longer there" from "what it fronts
+			// did not answer". Through the connector's own tunnel here it can: the connector has not moved.
+			if viaPeer {
+				wantedARoute = append(wantedARoute, candidate.ID)
+			}
 			log.Printf("connector_candidate_would_not_open host=%q connector=%q connector_region=%q this_region=%q: %v — trying another reachable path",
 				destination, candidate.ID, ConnectorRegionForLog(candidate), d.LocalRegion, oerr)
 			// A peer link is shared by other Connectors. A timeout for this
@@ -480,6 +509,30 @@ func lookAgainAfterAMove(ctx context.Context, resolve ConnectorResolveFunc, resi
 		return afterAMove{}, fmt.Errorf("tenant residency lookup failed after the wait: %w", err)
 	}
 	return afterAMove{conn: conn, allowedRegions: allowed}, nil
+}
+
+// errConnectorOutsideResidencyBoundary is the one refusal that learning where a connector is cannot change.
+var errConnectorOutsideResidencyBoundary = errors.New("outside the tenant's residency boundary")
+
+// ConnectorUnreachableNoter is what a tunnel provider adds when a refusal is, to it, a reason to ask the
+// deployment where a connector is now.
+//
+// ★★★ HALF A MINUTE OF REFUSALS WHEN A REGION WAS UPGRADED (2026-11-13, measured on three regions of one machine
+// each while the region the connectors were attached to was replaced). The connectors had moved to another
+// region two seconds after their tunnels ended. The Edges of the other two regions went on routing to where the
+// connectors had been until their next ordinary poll, thirty seconds later:
+//
+//	04:32:35 connector  tunnel ended
+//	04:32:37 connector  tunnel connected … region-b
+//	04:33:05 region-c   connector_unreachable … (the last one)
+//
+// The node a connector leaves knows a move is under way and asks early (ConnectorMoveAwaiter). Here that node
+// was the one being replaced: it restarted remembering nothing, and no other node had seen a departure. What
+// every node did see was the refusal itself. So a flow that no connector fronting its destination could carry
+// tells the provider, and the provider decides whether that is worth an early question. The flow that reports
+// it is then waited for like any flow for a connector that just left.
+type ConnectorUnreachableNoter interface {
+	NoteConnectorUnreachable(connectorID string)
 }
 
 // ConnectorMoveAwaiter is what a tunnel provider adds when it remembers which connectors just LEFT this node.

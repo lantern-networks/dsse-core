@@ -41,6 +41,6 @@ docker buildx build --platform "$platform" \
     --tag "$image_tag" --load "$source_dir/postgres-appliance"
 
 docker run --rm --platform "$platform" --entrypoint /bin/bash "$image_tag" \
-    -c 'set -euo pipefail; postgres --version | grep -F "PostgreSQL) 18.6"; patroni --version | grep -F "4.1.5"; wal-g --version'
+    -c 'set -euo pipefail; postgres --version | grep -F "PostgreSQL) 18.7"; patroni --version | grep -F "4.1.5"; wal-g --version'
 docker run --rm --platform "$platform" --user postgres --entrypoint /bin/bash "$image_tag" \
     -c 'test -x /scripts/patroni_wait.sh && test -x /etc/runit/runsvdir/default/patroni/run && test -x /usr/local/bin/wal-g'

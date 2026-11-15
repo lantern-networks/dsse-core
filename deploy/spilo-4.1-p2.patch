@@ -1,10 +1,10 @@
 diff --git a/postgres-appliance/Dockerfile b/postgres-appliance/Dockerfile
-index 6608483..bda95cf 100644
+index 6608483..9e62953 100644
 --- a/postgres-appliance/Dockerfile
 +++ b/postgres-appliance/Dockerfile
 @@ -1 +1 @@
 -ARG BASE_IMAGE=ubuntu:22.04
-+ARG BASE_IMAGE=ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
++ARG BASE_IMAGE=ubuntu:22.04@sha256:74b12b11ffa550fba1929ad4d8d16533c34f6612728469671afba1b03b66881c
 @@ -8,9 +7,0 @@ ARG ADDITIONAL_LOCALES=
 -FROM ubuntu:18.04 as ubuntu-18
 -
@@ -30,12 +30,18 @@ index 6608483..bda95cf 100644
 +# COPY preserves upstream root-only modes; Patroni runs as postgres and needs these helpers.
 +RUN chmod -R a+rX /scripts /etc/runit/runsvdir/default/patroni
 diff --git a/postgres-appliance/build_scripts/base.sh b/postgres-appliance/build_scripts/base.sh
-index bc4633d..48d133b 100644
+index bc4633d..07adbe6 100644
 --- a/postgres-appliance/build_scripts/base.sh
 +++ b/postgres-appliance/build_scripts/base.sh
 @@ -197 +197 @@ apt-get update
 -apt-get install -y postgresql postgresql-server-dev-all postgresql-all libpq-dev
 +apt-get install -y libpq-dev
+@@ -328,0 +329,5 @@ find /var/log -type f -exec truncate --size 0 {} \;
++
++# DSSE: postgresql-common 295 leaves /run/postgresql to systemd-tmpfiles, which never runs in a container;
++# Patroni refuses to start without it. Created here as the published images had it.
++install -d -m 2775 -o postgres -g root /run/postgresql
++[ "$(id -u postgres):$(id -g postgres)" = "101:103" ] || { echo "postgres is $(id -u postgres):$(id -g postgres), not 101:103" >&2; exit 1; }
 diff --git a/postgres-appliance/build_scripts/dependencies.sh b/postgres-appliance/build_scripts/dependencies.sh
 index 2f1ef68..f680b12 100644
 --- a/postgres-appliance/build_scripts/dependencies.sh
@@ -60,6 +66,18 @@ index e9fe60a..be3323c 100644
 @@ -39 +39 @@ if [ "$DEMO" != "true" ]; then
 -            'git+https://github.com/zalando/pg_view.git@master#egg=pg-view'
 +            'git+https://github.com/zalando/pg_view.git@3b35609f34b25db861252e2ce9912c2dab8a7934#egg=pg-view'
+diff --git a/postgres-appliance/build_scripts/prepare.sh b/postgres-appliance/build_scripts/prepare.sh
+index 8590e34..943a635 100644
+--- a/postgres-appliance/build_scripts/prepare.sh
++++ b/postgres-appliance/build_scripts/prepare.sh
+@@ -6,0 +7,7 @@ echo -e 'APT::Install-Recommends "0";\nAPT::Install-Suggests "0";' > /etc/apt/ap
++# DSSE: the database user owns every existing data directory by NUMBER. Created first, with the ids the
++# published images have always used, so a package that creates system users of its own (systemd's, or
++# postgresql-common 295's sysusers entry) cannot take 101/103 and move postgres to another uid.
++groupadd --system --gid 103 postgres
++useradd --system --uid 101 --gid 103 --home-dir /var/lib/postgresql --no-create-home --shell /bin/bash \
++    --comment "PostgreSQL administrator" postgres
++
 diff --git a/postgres-appliance/launch.sh b/postgres-appliance/launch.sh
 index 07f1747..8f8cad0 100755
 --- a/postgres-appliance/launch.sh

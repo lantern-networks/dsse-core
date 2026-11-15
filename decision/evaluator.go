@@ -137,15 +137,56 @@ func (e Evaluator) Evaluate(req model.DecisionRequest) model.AccessDecision {
 		decisionValue, reason, reasonCodes = e.serverInitiatedDecisionFor(req, now)
 		policyID = "server_initiated_policy"
 		metadata["server_initiated_authorization"] = true
-	} else if e.EastWestEnabled && e.isEastWestFlow(req) {
-		// East-west per-hop authorization (E1): default-deny internal/lateral access; each hop must be
-		// explicitly allowed/authenticated by an east-west rule. Governs east-west protocols on its own,
-		// bypassing the north-bound policy match.
-		var ewActions []model.DecisionAction
-		decisionValue, reason, reasonCodes, ewActions = e.eastWestDecisionFor(req, now)
-		actions = append(actions, ewActions...)
-		policyID = "east_west_policy"
+	} else if e.isEastWestFlow(req) && (e.EastWestEnabled || (req.ConnectorRouteVerified && req.ConnectorFlowFromDevice)) {
+		// A flow to a registered network — one a Connector route carries — is Connector Access in every
+		// posture, and everything else is Internet Access. The posture only says what Connector Access does
+		// with it. While it is OBSERVE (EastWestEnabled false) the layer allows the flow and enforces none of
+		// its rules; the Internet Access rules do not decide it, and the row says Connector Access did. From
+		// PARTIAL ENFORCE on, each hop must be allowed or authenticated by a rule (E1), and the row names the
+		// rule that decided.
+		//
+		// A lateral protocol to a destination no Connector route carries stays with the Internet Access rules
+		// while the posture is OBSERVE, as before: an operator's rule for it (deny at high risk, sign in
+		// first) must not stop applying because this layer is only watching.
+		//
+		// So does a browser's request for a published application (ConnectorFlowFromDevice false). Observing
+		// lets through what an enrolled device sends; a visitor nobody has identified is admitted by the
+		// application's own policy or not at all, and "observed and allowed" there would publish every
+		// private application to the internet.
+		policyID = EastWestPolicyClassID
+		if e.EastWestEnabled {
+			rule, ruleMatched := MatchedEastWestRule(e.EastWestRules, req)
+			var ewActions []model.DecisionAction
+			decisionValue, reason, reasonCodes, ewActions = e.eastWestDecisionForRule(rule, ruleMatched, req, now)
+			if decisionValue == "authenticate_required" && ruleMatched && strings.TrimSpace(rule.ID) != "" &&
+				strings.TrimSpace(req.ConnectorSignInDoneForRule) == strings.TrimSpace(rule.ID) {
+				// THIS rule asks for a sign-in, and the connection this request travels in was only opened
+				// once the sign-in for THIS rule was done. Asking again for each request inside it would
+				// refuse a rule that binds the sign-in to one held connection, which a request cannot be.
+				//
+				// The evidence is the rule, not the connection. A connection opened by address under a plain
+				// allow has proved nothing about a rule written for the host name its first request names;
+				// that request is asked to sign in like any other.
+				decisionValue = "allow"
+				reason = "Connector access allowed: the connection this request travels in satisfied the rule's sign-in when it opened."
+				reasonCodes = []string{"east_west_connection_authenticated"}
+				ewActions = nil
+			}
+			actions = append(actions, ewActions...)
+			if id := strings.TrimSpace(rule.ID); ruleMatched && id != "" {
+				policyID = id
+			}
+		} else {
+			decisionValue = "allow"
+			reason = "Connector access observed and allowed (posture OBSERVE: Connector Access rules are not enforced)."
+			reasonCodes = []string{"east_west_observe"}
+		}
+		// Access to a private application is always recorded. An Internet Access rule chooses whether its
+		// allowed traffic is logged; a Connector Access rule has no such choice, so without this an allowed
+		// connection to a private application left no row at all.
+		metadata["log_traffic"] = true
 		metadata["east_west_authorization"] = true
+		metadata["east_west_posture"] = e.eastWestPostureName()
 		metadata["east_west_protocol"] = strings.ToLower(strings.TrimSpace(req.ServiceFamily))
 		metadata["destination_locality"] = ClassifyDestinationLocality(req, e.EastWestInternalNetworks).String()
 	} else if matchedPolicy, names, ok, whyNot := e.firstMatchedPolicyWithDiagnosis(req, actorType); !ok && whyNot != "" {

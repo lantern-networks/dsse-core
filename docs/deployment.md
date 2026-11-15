@@ -46,12 +46,15 @@ dsse-install -up -plan plan.json -dir /opt/dsse/region-a \
 - When the order reaches another machine, `-up` has already built that machine's package. It
   prints where the package is and the one command to run on that machine, and waits. At a
   terminal, press Enter when the command has finished; otherwise run the same `-up` command
-  again with `-confirmed <machine>`.
+  again with `-confirmed <machine>`. Delete the package from that machine when its command
+  has finished.
 - With `-ssh`, `-up` copies each package and starts each machine itself, using the `scp`
   and remote commands the order prints. The first machine must be able to `ssh` to the
   others without a prompt, and each must have Docker and a writable `/opt/dsse`. Where the
   order starts a machine with `dsse-install -start-node`, that machine needs `dsse-install`
-  too.
+  too. When a machine has started from its package, `-up` removes the copy it put on that
+  machine; the packages it built stay in `<dir>.packages` on the first machine, readable
+  only by you.
 - Every machine needs the deployment's names resolving, not only the first: a machine that
   cannot resolve them starts and never joins. `-print-names` prints the lines for all of
   them.
@@ -59,15 +62,47 @@ dsse-install -up -plan plan.json -dir /opt/dsse/region-a \
   store to accept the next member after one was given its vote — `-up` waits and asks again.
 - If a step fails, correct the cause and run the same command again. Completed steps are
   kept and not repeated.
+- A plan with a `profile` (`one-region-three-nodes`, `one-region-multi-edge`,
+  `three-regions-multi-edge`) starts each machine with `dsse-install -start-node`, which
+  checks the machine first and fetches nothing itself. `-up` fetches the release's images
+  on each machine just before that check.
+- Those machines serve the browser Portal and need a certificate for the plan's Portal
+  names that browsers already trust. Give it to `-up` with
+  `-install-portal-certificate <full chain> -portal-key <key>` (add `-portal-ca <bundle>`
+  when its issuer is not in the system trust store). Without it, `-up` says so and starts
+  nothing. Which machine reads those paths depends on the first machine:
+  - Where the first machine holds an Edge (`one-region-three-nodes`), the paths are files
+    on the first machine. `-up` installs the certificate there, and the other machines
+    receive it in their package.
+  - Where the first machine holds no Edge (`one-region-multi-edge`,
+    `three-regions-multi-edge`), the private key never passes through it. Put each Edge
+    machine's certificate and key on that machine, at the same two paths on every Edge
+    machine, and pass those paths. Each Edge machine's start installs from its own files,
+    so each Region's Edge machines can hold a certificate for that Region's Portal name.
+    The `-portal-ca` bundle is read on every Edge machine and on the first machine, at one
+    path. With `-ssh`, `-up` asks every Edge machine for its files before the first step
+    and, if one is missing, names the machine and starts nothing.
 - The first administrator's password and second factor are written to
   `admin-credentials.txt` in the deployment directory, readable only by you, and are not
   printed. Steps are logged to `<dir>.install.log`.
+- If the first-administrator step fails, what it printed is in
+  `admin-credentials.txt.pending`. Read it before running the command again: when the
+  administrator was created before the step failed, that file holds the only copy of the
+  credentials. Running again does not write over it; a later attempt writes to
+  `admin-credentials.txt.pending.attempt-<time>` beside it.
 
 `-up` ends with `dsse-install -verify`, as the order does. It was used to install one
 machine (50 checks passed, 1 not checked) and three Regions of one combined machine each
-(61 passed, 2 not checked), the third of them over `-ssh`. Tests run the orders of the
-other example plans through it command for command; those topologies were not installed
-with it.
+(61 passed, 2 not checked), the third of them over `-ssh`. Each layout with a profile
+was installed over `-ssh` with one command: one Region of three machines that each hold a
+control plane and Edges (`one-region-three-nodes`; 66 passed, 3 not checked), one Region
+of one control-plane machine and two Edge machines (`one-region-multi-edge`; 51 passed,
+2 not checked), and three Regions of one control-plane machine and two Edge machines each
+(`three-regions-multi-edge`, nine machines; 64 passed, 3 not checked). Those installs
+used a certificate from a private CA passed with `-portal-ca`. `one-region-multi-edge`
+was also installed without `-ssh`, running each Edge machine's printed command by hand
+and confirming it with `-confirmed` (51 passed, 2 not checked); for the other two layouts
+with a profile, that flow is covered by tests.
 
 The 0.4.0 images were installed in two topologies: three Regions with one CP+HAProxy
 host and two Edge hosts each, and one Region with three combined nodes, the second
@@ -482,6 +517,49 @@ browser trusts it. Never infer trust from an issuer name alone.
 The customer organization's transport, device identity, and interception authorities
 are configured separately under [Organizations](organizations.md). Do not distribute
 private CA keys to endpoints.
+
+### Publishing revocation lists
+
+A client that requires an online revocation answer — `curl.exe` and Git for Windows with
+Schannel, .NET with revocation checking — refuses a certificate that names nowhere to ask.
+To let this deployment's certificates name such a place, declare it in the plan **before the
+deployment is created**; the addresses are written into the certificates and cannot be added
+later:
+
+```json
+"deployment_crl_origins": ["http://crl.dsse.example.com"],
+"deployment_crl_http_listen": "0.0.0.0:80"
+```
+
+- `deployment_crl_origins`: one to eight plain-HTTP origins, each a name devices and the
+  Edges can resolve and reach on port 80. No path, no credentials.
+- `deployment_crl_http_listen`: optional. When set, the founding machine accepts HTTP on
+  that address itself and hands it to the publisher. Leave it out when a load balancer or
+  another front end routes the origins to the publisher on `127.0.0.1:18081`.
+
+`dsse-install -up` then adds one step, "publish this deployment's revocation lists". It
+needs `sudo`: it installs the publisher program from the release's service image, a timer
+that re-signs the lists every hour (each list is valid for 24 hours), and the publisher,
+which holds no key and answers only the exact list paths for the declared host names.
+The step runs before any service starts, and the start check fetches every published list.
+
+This covers the deployment's own certificates and the certificates an Edge issues for
+inspected sites, under the deployment's shared inspection authority and under an
+inspection root made for an organization from its Certificates page ("Let this deployment
+make one"). An organization that brings its own inspection PKI publishes its own lists.
+
+An inspection root made for an organization keeps no key. When it is made it signs one
+revocation list — empty, valid for as long as the issuing certificate beneath it, two
+years — and nothing can sign for it again. To withdraw that issuing certificate, replace
+the organization's inspection root. The lists of the issuing authority and of each Edge
+are re-signed every few minutes and served from the same origins.
+
+Walked on one machine from an empty directory: seven steps; the lists fetched from outside
+with HTTP 200, any other path or host name refused; and on an enrolled Windows device,
+with an inspection root made from the Certificates page, the installation check's strict
+online-revocation validation and `curl.exe` with Schannel both reached an inspected site.
+Further signing hosts for the deployment's own lists are described in
+[deployment-crl-replica.md](deployment-crl-replica.md).
 
 ## Break-glass, and closing it
 

@@ -323,7 +323,7 @@ if (Test-Path $log) {
     }
     if ($ts) {
       $age = ((Get-Date) - $ts).TotalSeconds
-      if ($age -le 120) { ok ("last heartbeat {0:N0}s ago: " -f $age) + $hb.Line.Substring([Math]::Max(0, $hb.Line.IndexOf('heartbeat'))) }
+      if ($age -le 120) { ok (("last heartbeat {0:N0}s ago: " -f $age) + $hb.Line.Substring([Math]::Max(0, $hb.Line.IndexOf('heartbeat')))) }
       else { bad ("the last heartbeat is {0:N0}s old - the agent has stopped talking to the deployment" -f $age) }
     }
     else { note ("a heartbeat line exists but its timestamp could not be read: " + $hb.Line) }
@@ -386,6 +386,8 @@ public sealed class DsseStrictTlsObservation {
 '@
 }
 $observation = New-Object DsseStrictTlsObservation
+# Set in 6 when the certificate presented for the probe names nowhere to ask about revocation. 6b reads it.
+$script:revocationUnpublished = $false
 $ssl = $null
 $tcp = $null
 $ch = $null
@@ -418,9 +420,63 @@ try {
   if ($chainLen -gt 0) { $chainRoot = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ch.ChainElements[$chainLen - 1].Certificate) }
   ok "SslStream validated the hostname, OS trust and online revocation status"
 } catch {
-  bad "could not complete strict TLS to $Probe : $($_.Exception.Message)"
-  note ("TLS policy errors: " + $observation.Errors)
-  if ($observation.ChainStatus.Length) { note ("chain status: " + ($observation.ChainStatus -join ', ')) }
+  $strictError = $_.Exception.Message
+  $strictStatus = @($observation.ChainStatus)
+  # WHEN THE ONLY THING MISSING IS A REVOCATION ANSWER, ASK THE REST OF THE QUESTION. A certificate that names
+  # no revocation list and no responder cannot be checked for revocation by anybody, and the strict handshake
+  # above stops there - before the leaf is read, so the check below (does the chain lead to the announced
+  # interception root) was never asked on exactly the devices that are being inspected. The hostname and the
+  # OS trust decision are validated again here without the revocation requirement; revocation itself is
+  # reported as not checked, never as passed.
+  $onlyRevocation = ($strictStatus.Count -gt 0) -and (@($strictStatus | Where-Object { $_ -notin 'RevocationStatusUnknown', 'OfflineRevocation' }).Count -eq 0)
+  $second = $null; $ssl2 = $null; $tcp2 = $null; $ch2 = $null
+  if ($onlyRevocation) {
+    try {
+      $second = New-Object DsseStrictTlsObservation
+      $tcp2 = New-Object Net.Sockets.TcpClient
+      $connect2 = $tcp2.ConnectAsync($u.Host, $u.Port)
+      if (-not $connect2.Wait(5000)) { throw 'TCP connection timed out' }
+      $null = $connect2.GetAwaiter().GetResult()
+      $ssl2 = New-Object Net.Security.SslStream($tcp2.GetStream(), $false, $second.Callback)
+      $auth2 = $ssl2.AuthenticateAsClientAsync($u.Host, (New-Object Security.Cryptography.X509Certificates.X509CertificateCollection), [Security.Authentication.SslProtocols]::None, $false)
+      if (-not $auth2.Wait(20000)) { throw 'TLS authentication timed out' }
+      $null = $auth2.GetAwaiter().GetResult()
+      $leaf = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ssl2.RemoteCertificate)
+      $leafIssuer = $leaf.Issuer
+      $ch2 = New-Object Security.Cryptography.X509Certificates.X509Chain
+      $ch2.ChainPolicy.RevocationMode = 'NoCheck'
+      $ch2.ChainPolicy.VerificationFlags = 'NoFlag'
+      foreach ($x in $second.Served) { [void]$ch2.ChainPolicy.ExtraStore.Add($x) }
+      if (-not $ch2.Build($leaf)) {
+        throw ("chain validation failed: " + (($ch2.ChainStatus | ForEach-Object { "$($_.Status)" }) -join ', '))
+      }
+      $chainLen = $ch2.ChainElements.Count
+      if ($chainLen -gt 0) { $chainRoot = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ch2.ChainElements[$chainLen - 1].Certificate) }
+      # 2.5.29.31 = CRL distribution points, 1.3.6.1.5.5.7.1.1 = authority information access (OCSP).
+      $namesRevocation = @($leaf.Extensions | Where-Object { $_.Oid.Value -in '2.5.29.31', '1.3.6.1.5.5.7.1.1' }).Count -gt 0
+      if ($namesRevocation) {
+        bad "the certificate for $Probe names where its revocation status is published, and that could not be obtained: $strictError"
+      }
+      else {
+        $script:revocationUnpublished = $true
+        ok "SslStream validated the hostname and OS trust for $Probe"
+        na "revocation of the certificate for $Probe was not checked - it names no revocation list and no responder, so no client can check it (documented limitation under inspection; a deployment that publishes revocation lists does not have it)"
+      }
+    } catch {
+      bad "could not complete TLS to $Probe even without the revocation requirement: $($_.Exception.Message)"
+      note "the strict attempt had failed with: $strictError"
+    } finally {
+      if ($ssl2) { $ssl2.Dispose() }
+      if ($tcp2) { $tcp2.Dispose() }
+      if ($ch2) { $ch2.Dispose() }
+      if ($second) { foreach ($x in $second.Served) { $x.Dispose() } }
+    }
+  }
+  else {
+    bad "could not complete strict TLS to $Probe : $strictError"
+    note ("TLS policy errors: " + $observation.Errors)
+  }
+  if ($strictStatus.Count) { note ("chain status of the strict attempt: " + ($strictStatus -join ', ')) }
 } finally {
   if ($ssl) { $ssl.Dispose() }
   if ($tcp) { $tcp.Dispose() }
@@ -474,19 +530,58 @@ try {
   $strictHttp.Timeout = [TimeSpan]::FromSeconds(15)
   $strictResponse = $strictHttp.GetAsync($Probe).GetAwaiter().GetResult()
   $osOk = ([int]$strictResponse.StatusCode -eq 200)
-} catch { note "strict HttpClient: $($_.Exception.Message)" }
+} catch {
+  # The innermost exception is the one that names the cause; the outer one only says a method call threw.
+  $cause = $_.Exception
+  while ($cause.InnerException) { $cause = $cause.InnerException }
+  note "strict HttpClient: $($cause.Message)"
+}
 finally {
   if ($strictResponse) { $strictResponse.Dispose() }
   if ($strictHttp) { $strictHttp.Dispose() }
   elseif ($strictHandler) { $strictHandler.Dispose() }
 }
 if ($osOk) { ok "OS certificate store with online revocation (HttpClient): $Probe -> 200" }
+elseif ($script:revocationUnpublished) {
+  # The same request without the revocation requirement, so that "cannot be checked for revocation" is not
+  # reported as "the OS does not trust it".
+  $plainOk = $false
+  $plainHandler = $null; $plainHttp = $null; $plainResponse = $null
+  try {
+    $plainHandler = New-Object Net.Http.HttpClientHandler
+    $plainHandler.CheckCertificateRevocationList = $false
+    $plainHttp = New-Object Net.Http.HttpClient($plainHandler)
+    $plainHttp.Timeout = [TimeSpan]::FromSeconds(15)
+    $plainResponse = $plainHttp.GetAsync($Probe).GetAwaiter().GetResult()
+    $plainOk = ([int]$plainResponse.StatusCode -eq 200)
+  } catch { note "HttpClient without the revocation requirement: $($_.Exception.Message)" }
+  finally {
+    if ($plainResponse) { $plainResponse.Dispose() }
+    if ($plainHttp) { $plainHttp.Dispose() }
+    elseif ($plainHandler) { $plainHandler.Dispose() }
+  }
+  if ($plainOk) {
+    ok "OS certificate store (HttpClient): $Probe -> 200"
+    na "HttpClient with an online revocation requirement was not satisfied - the certificate names nowhere to ask (see 6)"
+  }
+  else { bad "OS certificate validation cannot reach $Probe, with or without the revocation requirement" }
+}
 else { bad "strict OS certificate validation cannot reach $Probe" }
 
 $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 if ($curl) {
   $code = (& $curl -sS -o NUL -w '%{http_code}' --max-time 15 $Probe 2>&1 | Select-Object -Last 1)
+  $curlNoRevoke = ''
+  if ("$code" -ne '200' -and $script:revocationUnpublished) {
+    # curl.exe on Windows uses Schannel and requires a revocation answer by default. Asked again without that
+    # requirement, to tell "this program cannot check revocation here" from "this program does not trust it".
+    $curlNoRevoke = (& $curl -sS -o NUL -w '%{http_code}' --ssl-no-revoke --max-time 15 $Probe 2>&1 | Select-Object -Last 1)
+  }
   if ("$code" -eq '200') { ok "own-CA-bundle path (curl): $Probe -> 200" }
+  elseif ("$curlNoRevoke" -eq '200') {
+    ok "own-CA-bundle path (curl --ssl-no-revoke): $Probe -> 200"
+    na "curl.exe with its default revocation requirement does not reach $Probe - the certificate names nowhere to ask (see 6). Programs that require an online revocation result fail on inspected sites on this deployment"
+  }
   else {
     bad "own-CA-bundle path (curl) cannot verify $Probe -> $code"
     note "programs that do not use the OS store - curl, openssl, python-requests, node - are broken on this device"

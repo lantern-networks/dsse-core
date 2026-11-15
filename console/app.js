@@ -775,8 +775,18 @@ async function apiFetch(method, path, body, plane, signal, tenantOverride, retri
   // again would be a loop that keeps opening elevations the organization then has to read.
   if (res.status === 403 && parsed && parsed.elevation_required && !retriedAfterElevation) {
     const granted = await offerOperatorElevation(parsed.elevation_required, plane, actingTenant, tenantOverride === undefined);
-    if (granted && (tenantOverride !== undefined || operateTenant === actingTenant))
-      return apiFetch(method, path, body, plane, signal, actingTenant, true, retriedOnControl);
+    if (granted && (tenantOverride !== undefined || operateTenant === actingTenant)) {
+      // The grant is made at one node and the act is carried out at another, which hears of the grant a moment
+      // later. Asked in that moment, it refused again — for want of the time just granted — and the operator
+      // was shown a refusal for an act that worked on the next press. A refusal of that one kind is asked
+      // again for a few seconds; it has done nothing, so asking again is safe, and no further time is taken.
+      for (let attempt = 0; ; attempt++) {
+        const again = await apiFetch(method, path, body, plane, signal, actingTenant, true, retriedOnControl);
+        const stillWaitingForTheGrant = again && again.status === 403 && again.body && again.body.elevation_required;
+        if (!stillWaitingForTheGrant || attempt >= 5) return again;
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
   }
 
   // ★★★ AND A NODE THAT SAYS "ASK THE AUTHORITY" IS ASKED (2026-09-06, found by pressing "Download everything
@@ -823,7 +833,7 @@ const ELEVATED_ACT_LABELS = {
   "POST /admin/tenant-interception-authority/revoke-delegation": { en: "permanently revoking an Edge's interception CA", ja: "Edge の傍受用 CA を失効させる（元に戻せません）" },
   "POST /admin/tenant-interception-authority/promote": { en: "making the prepared interception authority the one in use", ja: "準備した傍受用の認証局を使い始める" },
   "POST /admin/tenant-interception-authority/withdraw-incoming": { en: "withdrawing the new interception root devices were asked to trust", ja: "端末に配った新しい傍受ルート証明書を取り下げる" },
-  "POST /admin/tenant-interception-authority": { en: "accepting the interception authority this organization handed over", ja: "組織から預かった傍受用の認証局を受け入れる" },
+  "POST /admin/tenant-interception-authority": { en: "setting the interception authority this organization uses", ja: "この組織の傍受用の認証局を設定する" },
   "POST /admin/interception-intermediate/*/revoke": { en: "revoking the certificate that signs this organization's intercepted traffic", ja: "傍受の署名に使う証明書を失効させる" },
   "POST /admin/interception-intermediate/*": { en: "replacing the certificate that signs this organization's intercepted traffic", ja: "傍受の署名に使う証明書を入れ替える" },
   "DELETE /admin/tenant-cas/*/*": { en: "no longer admitting devices under this CA", ja: "この CA の端末を受け付けなくする" },
@@ -1799,7 +1809,7 @@ async function confirmFullEnforce() {
   if (uncovered && uncovered > 0) {
     msg = bl({
       en: "⚠ " + uncovered + " observed flow(s) are still UNCOVERED by any rule. Full enforcement will BLOCK them. Adopt them from the Observations tab first, or proceed and break those connections?",
-      ja: "⚠ 観測されたフローのうち " + uncovered + " 件がまだどのルールにもカバーされていません。完全強制はこれらを遮断します。先に Observations タブでルール化するか、このまま進めて該当接続を切断しますか?" });
+      ja: "⚠ 観測されたフローのうち " + uncovered + " 件がまだどのルールにもカバーされていません。完全強制はこれらを遮断します。先に「観測」タブでルール化するか、このまま進めて該当接続を切断しますか?" });
   } else {
     msg = bl({
       en: "Turn on full enforcement? Connections to internal resources that no rule allows will be denied. Uncovered observed flows: " + (uncovered === null ? "unknown" : "0") + ".",
@@ -1808,16 +1818,30 @@ async function confirmFullEnforce() {
   setEastWestMode("full", msg);
 }
 
+// The question is asked in the Console's own dialog, like every other act that changes what is enforced. It
+// used to be the browser's native confirm: a window of another style, in the browser's language, that nothing
+// driving the page could answer.
+const EAST_WEST_MODE_TITLE = {
+  observe: { en: "Return connector access to observe?", ja: "コネクタ経由アクセスを観測に戻しますか?" },
+  partial: { en: "Set connector access to partial enforcement?", ja: "コネクタ経由アクセスを部分強制にしますか?" },
+  full: { en: "Turn on full enforcement for connector access?", ja: "コネクタ経由アクセスを完全強制にしますか?" },
+};
 async function setEastWestMode(mode, confirmMsg) {
-  if (!window.confirm(confirmMsg)) return;
+  const ok = await uiConfirm({
+    title: bl(EAST_WEST_MODE_TITLE[mode] || { en: "Change connector-access posture?", ja: "コネクタ経由アクセスの姿勢を変えますか?" }),
+    body: confirmMsg,
+    confirmLabel: bl({ en: "Change", ja: "変更する" }),
+    danger: mode === "full",
+  });
+  if (!ok) return;
   try {
     const res = await apiFetch("POST", "/admin/east-west", { mode });
     if (!res || !res.ok) {
-      window.alert(bl({ en: "Failed to change connector-access posture (status ", ja: "コネクタ経由アクセスの変更に失敗(状態 " }) + (res ? res.status : "?") + ")");
+      uiToast(bl({ en: "Failed to change connector-access posture", ja: "コネクタ経由アクセスの変更に失敗しました" }) + ": " + ((res && res.body && res.body.error) || ("HTTP " + (res ? res.status : "?"))), "err");
     } else {
       announceModeChangeToOtherTabs();
     }
-  } catch (e) { window.alert(String(e)); }
+  } catch (e) { uiToast(String(e), "err"); }
   refreshModeBanner();
 }
 

@@ -326,6 +326,12 @@ func eastWestDeviceAttestationEligible(req model.DecisionRequest) bool {
 // that opts in — by device attestation for a machine/non-interactive flow (no human OOB possible).
 func (e Evaluator) eastWestDecisionFor(req model.DecisionRequest, now time.Time) (decisionValue, reason string, reasonCodes []string, actions []model.DecisionAction) {
 	rule, matched := MatchedEastWestRule(e.EastWestRules, req)
+	return e.eastWestDecisionForRule(rule, matched, req, now)
+}
+
+// eastWestDecisionForRule is eastWestDecisionFor once the rule is known, so the caller that records the
+// decision can name the rule that made it.
+func (e Evaluator) eastWestDecisionForRule(rule EastWestRule, matched bool, req model.DecisionRequest, now time.Time) (decisionValue, reason string, reasonCodes []string, actions []model.DecisionAction) {
 	mode := EastWestModeDeny
 	if matched {
 		switch m := strings.ToLower(strings.TrimSpace(rule.Mode)); m {
@@ -477,3 +483,65 @@ func IsEastWestFlow(req model.DecisionRequest, declared InternalNetworks) bool {
 	}
 	return EastWestLocalityAdmits(ClassifyDestinationLocality(req, declared))
 }
+
+// EastWestPolicyClassID is the policy id a Connector Access decision carries when no single rule made it: the
+// posture's own default (observed and allowed, allowed because unmatched, denied because unmatched). A
+// decision a rule made carries that rule's id instead.
+const EastWestPolicyClassID = "east_west_policy"
+
+// eastWestPostureName is the posture in the words the Console and the documentation use.
+func (e Evaluator) eastWestPostureName() string {
+	switch {
+	case !e.EastWestEnabled:
+		return "observe"
+	case e.EastWestAllowUnmatched:
+		return "partial_enforce"
+	default:
+		return "full_enforce"
+	}
+}
+
+// IsConnectorAccessDecision reports whether Connector Access, and not the Internet Access rules, made dec.
+func IsConnectorAccessDecision(dec model.AccessDecision) bool {
+	v, _ := dec.Metadata["east_west_authorization"].(bool)
+	return v
+}
+
+// ConnectorSignInDoneForRule is the id of the Connector Access rule whose sign-in the flow behind dec
+// completed, or "" when the decision involved none. The caller must only use it for a flow it then lets
+// through: a decision that still asks for sign-in names the rule being asked for, and the flow is forwarded
+// only after that sign-in has been completed.
+func ConnectorSignInDoneForRule(dec model.AccessDecision) string {
+	if !IsConnectorAccessDecision(dec) || dec.PolicyID == "" || dec.PolicyID == EastWestPolicyClassID {
+		return ""
+	}
+	if dec.Decision == "authenticate_required" {
+		return dec.PolicyID
+	}
+	// The ordinary case. Once the sign-in a held flow waited for has been verified, the Edge rewrites the
+	// decision it records and forwards with: allow, the rule's own reason codes kept, "authentication_satisfied"
+	// added, and what the rule had asked for remembered as required_decision. The route is built from THAT
+	// decision, so it is the form that must be recognised — the first version of this function knew only the
+	// decision as it was before the sign-in, and every flow that had just signed in was forwarded as if it had
+	// not: its first request inside the connection was asked to sign in again, which a rule that binds the
+	// sign-in to one held connection can only refuse (second review, 2026-11-14).
+	if dec.Decision == "allow" {
+		if required, _ := dec.Metadata["required_decision"].(string); required == "authenticate_required" {
+			for _, code := range dec.ReasonCodes {
+				if code == AuthenticationSatisfiedReasonCode {
+					return dec.PolicyID
+				}
+			}
+		}
+	}
+	for _, code := range dec.ReasonCodes {
+		if code == "east_west_grant_satisfied" || code == "east_west_device_attested" {
+			return dec.PolicyID
+		}
+	}
+	return ""
+}
+
+// AuthenticationSatisfiedReasonCode is added to a decision when the interactive sign-in it required has been
+// verified and the flow is let through on that account.
+const AuthenticationSatisfiedReasonCode = "authentication_satisfied"

@@ -251,7 +251,12 @@ func handleConnectorApplication(w http.ResponseWriter, r *http.Request, deps con
 		writeError(w, http.StatusBadRequest, fmt.Errorf("no application named in the request path"))
 		return
 	}
-	conn, ok, err := connectorForApplication(r.Context(), r, registry, applicationCatalogStore, callerTenant, applicationID)
+	// This path carries the request through a tunnel this node holds, so that is what "reachable" means here.
+	conn, ok, err := connectorForApplicationPreferring(r.Context(), r, registry, applicationCatalogStore, callerTenant, applicationID,
+		func(candidate model.ConnectorRegistration) bool {
+			_, held := tunnelManager.Get(candidate.ID)
+			return held
+		})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

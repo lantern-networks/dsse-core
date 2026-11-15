@@ -60,8 +60,8 @@ work without a live deployment:
 - [Windows recovery](windows-agent.md#restore-normal-networking): use administrator
   PowerShell and run each command separately. The guide also explains command-not-found,
   `UnexpectedToken`, and service-startup spelling errors.
-- [macOS recovery](macos-agent.md#restore-normal-networking): disable the transparent
-  proxy as the logged-in user, without `sudo`.
+- [macOS recovery](macos-agent.md#turning-steering-off-and-on): turn steering off with
+  `sudo dsse-steering off`; it needs an administrator.
 
 Check actual browsing after recovery. Do not delete the executable needed to undo its
 network settings or reset unrelated firewall rules.
